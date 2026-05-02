@@ -66,6 +66,8 @@ class FarkasProverConfig:
 
     num_templates: int = 3
     solver: str = "z3"  # placeholder for future external support
+    positivity_lemma: str = "farkas"
+    putinar_max_degree: int = 2
     validate_invariant: bool = True
     timeout: Optional[int] = None  # seconds
     verbose: bool = False
@@ -109,7 +111,12 @@ class FarkasProver:
     # -------------------------------------------------------- private helpers
     # ----------------------------- template
     def _create_template(self) -> FarkasTemplate:
-        return FarkasTemplate(self.sts, num_templates=self.cfg.num_templates)
+        return FarkasTemplate(
+            self.sts,
+            num_templates=self.cfg.num_templates,
+            positivity_lemma=self.cfg.positivity_lemma,
+            putinar_max_degree=self.cfg.putinar_max_degree,
+        )
 
     # ----------------------------- solver selection
     @staticmethod

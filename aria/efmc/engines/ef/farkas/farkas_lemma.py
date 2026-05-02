@@ -29,6 +29,12 @@ def _is_numeric(e: z3.ExprRef) -> bool:
     return z3.is_int_value(e) or z3.is_rational_value(e)
 
 
+def _is_zero_expr(e: z3.ExprRef) -> bool:
+    return (z3.is_int_value(e) and e.as_long() == 0) or (
+        z3.is_rational_value(e) and e.numerator_as_long() == 0
+    )
+
+
 def _to_float(e: Num) -> float:
     if z3.is_int_value(e):
         return float(e.as_long())
@@ -263,9 +269,128 @@ class FarkasLemma:
         # constraints will be Z3 formulas over lambda variables
     """
 
+    _fresh_counter = 0
+
     def __init__(self) -> None:
         self._constraints: List[z3.BoolRef] = []
-        self._lambda_counter = 0
+
+    @classmethod
+    def _fresh_lambdas(cls, count: int) -> List[z3.ArithRef]:
+        prefix = cls._fresh_counter
+        cls._fresh_counter += 1
+        return [z3.Real(f"farkas_lambda_{prefix}_{i}") for i in range(count)]
+
+    @staticmethod
+    def _zero_for(v: z3.ArithRef) -> z3.ArithRef:
+        return z3.IntVal(0) if z3.is_int(v) else z3.RealVal(0)
+
+    @staticmethod
+    def _one_for(v: z3.ArithRef) -> z3.ArithRef:
+        return z3.IntVal(1) if z3.is_int(v) else z3.RealVal(1)
+
+    @classmethod
+    def _linearise_symbolic(
+        cls, expr: z3.ArithRef, program_vars: Sequence[z3.ArithRef]
+    ) -> Tuple[Dict[z3.ArithRef, z3.ArithRef], z3.ArithRef]:
+        """
+        Return coefficients and constant of an expression affine in program_vars.
+
+        Coefficients may still contain template variables and Farkas
+        multipliers.  This mirrors PolyHorn's polynomial coefficient matching
+        while staying in Z3 expressions.
+        """
+        zero_subst = [(v, cls._zero_for(v)) for v in program_vars]
+        const = z3.simplify(z3.substitute(expr, zero_subst))
+        coeffs: Dict[z3.ArithRef, z3.ArithRef] = {}
+
+        for v in program_vars:
+            subst = list(zero_subst)
+            for i, (subst_var, _) in enumerate(subst):
+                if subst_var.eq(v):
+                    subst[i] = (subst_var, cls._one_for(v))
+                    break
+            coeffs[v] = z3.simplify(z3.substitute(expr, subst) - const)
+
+        rebuilt = const + z3.Sum([coeffs[v] * v for v in program_vars])
+        residual = z3.simplify(expr - rebuilt)
+        if not _is_zero_expr(residual):
+            solver = z3.Solver()
+            solver.add(residual != 0)
+            if solver.check() != z3.unsat:
+                raise ValueError(
+                    f"Expression is not affine in program variables: {expr}"
+                )
+
+        return coeffs, const
+
+    @staticmethod
+    def _as_ge_zero(c: z3.BoolRef) -> List[Tuple[z3.ArithRef, bool]]:
+        """
+        Convert an atom to PolyHorn-style polynomial constraints p >= 0.
+
+        The bool marks strict constraints p > 0.  Equalities are split into
+        both directions, as in PolyHorn's Farkas reduction.
+        """
+        if z3.is_true(c):
+            return []
+        if z3.is_false(c):
+            return [(z3.RealVal(-1), False)]
+        if z3.is_ge(c):
+            return [(c.arg(0) - c.arg(1), False)]
+        if z3.is_le(c):
+            return [(c.arg(1) - c.arg(0), False)]
+        if z3.is_gt(c):
+            return [(c.arg(0) - c.arg(1), True)]
+        if z3.is_lt(c):
+            return [(c.arg(1) - c.arg(0), True)]
+        if z3.is_eq(c):
+            lhs, rhs = c.arg(0), c.arg(1)
+            return [(lhs - rhs, False), (rhs - lhs, False)]
+        raise ValueError(f"Unsupported Farkas atom: {c}")
+
+    def apply_entailment_symbolic(
+        self,
+        conclusion: z3.BoolRef,
+        program_vars: Sequence[z3.ArithRef],
+    ) -> List[z3.BoolRef]:
+        """
+        Encode premise constraints => conclusion using PolyHorn's Farkas shape.
+
+        For premise polynomials f_i >= 0 and conclusion g >= 0, PolyHorn builds
+        y_0 + sum_i y_i f_i = g with all y_i >= 0.  Matching coefficients of
+        program variables eliminates the universal quantifiers.
+        """
+        premise_polys: List[Tuple[z3.ArithRef, bool]] = []
+        for c in self._constraints:
+            premise_polys.extend(self._as_ge_zero(c))
+
+        result: List[z3.BoolRef] = []
+        for rhs_poly, rhs_strict in self._as_ge_zero(conclusion):
+            multipliers = self._fresh_lambdas(len(premise_polys) + 1)
+            slack = multipliers[0]
+
+            result.extend(multiplier >= 0 for multiplier in multipliers)
+
+            lhs_poly = slack
+            strict_sum = slack
+            for multiplier, (premise_poly, premise_strict) in zip(
+                multipliers[1:], premise_polys
+            ):
+                lhs_poly = lhs_poly + multiplier * premise_poly
+                if premise_strict:
+                    strict_sum = strict_sum + multiplier
+
+            lhs_coeffs, lhs_const = self._linearise_symbolic(lhs_poly, program_vars)
+            rhs_coeffs, rhs_const = self._linearise_symbolic(rhs_poly, program_vars)
+
+            result.append(lhs_const == rhs_const)
+            for v in program_vars:
+                result.append(lhs_coeffs[v] == rhs_coeffs[v])
+
+            if rhs_strict:
+                result.append(strict_sum > 0)
+
+        return result
 
     def apply_farkas_lemma_symbolic(
         self, program_vars: Sequence[z3.ArithRef]
@@ -286,79 +411,23 @@ class FarkasLemma:
         list of Z3 BoolRef
             Constraints encoding the Farkas conditions
         """
-        if not self._constraints:
-            return []
+        premise_polys: List[Tuple[z3.ArithRef, bool]] = []
+        for c in self._constraints:
+            premise_polys.extend(self._as_ge_zero(c))
 
-        m = len(self._constraints)
+        multipliers = self._fresh_lambdas(len(premise_polys))
+        result: List[z3.BoolRef] = [multiplier >= 0 for multiplier in multipliers]
 
-        # Create fresh lambda variables
-        lambdas = [z3.Real(f"lambda_{self._lambda_counter}_{i}") for i in range(m)]
-        self._lambda_counter += 1
+        combo = z3.RealVal(0)
+        for multiplier, (premise_poly, _premise_strict) in zip(
+            multipliers, premise_polys
+        ):
+            combo = combo + multiplier * premise_poly
 
-        result: List[z3.BoolRef] = []
-
-        # 1. λᵢ ≥ 0 for all i
-        for lmb in lambdas:
-            result.append(lmb >= 0)
-
-        # 2. For each program variable v, the coefficient of v in the
-        #    linear combination Σᵢ λᵢ * constraint_i must be 0
-        #
-        # We'll use Z3's simplification to extract coefficients
+        coeffs, const = self._linearise_symbolic(combo, program_vars)
         for v in program_vars:
-            # Build: Σᵢ λᵢ * (lhs_i - rhs_i) where constraint_i is lhs_i ≤/≥ rhs_i
-            terms = []
-            for i, c in enumerate(self._constraints):
-                # Normalize constraint to lhs - rhs ≤ 0 form
-                if z3.is_le(c):
-                    terms.append(lambdas[i] * (c.arg(0) - c.arg(1)))
-                elif z3.is_ge(c):
-                    terms.append(lambdas[i] * (c.arg(1) - c.arg(0)))
-                elif z3.is_eq(c):
-                    # Equality contributes in both directions (split into two)
-                    # For now, just handle as lhs - rhs
-                    terms.append(lambdas[i] * (c.arg(0) - c.arg(1)))
-
-            if terms:
-                combo = z3.Sum(terms) if len(terms) > 1 else terms[0]
-                # Extract coefficient of v from combo
-                # We want: coeff(combo, v) == 0
-                # Use a simple approach: substitute v=1 and v=0
-                # coeff(f, v) = f[v←1] - f[v←0]
-                # Use the right sort for the substitution value
-                if z3.is_int(v):
-                    one_val = z3.IntVal(1)
-                    zero_val = z3.IntVal(0)
-                else:
-                    one_val = z3.RealVal(1)
-                    zero_val = z3.RealVal(0)
-                val_at_1 = z3.substitute(combo, [(v, one_val)])
-                val_at_0 = z3.substitute(combo, [(v, zero_val)])
-                coeff_v = z3.simplify(val_at_1 - val_at_0)
-                result.append(coeff_v == 0)
-
-        # 3. The constant term (when all program vars are 0) must be < 0
-        terms = []
-        for i, c in enumerate(self._constraints):
-            if z3.is_le(c):
-                lhs_minus_rhs = c.arg(0) - c.arg(1)
-            elif z3.is_ge(c):
-                lhs_minus_rhs = c.arg(1) - c.arg(0)
-            elif z3.is_eq(c):
-                lhs_minus_rhs = c.arg(0) - c.arg(1)
-            else:
-                continue
-
-            # Evaluate at program_vars = 0 to get constant term
-            subst = [
-                (v, z3.IntVal(0) if z3.is_int(v) else z3.RealVal(0))
-                for v in program_vars
-            ]
-            const_term = z3.substitute(lhs_minus_rhs, subst)
-            terms.append(lambdas[i] * const_term)
-
-        if terms:
-            result.append(z3.Sum(terms) < 0)
+            result.append(coeffs[v] == 0)
+        result.append(const < 0)
 
         return result
 

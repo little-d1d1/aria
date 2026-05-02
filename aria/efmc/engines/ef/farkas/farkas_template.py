@@ -32,6 +32,7 @@ import z3
 
 from aria.efmc.engines.ef.templates.abstract_template import Template
 from aria.efmc.engines.ef.farkas.farkas_lemma import FarkasLemma  # the improved one
+from aria.efmc.engines.ef.farkas.putinar_lemma import PutinarLemma
 from aria.efmc.sts import TransitionSystem
 
 logger = logging.getLogger(__name__)
@@ -67,9 +68,18 @@ class FarkasTemplate(Template):
     """
 
     # ------------------------------------------------------------------- init
-    def __init__(self, sts: TransitionSystem, *, num_templates: int = 3) -> None:
+    def __init__(
+        self,
+        sts: TransitionSystem,
+        *,
+        num_templates: int = 3,
+        positivity_lemma: str = "farkas",
+        putinar_max_degree: int = 2,
+    ) -> None:
         self.sts = sts
         self.num_templates = num_templates
+        self.positivity_lemma = positivity_lemma
+        self.putinar_max_degree = putinar_max_degree
 
         self._arity = len(self.sts.variables)  # #program vars
         self._tpl_coeffs: List[List[z3.RealRef]] = []  # pᵢⱼ variables
@@ -79,6 +89,13 @@ class FarkasTemplate(Template):
 
         self.add_template_vars()
         self.add_template_cnts()
+
+    def _new_positivity_lemma(self):
+        if self.positivity_lemma == "farkas":
+            return FarkasLemma()
+        if self.positivity_lemma == "putinar":
+            return PutinarLemma(max_degree=self.putinar_max_degree)
+        raise ValueError(f"Unsupported positivity lemma: {self.positivity_lemma}")
 
     # -------------------------------------------------------- public contract
     # Template subclasses must expose .template_cnt_init_and_post and
@@ -138,43 +155,23 @@ class FarkasTemplate(Template):
         If conclusion is a conjunction, prove each conjunct separately:
             premise ⇒ (a ∧ b) ≡ (premise ⇒ a) ∧ (premise ⇒ b)
         """
-        # Split conclusion into conjuncts
         conclusion_conjuncts = _flatten_conj(conclusion)
 
         all_constraints: List[z3.BoolRef] = []
 
-        # Prove premise ⇒ each conjunct separately
         for conj in conclusion_conjuncts:
-            fl = FarkasLemma()
+            lemma = self._new_positivity_lemma()
 
-            # Collect atomic linear constraints of premise ∧ ¬conj
-            # which must be UNSAT for the implication to hold
             premise_atoms = _flatten_conj(premise)
             for a in premise_atoms:
-                fl.add_constraint(a)
+                lemma.add_constraint(a)
 
-            # Add the negation of this conjunct
-            # Handle the negation properly based on the form of conj
-            if z3.is_le(conj):  # ¬(lhs ≤ rhs) ⇒ lhs > rhs
-                # In Farkas: lhs - rhs ≥ 0
-                lhs, rhs = conj.arg(0), conj.arg(1)
-                fl.add_constraint(lhs - rhs >= 0)
-            elif z3.is_ge(conj):  # ¬(lhs ≥ rhs) ⇒ lhs < rhs
-                # In Farkas: rhs - lhs ≥ 0
-                lhs, rhs = conj.arg(0), conj.arg(1)
-                fl.add_constraint(rhs - lhs >= 0)
-            elif z3.is_eq(conj):  # ¬(lhs == rhs) - not representable in Farkas
-                # Skip or handle specially - for now, skip
-                continue
-            else:
-                # For other forms, try to add the negation directly
-                fl.add_constraint(z3.Not(conj))
-
-            # variables possibly from both current and primed worlds
             universe = list({*self.sts.variables, *self.sts.prime_variables})
-            constraints = fl.apply_farkas_lemma_symbolic(universe)
+            constraints = lemma.apply_entailment_symbolic(conj, universe)
             logger.debug(
-                "Farkas produced %d constraints for one conjunct.", len(constraints)
+                "%s produced %d constraints for one conjunct.",
+                self.positivity_lemma,
+                len(constraints),
             )
 
             all_constraints.extend(constraints)
@@ -183,7 +180,7 @@ class FarkasTemplate(Template):
 
     # ----------------------------- assemble the three VCs -------------------
     def add_template_cnts(self) -> None:
-        """Add constraints according to the specification of inductive loop invariant."""
+        """Add constraints for the inductive loop invariant."""
         inv = self._invariant_formula(self.sts.variables)
         inv_ = self._invariant_formula(self.sts.prime_variables)
 

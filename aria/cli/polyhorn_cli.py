@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from aria.efmc.engines.polyhorn.main import execute, add_default_config
+from aria.quant.polyhorn.main import add_default_config, execute
 
 logger = logging.getLogger(__name__)
 
