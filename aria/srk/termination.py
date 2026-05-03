@@ -14,8 +14,21 @@ from aria.srk.syntax import (
     Context,
     Symbol,
     Type,
+    Expression,
     FormulaExpression,
     ArithExpression,
+    Const,
+    Var,
+    Add,
+    Mul,
+    TrueExpr,
+    FalseExpr,
+    And,
+    Or,
+    Not,
+    Eq,
+    Lt,
+    Leq,
     mk_real,
     mk_const,
     mk_add,
@@ -117,6 +130,38 @@ class LinearRankingFunction:
         return f"LinearRankingFunction({self.coefficients}, {self.constant})"
 
 
+@dataclass(frozen=True)
+class _LinearExpr:
+    """Small linear expression model used by conservative termination checks."""
+
+    coeffs: Dict[Symbol, Fraction] = field(default_factory=dict)
+    const: Fraction = Fraction(0)
+
+    def __add__(self, other: "_LinearExpr") -> "_LinearExpr":
+        coeffs = dict(self.coeffs)
+        for sym, coeff in other.coeffs.items():
+            coeffs[sym] = coeffs.get(sym, Fraction(0)) + coeff
+            if coeffs[sym] == 0:
+                del coeffs[sym]
+        return _LinearExpr(coeffs, self.const + other.const)
+
+    def __neg__(self) -> "_LinearExpr":
+        return _LinearExpr(
+            {sym: -coeff for sym, coeff in self.coeffs.items()}, -self.const
+        )
+
+    def __sub__(self, other: "_LinearExpr") -> "_LinearExpr":
+        return self + (-other)
+
+    def scale(self, scalar: Fraction) -> "_LinearExpr":
+        if scalar == 0:
+            return _LinearExpr()
+        return _LinearExpr(
+            {sym: coeff * scalar for sym, coeff in self.coeffs.items()},
+            self.const * scalar,
+        )
+
+
 class TerminationAnalyzer:
     """Analyzer for proving program termination."""
 
@@ -126,35 +171,345 @@ class TerminationAnalyzer:
     def analyze_transitions(self, transitions: List[Any]) -> TerminationResult:
         """Analyze a list of transitions for termination.
 
-        Heuristic: try to synthesize a simple linear ranking function over
-        variables used by the transitions; if found, report terminating.
+        The analyzer is intentionally conservative: it only reports termination
+        when a linear candidate is bounded below by the transition guards and
+        decreases by a positive constant under every transition transform.
         """
         try:
             if not transitions:
                 return TerminationResult(True)
 
-            # Collect symbols appearing in transitions
-            used_syms: List[Symbol] = []
-            for tr in transitions:
-                if hasattr(tr, "uses"):
-                    for s in tr.uses():
-                        if s not in used_syms:
-                            used_syms.append(s)
-
-            if not used_syms:
+            linear_rf = self._synthesize_from_transitions(transitions)
+            if linear_rf is None:
                 return TerminationResult(False)
 
-            # Create a simple linear ranking function f(x) = -x_0
-            coeffs = QQVector(
-                {0: QQ.one().negate() if hasattr(QQ.one(), "negate") else -QQ.one()}
-            )
-            symbol_map = {0: used_syms[0]}
-            lrf = LinearRankingFunction(coeffs, QQ.zero(), symbol_map)
-            rf_term = lrf.to_term(self.context)
+            rf_term = linear_rf.to_term(self.context)
             return TerminationResult(True, RankingFunction(rf_term, True))
         except Exception as e:
             logf(f"Error analyzing transitions: {e}")
             return TerminationResult(False)
+
+    def _synthesize_from_transitions(
+        self, transitions: List[Any]
+    ) -> Optional[LinearRankingFunction]:
+        variables = self._transition_variables(transitions)
+        if not variables:
+            return None
+
+        for candidate in self._ranking_candidates(variables):
+            if self._valid_ranking_candidate(candidate, transitions, variables):
+                return self._linear_expr_to_ranking(candidate, variables)
+
+        return None
+
+    def _transition_variables(self, transitions: List[Any]) -> List[Symbol]:
+        variables: List[Symbol] = []
+
+        def add(sym: Symbol) -> None:
+            if isinstance(sym, Symbol) and sym.typ in (Type.INT, Type.REAL):
+                if sym not in variables:
+                    variables.append(sym)
+
+        for tr in transitions:
+            transform = getattr(tr, "transform", None)
+            if isinstance(transform, dict):
+                for sym, expr in transform.items():
+                    add(sym)
+                    for used in symbols(expr):
+                        add(used)
+
+            guard = getattr(tr, "guard", None)
+            if guard is not None:
+                for sym in symbols(guard):
+                    add(sym)
+
+            if hasattr(tr, "uses"):
+                for sym in tr.uses():
+                    add(sym)
+            if hasattr(tr, "defines"):
+                for sym in tr.defines():
+                    add(sym)
+
+        return variables
+
+    def _ranking_candidates(self, variables: List[Symbol]) -> List[_LinearExpr]:
+        candidates: List[_LinearExpr] = []
+
+        def add(candidate: _LinearExpr) -> None:
+            if candidate.coeffs and candidate not in candidates:
+                candidates.append(candidate)
+
+        for sym in variables:
+            add(_LinearExpr({sym: Fraction(1)}))
+            add(_LinearExpr({sym: Fraction(-1)}))
+
+        add(_LinearExpr({sym: Fraction(1) for sym in variables}))
+
+        for left in variables:
+            for right in variables:
+                if left != right:
+                    add(_LinearExpr({left: Fraction(1), right: Fraction(-1)}))
+
+        return candidates
+
+    def _valid_ranking_candidate(
+        self, candidate: _LinearExpr, transitions: List[Any], variables: List[Symbol]
+    ) -> bool:
+        for tr in transitions:
+            guard = getattr(tr, "guard", mk_true(self.context))
+            transform = getattr(tr, "transform", None)
+            if not isinstance(transform, dict):
+                return False
+            if isinstance(guard, FalseExpr) or (
+                hasattr(tr, "is_zero") and tr.is_zero()
+            ):
+                continue
+            if not self._guard_implies_nonnegative(candidate, guard, variables):
+                return False
+
+            post = self._post_linear_expr(candidate, transform, variables)
+            if post is None:
+                return False
+
+            decrease = candidate - post
+            if decrease.coeffs or decrease.const <= 0:
+                return False
+
+        return True
+
+    def _post_linear_expr(
+        self,
+        candidate: _LinearExpr,
+        transform: Dict[Symbol, Expression],
+        variables: List[Symbol],
+    ) -> Optional[_LinearExpr]:
+        post = _LinearExpr()
+        for sym, coeff in candidate.coeffs.items():
+            expr = transform.get(sym, mk_const(sym))
+            lin_expr = self._linear_expr_of(expr, variables)
+            if lin_expr is None:
+                return None
+            post = post + lin_expr.scale(coeff)
+        return post + _LinearExpr(const=candidate.const)
+
+    def _linear_expr_to_ranking(
+        self, candidate: _LinearExpr, variables: List[Symbol]
+    ) -> LinearRankingFunction:
+        symbol_map = {idx: sym for idx, sym in enumerate(variables)}
+        coeffs = {
+            idx: candidate.coeffs[sym]
+            for idx, sym in symbol_map.items()
+            if candidate.coeffs.get(sym, Fraction(0)) != 0
+        }
+        return LinearRankingFunction(QQVector(coeffs), candidate.const, symbol_map)
+
+    def _linear_expr_of(
+        self, expr: Expression, variables: List[Symbol]
+    ) -> Optional[_LinearExpr]:
+        if isinstance(expr, Const):
+            value = self._numeric_const(expr)
+            if value is not None:
+                return _LinearExpr(const=value)
+            if expr.symbol in variables:
+                return _LinearExpr({expr.symbol: Fraction(1)})
+            return None
+
+        if isinstance(expr, Var):
+            for sym in variables:
+                if sym.id == expr.var_id and sym.typ == expr.var_type:
+                    return _LinearExpr({sym: Fraction(1)})
+            return None
+
+        if isinstance(expr, Add):
+            result = _LinearExpr()
+            for arg in expr.args:
+                lin_arg = self._linear_expr_of(arg, variables)
+                if lin_arg is None:
+                    return None
+                result = result + lin_arg
+            return result
+
+        if isinstance(expr, Mul):
+            scalar = Fraction(1)
+            linear_part: Optional[_LinearExpr] = None
+            for arg in expr.args:
+                lin_arg = self._linear_expr_of(arg, variables)
+                if lin_arg is None:
+                    return None
+                if lin_arg.coeffs:
+                    if linear_part is not None:
+                        return None
+                    linear_part = lin_arg
+                else:
+                    scalar *= lin_arg.const
+            return (linear_part or _LinearExpr(const=Fraction(1))).scale(scalar)
+
+        return None
+
+    def _numeric_const(self, expr: Const) -> Optional[Fraction]:
+        name = expr.symbol.name
+        if name is None:
+            return None
+        if name.startswith("real_"):
+            name = name[5:]
+        try:
+            return Fraction(name)
+        except (ValueError, TypeError):
+            try:
+                return Fraction(str(float(name)))
+            except (ValueError, TypeError):
+                return None
+
+    def _guard_implies_nonnegative(
+        self, candidate: _LinearExpr, guard: FormulaExpression, variables: List[Symbol]
+    ) -> bool:
+        if not candidate.coeffs:
+            return candidate.const >= 0
+        if isinstance(guard, TrueExpr):
+            return False
+        if isinstance(guard, FalseExpr):
+            return True
+
+        needed = _LinearExpr(const=candidate.const)
+        needed = needed + _LinearExpr(dict(candidate.coeffs))
+        if self._is_direct_nonnegative_guard(needed, guard, variables):
+            return True
+
+        return False
+
+    def _is_direct_nonnegative_guard(
+        self, needed: _LinearExpr, guard: FormulaExpression, variables: List[Symbol]
+    ) -> bool:
+        atoms = self._guard_atoms(guard)
+        if atoms is None:
+            return False
+
+        if not needed.coeffs:
+            return needed.const >= 0
+
+        for atom in atoms:
+            if isinstance(atom, Leq):
+                left = self._linear_expr_of(atom.left, variables)
+                right = self._linear_expr_of(atom.right, variables)
+                if left is None or right is None:
+                    continue
+                if self._same_linear_expr(right - left, needed):
+                    return True
+            elif isinstance(atom, Lt):
+                left = self._linear_expr_of(atom.left, variables)
+                right = self._linear_expr_of(atom.right, variables)
+                if left is None or right is None:
+                    continue
+                diff = right - left
+                if self._same_linear_expr(diff, needed):
+                    return True
+                if (
+                    self._same_coeffs(diff, needed)
+                    and diff.const >= needed.const
+                    and all(sym.typ == Type.INT for sym in needed.coeffs)
+                ):
+                    return True
+
+        return False
+
+    def _guard_atoms(
+        self, guard: FormulaExpression
+    ) -> Optional[List[FormulaExpression]]:
+        if isinstance(guard, TrueExpr):
+            return []
+        if isinstance(guard, FalseExpr):
+            return [guard]
+        if isinstance(guard, And):
+            atoms: List[FormulaExpression] = []
+            for arg in guard.args:
+                arg_atoms = self._guard_atoms(arg)
+                if arg_atoms is None:
+                    return None
+                atoms.extend(arg_atoms)
+            return atoms
+        if isinstance(guard, (Or, Not)):
+            return None
+        return [guard]
+
+    def _same_linear_expr(self, left: _LinearExpr, right: _LinearExpr) -> bool:
+        return self._same_coeffs(left, right) and left.const == right.const
+
+    def _same_coeffs(self, left: _LinearExpr, right: _LinearExpr) -> bool:
+        return left.coeffs == right.coeffs
+
+    def _transitions_from_formula(self, transition_formula: Any) -> Optional[List[Any]]:
+        if hasattr(transition_formula, "transform") and hasattr(
+            transition_formula, "guard"
+        ):
+            return [transition_formula]
+
+        formula = self._get_formula(transition_formula)
+        var_pairs = self._get_symbol_pairs(transition_formula)
+        if formula is None or not var_pairs:
+            return None
+
+        atoms = self._guard_atoms(formula)
+        if atoms is None:
+            return None
+
+        post_to_pre = {post: pre for pre, post in var_pairs}
+        post_symbols = set(post_to_pre)
+        variables = [pre for pre, _ in var_pairs]
+        transform: Dict[Symbol, Expression] = {}
+        guards: List[FormulaExpression] = []
+
+        for atom in atoms:
+            assigned = self._assignment_from_atom(atom, post_to_pre, post_symbols)
+            if assigned is None:
+                if symbols(atom) & post_symbols:
+                    return None
+                guards.append(atom)
+            else:
+                pre, expr = assigned
+                if self._linear_expr_of(expr, variables) is None:
+                    return None
+                transform[pre] = expr
+
+        guard = mk_true(self.context) if not guards else mk_and(self.context, guards)
+
+        @dataclass(frozen=True)
+        class _FormulaTransition:
+            transform: Dict[Symbol, Expression]
+            guard: FormulaExpression
+
+        return [_FormulaTransition(transform, guard)]
+
+    def _assignment_from_atom(
+        self,
+        atom: FormulaExpression,
+        post_to_pre: Dict[Symbol, Symbol],
+        post_symbols: Set[Symbol],
+    ) -> Optional[Tuple[Symbol, Expression]]:
+        if not isinstance(atom, Eq):
+            return None
+        if isinstance(atom.left, Const) and atom.left.symbol in post_to_pre:
+            if symbols(atom.right) & post_symbols:
+                return None
+            return post_to_pre[atom.left.symbol], atom.right
+        if isinstance(atom.right, Const) and atom.right.symbol in post_to_pre:
+            if symbols(atom.left) & post_symbols:
+                return None
+            return post_to_pre[atom.right.symbol], atom.left
+        return None
+
+    def _get_symbol_pairs(self, transition_formula: Any) -> List[Tuple[Symbol, Symbol]]:
+        raw_symbols = getattr(transition_formula, "symbols", None)
+        if callable(raw_symbols):
+            raw_symbols = raw_symbols()
+        if raw_symbols is None:
+            return []
+        return list(raw_symbols)
+
+    def _get_formula(self, transition_formula: Any) -> Optional[FormulaExpression]:
+        formula = getattr(transition_formula, "formula", None)
+        if callable(formula):
+            formula = formula()
+        return formula
 
     def synthesize_linear_ranking_function(
         self, pre_vars: List[Symbol], post_vars: List[Symbol], guard: FormulaExpression
@@ -169,37 +524,20 @@ class TerminationAnalyzer:
         We use Farkas' lemma and linear programming to find such a function.
         """
         try:
-            from .smt import Solver
-            from .polyhedron import Polyhedron
-
-            # Build constraint system for ranking function synthesis
-            # We need: guard(x, x') => (f(x) >= 0 and f(x) - f(x') >= delta)
-
-            # For simplicity, we try to find coefficients via constraint solving
-            # This is a simplified version - a full implementation would use
-            # Farkas' lemma and LP solving
-
             n = len(pre_vars)
-            if n == 0:
+            if n == 0 or len(pre_vars) != len(post_vars):
                 return None
 
-            # Create coefficient variables for the ranking function
-            # f(x) = c_0 * x_0 + ... + c_{n-1} * x_{n-1} + d
+            formula = guard or mk_true(self.context)
+            from aria.srk.transitionFormula import TransitionFormula
 
-            # Simple heuristic: try some common linear ranking functions
-            # This is incomplete but handles many practical cases
-
-            # Try f(x) = -x_i for each variable
-            for i, var in enumerate(pre_vars):
-                coeff_vec = QQVector({i: QQ.of_int(-1)})
-                symbol_map = {i: var}
-                candidate = LinearRankingFunction(coeff_vec, QQ.zero, symbol_map)
-
-                # TODO: Verify that this is a valid ranking function
-                # For now, we just return the candidate
-                return candidate
-
-            return None
+            tf = TransitionFormula(
+                formula=formula, symbols=list(zip(pre_vars, post_vars))
+            )
+            transitions = self._transitions_from_formula(tf)
+            if not transitions:
+                return None
+            return self._synthesize_from_transitions(transitions)
 
         except Exception as e:
             logf(f"Error synthesizing linear ranking function: {e}")
@@ -210,16 +548,18 @@ class TerminationAnalyzer:
     ) -> Optional[RankingFunction]:
         """Synthesize a ranking function for a transition formula."""
         try:
+            transitions = self._transitions_from_formula(transition_formula)
+            if transitions:
+                linear_rf = self._synthesize_from_transitions(transitions)
+                if linear_rf:
+                    return RankingFunction(linear_rf.to_term(self.context), True)
+
             # Extract pre/post variables from transition formula
-            if hasattr(transition_formula, "symbols"):
-                var_pairs = transition_formula.symbols()
+            var_pairs = self._get_symbol_pairs(transition_formula)
+            if var_pairs:
                 pre_vars = [pre for pre, _ in var_pairs]
                 post_vars = [post for _, post in var_pairs]
-                guard = (
-                    transition_formula.formula()
-                    if hasattr(transition_formula, "formula")
-                    else None
-                )
+                guard = self._get_formula(transition_formula)
             else:
                 # Fallback: try to find variables in the formula
                 pre_vars = []
@@ -248,6 +588,16 @@ class TerminationAnalyzer:
     def prove_termination(self, transition_system: Any) -> TerminationResult:
         """Prove termination of a transition system."""
         try:
+            if isinstance(transition_system, list):
+                return self.analyze_transitions(transition_system)
+
+            if hasattr(transition_system, "edges"):
+                edges = transition_system.edges
+                if callable(edges):
+                    edges = edges()
+                transitions = [edge[1] for edge in edges]
+                return self.analyze_transitions(transitions)
+
             # Try to find a ranking function
             ranking_function = self.synthesize_ranking_function(transition_system)
 

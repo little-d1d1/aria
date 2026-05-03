@@ -5,6 +5,9 @@ Tests for the termination analysis module.
 import unittest
 from aria.srk.syntax import Context, Symbol, Type
 from aria.srk.termination import TerminationAnalyzer, RankingFunction, TerminationResult
+from aria.srk.transition import Transition
+from aria.srk.qQ import QQ
+from aria.srk.syntax import mk_add, mk_const, mk_lt, mk_real
 
 
 class TestTerminationAnalyzer(unittest.TestCase):
@@ -22,15 +25,71 @@ class TestTerminationAnalyzer(unittest.TestCase):
         """Test analyzing a simple loop for termination."""
         analyzer = TerminationAnalyzer(self.context)
 
-        # Create a simple loop transition
-        x = self.context.mk_symbol("x", Type.INT)
-        from aria.srk.transition import Transition
-
         # This is a placeholder - real implementation would create actual transitions
         transitions = []  # Empty for now
 
         result = analyzer.analyze_transitions(transitions)
         self.assertIsInstance(result, TerminationResult)
+
+    def test_analyze_decrementing_counter_with_guard(self):
+        """x > 0; x := x - 1 is proved by ranking function x."""
+        analyzer = TerminationAnalyzer(self.context)
+        x = self.context.mk_symbol("x", Type.INT)
+        zero = mk_real(self.context, QQ.zero())
+        minus_one = mk_real(self.context, QQ.of_int(-1))
+        tr = Transition(
+            transform={x: mk_add([mk_const(x), minus_one])},
+            guard=mk_lt(zero, mk_const(x)),
+            context=self.context,
+        )
+
+        result = analyzer.analyze_transitions([tr])
+
+        self.assertTrue(result.terminates)
+        self.assertIsNotNone(result.ranking_function)
+
+    def test_analyze_increasing_counter_to_bound(self):
+        """x < n; x := x + 1 is proved by ranking function n - x."""
+        analyzer = TerminationAnalyzer(self.context)
+        x = self.context.mk_symbol("x", Type.INT)
+        n = self.context.mk_symbol("n", Type.INT)
+        one = mk_real(self.context, QQ.one())
+        tr = Transition(
+            transform={x: mk_add([mk_const(x), one])},
+            guard=mk_lt(mk_const(x), mk_const(n)),
+            context=self.context,
+        )
+
+        result = analyzer.analyze_transitions([tr])
+
+        self.assertTrue(result.terminates)
+        self.assertIsNotNone(result.ranking_function)
+
+    def test_analyze_decrement_without_lower_bound_is_unknown(self):
+        """A decreasing transform without a guard lower bound stays unknown."""
+        analyzer = TerminationAnalyzer(self.context)
+        x = self.context.mk_symbol("x", Type.INT)
+        minus_one = mk_real(self.context, QQ.of_int(-1))
+        tr = Transition.assign(self.context, x, mk_add([mk_const(x), minus_one]))
+
+        result = analyzer.analyze_transitions([tr])
+
+        self.assertFalse(result.terminates)
+
+    def test_analyze_havoc_like_transform_is_unknown(self):
+        """Identity/havoc-like transforms do not prove a positive decrease."""
+        analyzer = TerminationAnalyzer(self.context)
+        x = self.context.mk_symbol("x", Type.INT)
+        zero = mk_real(self.context, QQ.zero())
+        tr = Transition(
+            transform={x: mk_const(x)},
+            guard=mk_lt(zero, mk_const(x)),
+            context=self.context,
+        )
+
+        result = analyzer.analyze_transitions([tr])
+
+        self.assertFalse(result.terminates)
 
 
 class TestRankingFunction(unittest.TestCase):

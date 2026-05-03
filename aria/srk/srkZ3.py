@@ -80,6 +80,26 @@ class Z3Result(Enum):
     UNKNOWN = "unknown"
 
 
+def _numeric_symbol_value(symbol: Symbol) -> Optional[Tuple[Fraction, bool]]:
+    """Return a concrete numeric value encoded by SRK's numeric const symbols."""
+
+    name = symbol.name
+    if name is None:
+        return None
+
+    if symbol.typ == Type.REAL and name.startswith("real_"):
+        raw = name[5:]
+    elif symbol.typ in (Type.INT, Type.REAL):
+        raw = name
+    else:
+        return None
+
+    try:
+        return Fraction(raw), symbol.typ == Type.INT
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
 def bool_val(z3_expr) -> bool:
     """Convert Z3 boolean value to Python boolean."""
     if not Z3_AVAILABLE:
@@ -231,6 +251,13 @@ class SrkZ3:
 
     def get_z3_symbol(self, symbol: Symbol) -> z3.ExprRef:
         """Get or create Z3 expression for SRK symbol."""
+        numeric = _numeric_symbol_value(symbol)
+        if numeric is not None:
+            value, is_int = numeric
+            if is_int and value.denominator == 1:
+                return z3.IntVal(value.numerator, self.z3_ctx)
+            return z3.RealVal(f"{value.numerator}/{value.denominator}", self.z3_ctx)
+
         if symbol in self.symbol_map:
             return self.symbol_map[symbol]
 

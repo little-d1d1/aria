@@ -1015,17 +1015,11 @@ def simsat(srk: Any, phi: Any) -> str:
     Returns:
         'Sat', 'Unsat', or 'Unknown'
     """
-    from .smt import is_sat
-
-    # For now, fall back to SMT solver
-    result = is_sat(srk, phi)
-
-    if result == "Sat":
-        return "Sat"
-    elif result == "Unsat":
-        return "Unsat"
+    if _contains_quantifier(phi):
+        qf_pre, psi = normalize(srk, phi)
     else:
-        return "Unknown"
+        qf_pre, psi = [], phi
+    return simsat_core(srk, qf_pre, psi)
 
 
 def qe_mbp(srk: Any, phi: Any) -> Any:
@@ -1181,8 +1175,36 @@ class StrategyImprovementSolver:
 
     def solve(self, game):
         """Solve game using strategy improvement."""
-        # Placeholder implementation
-        return "Unknown"
+        qf_pre, phi = self._destructure_game(game)
+        if phi is None:
+            return "Unknown"
+
+        result = simsat_core(self.context, qf_pre, phi)
+        if result == "Unknown":
+            return "Unknown"
+        return result
+
+    def maximize(self, phi: Any, objective: Any) -> Any:
+        """Maximize an objective in the supported linear-arithmetic fragment."""
+        return maximize(self.context, phi, objective)
+
+    def check_strategy(
+        self, qf_pre: List[Tuple[str, Any]], phi: Any, strategy: Any
+    ) -> Optional[bool]:
+        """Validate a candidate strategy when the bounded Z3 path supports it."""
+        return check_strategy(self.context, qf_pre, phi, strategy)
+
+    def _destructure_game(
+        self, game: Any
+    ) -> Tuple[List[Tuple[str, Any]], Optional[Any]]:
+        if isinstance(game, dict):
+            phi = game.get("formula") or game.get("phi")
+            qf_pre = game.get("prefix") or game.get("qf_pre") or []
+            return (qf_pre, phi)
+        if isinstance(game, tuple) and len(game) == 2:
+            qf_pre, phi = game
+            return (qf_pre, phi)
+        return ([], game)
 
 
 def is_presburger_atom(srk: Any, atom: Any) -> bool:
@@ -1909,16 +1931,177 @@ class CSS:
             return "Unknown"
 
 
-def simsat_core(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> str:
-    """Game-theoretic satisfiability core (simplified)."""
-    from .smt import is_sat
+def _quantifier_symbol_name(symbol: Any) -> str:
+    """Return the name used by the SMT translator for a quantified symbol."""
+    return getattr(symbol, "name", None) or str(symbol)
 
-    res = is_sat(srk, phi)
-    if res == "Sat":
+
+def _quantified_formula(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> Any:
+    """Wrap a quantifier-free matrix with the supplied quantifier prefix."""
+    from .syntax import mk_exists, mk_forall
+
+    result = phi
+    for qt, symbol in reversed(qf_pre):
+        name = _quantifier_symbol_name(symbol)
+        typ = getattr(symbol, "typ", None)
+        if typ is None:
+            return None
+        if qt == "Forall":
+            result = mk_forall(srk, name, typ, result)
+        elif qt == "Exists":
+            result = mk_exists(srk, name, typ, result)
+        else:
+            return None
+    return result
+
+
+def _is_numeric_literal(symbol: Any) -> bool:
+    """Recognize symbols used by this port to encode numeric constants."""
+    from .syntax import Type
+
+    name = getattr(symbol, "name", None)
+    typ = getattr(symbol, "typ", None)
+    if name is None or typ not in (Type.INT, Type.REAL):
+        return False
+    if typ == Type.REAL and name.startswith("real_"):
+        name = name[5:]
+    try:
+        Fraction(name)
+        return True
+    except Exception:
+        return False
+
+
+def _is_linear_arithmetic_expr(expr: Any, in_formula: bool = False) -> bool:
+    """Check the small arithmetic fragment that the Z3-backed path supports."""
+    from .syntax import (
+        Add,
+        And,
+        Const,
+        Eq,
+        Exists,
+        FalseExpr,
+        Forall,
+        Ite,
+        Leq,
+        Lt,
+        Mul,
+        Not,
+        Or,
+        TrueExpr,
+        Type,
+        Var,
+        expr_typ,
+    )
+
+    if isinstance(expr, (TrueExpr, FalseExpr)):
+        return True
+    if isinstance(expr, Const):
+        return expr.symbol.typ in (Type.INT, Type.REAL, Type.BOOL)
+    if isinstance(expr, Var):
+        return expr.var_type in (Type.INT, Type.REAL, Type.BOOL)
+    if isinstance(expr, (Eq, Lt, Leq)):
+        return _is_linear_arithmetic_expr(expr.left) and _is_linear_arithmetic_expr(
+            expr.right
+        )
+    if isinstance(expr, (And, Or)):
+        return all(_is_linear_arithmetic_expr(arg, True) for arg in expr.args)
+    if isinstance(expr, Not):
+        return _is_linear_arithmetic_expr(expr.arg, True)
+    if isinstance(expr, (Forall, Exists)):
+        return expr.var_type in (Type.INT, Type.REAL, Type.BOOL) and (
+            _is_linear_arithmetic_expr(expr.body, True)
+        )
+    if isinstance(expr, Add):
+        return all(_is_linear_arithmetic_expr(arg) for arg in expr.args)
+    if isinstance(expr, Mul):
+        nonlinear_args = 0
+        for arg in expr.args:
+            if not _is_linear_arithmetic_expr(arg):
+                return False
+            if not (isinstance(arg, Const) and _is_numeric_literal(arg.symbol)):
+                try:
+                    if expr_typ(arg) in (Type.INT, Type.REAL):
+                        nonlinear_args += 1
+                except Exception:
+                    nonlinear_args += 1
+        return nonlinear_args <= 1
+    if isinstance(expr, Ite):
+        return (
+            _is_linear_arithmetic_expr(expr.condition, True)
+            and _is_linear_arithmetic_expr(expr.then_branch, in_formula)
+            and _is_linear_arithmetic_expr(expr.else_branch, in_formula)
+        )
+    return False
+
+
+def _contains_quantifier(expr: Any) -> bool:
+    from .syntax import Exists, Forall
+
+    if isinstance(expr, (Exists, Forall)):
+        return True
+    for attr in ("args",):
+        for child in getattr(expr, attr, ()) or ():
+            if _contains_quantifier(child):
+                return True
+    for attr in (
+        "arg",
+        "left",
+        "right",
+        "condition",
+        "then_branch",
+        "else_branch",
+        "body",
+    ):
+        child = getattr(expr, attr, None)
+        if child is not None and _contains_quantifier(child):
+            return True
+    return False
+
+
+def _smt_result_name(result: Any) -> str:
+    value = getattr(result, "value", result)
+    if value in ("sat", "Sat"):
         return "Sat"
-    if res == "Unsat":
+    if value in ("unsat", "Unsat"):
         return "Unsat"
     return "Unknown"
+
+
+def _bounded_z3_simsat(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> str:
+    """Validate an alternating linear-arithmetic game with Z3 when possible."""
+    from .smt import is_sat
+
+    quantified = _quantified_formula(srk, qf_pre, phi)
+    if quantified is None or not _is_linear_arithmetic_expr(quantified, True):
+        return "Unknown"
+    try:
+        return _smt_result_name(is_sat(srk, quantified))
+    except Exception:
+        return "Unknown"
+
+
+def _z3_number_to_fraction(value: Any) -> Optional[Fraction]:
+    """Convert a finite Z3 numeral/bound to Fraction when possible."""
+    text = str(value)
+    if text in ("oo", "+oo", "-oo"):
+        return None
+    if text.endswith("?"):
+        text = text[:-1]
+    try:
+        if hasattr(value, "as_fraction"):
+            return Fraction(value.as_fraction())
+        if "/" in text:
+            num, den = text.split("/", 1)
+            return Fraction(int(num), int(den))
+        return Fraction(text)
+    except Exception:
+        return None
+
+
+def simsat_core(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> str:
+    """Game-theoretic satisfiability core for supported linear arithmetic."""
+    return _bounded_z3_simsat(srk, qf_pre, phi)
 
 
 def simsat_forward(srk: Any, phi: Any) -> str:
@@ -1944,87 +2127,60 @@ def maximize_feasible(srk: Any, phi: Any, t: Any) -> Any:
     Returns:
         'MinusInfinity', 'Infinity', 'Bounded' with value, or 'Unknown'
     """
-    from .syntax import (
-        symbols,
-        mk_symbol,
-        mk_leq,
-        mk_sub,
-        mk_real,
-        mk_and,
-        mk_not,
-        normalize,
-        mk_const,
-    )
-    from .smt import is_sat
-    from .srkZ3 import optimize_box, Z3Result
-    from .interval import Interval
-    from .qQ import QQ
-
-    # Get all constants in phi and t
-    phi_constants = symbols(phi)
-    t_constants = symbols(t)
-    all_constants = phi_constants | t_constants
-
-    # Normalize phi to prenex form
-    qf_pre, phi_norm = normalize(srk, phi)
-
-    # Add existential quantifiers for all constants
-    qf_pre = [("Exists", k) for k in all_constants] + qf_pre
-
-    # First check if the objective is unbounded
-    # This is done by checking satisfiability of:
-    # forall i. exists ks. phi /\ t >= i
-    objective = mk_symbol(srk, name="objective", typ="TyReal")
-    qf_pre_unbounded = [("Forall", objective)] + qf_pre
-    phi_unbounded = mk_and(
-        srk,
-        [
-            phi_norm,
-            mk_leq(
-                srk, mk_sub(srk, mk_const(srk, objective), t), mk_real(srk, QQ.zero())
-            ),
-        ],
-    )
-
-    # Check if unbounded
-    unbounded_result = simsat_core(srk, qf_pre_unbounded, phi_unbounded)
-    if unbounded_result == "Unsat":
-        return "MinusInfinity"  # phi is unsatisfiable
-    elif unbounded_result == "Unknown":
+    if _contains_quantifier(phi):
+        qf_pre, phi_norm = normalize(srk, phi)
+    else:
+        qf_pre, phi_norm = [], phi
+    if qf_pre or not (
+        _is_linear_arithmetic_expr(phi_norm, True) and _is_linear_arithmetic_expr(t)
+    ):
         return "Unknown"
 
-    # If we get here, phi is satisfiable, so check if objective is bounded
-    # Use box optimization to find bounds
+    from .smt import is_sat
+    from .srkZ3 import make_z3_context, z3, Z3_AVAILABLE
+    from .syntax import mk_and, mk_lt, mk_real
+
+    if not Z3_AVAILABLE:
+        return "Unknown"
+
+    sat_result = _smt_result_name(is_sat(srk, phi_norm))
+    if sat_result == "Unsat":
+        return "MinusInfinity"
+    if sat_result == "Unknown":
+        return "Unknown"
+
     try:
-        result, intervals = optimize_box(srk, phi_norm, [t])
+        z3_ctx = make_z3_context(srk)
+        opt = z3.Optimize(ctx=z3_ctx.z3_ctx)
+        opt.add(z3_ctx.z3_of_formula(phi_norm))
+        handle = opt.maximize(z3_ctx._z3_of_expr(t))
+        result = opt.check()
 
-        if result == Z3Result.UNSAT:
+        if result == z3.unsat:
             return "MinusInfinity"
-        elif result == Z3Result.UNKNOWN:
-            return "Unknown"
-        elif result == Z3Result.SAT and intervals:
-            # Get the upper bound of the objective
-            lower_bound, upper_bound = intervals[0]
-
-            if upper_bound is None:
-                return "Infinity"
-            else:
-                # Convert Z3 value to QQ
-                if hasattr(upper_bound, "as_fraction"):
-                    upper_qq = QQ.of_string(str(upper_bound.as_fraction()))
-                else:
-                    upper_qq = QQ.of_string(str(upper_bound))
-
-                return ("Bounded", upper_qq)
-        else:
+        if result != z3.sat:
             return "Unknown"
 
-    except Exception as e:
-        # If optimization fails, fall back to simple satisfiability check
-        if is_sat(srk, phi_norm) == "Sat":
-            return "Infinity"  # Conservative: assume unbounded if we can't optimize
-        else:
+        upper = opt.upper(handle)
+        upper_text = str(upper)
+        if upper_text in ("oo", "+oo"):
+            return "Infinity"
+        if upper_text == "-oo":
             return "MinusInfinity"
+
+        upper_fraction = _z3_number_to_fraction(upper)
+        if upper_fraction is None:
+            return "Unknown"
+
+        # Validate the optimum with a second solver query: no model may improve it.
+        better = mk_and(srk, [phi_norm, mk_lt(srk, mk_real(srk, upper_fraction), t)])
+        if _smt_result_name(is_sat(srk, better)) != "Unsat":
+            return "Unknown"
+
+        return ("Bounded", upper_fraction)
+
+    except Exception:
+        return "Unknown"
 
 
 def maximize(srk: Any, phi: Any, t: Any) -> Any:
@@ -2073,9 +2229,31 @@ def winning_strategy(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> Any:
 
 def check_strategy(
     srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any, strategy: Any
-) -> bool:
-    from .smt import is_sat
-    from .syntax import mk_not, mk_and
+) -> Optional[bool]:
+    """Validate a candidate strategy for supported linear arithmetic games.
 
-    # Best-effort: check phi is valid under strategy by SMT
-    return is_sat(srk, mk_and(srk, [phi, mk_not(srk, phi)])) == "Unsat"
+    Returns True/False when Z3 can prove the strategy formula satisfiable or
+    unsatisfiable, and None when the strategy or formula is outside the bounded
+    validation fragment.
+    """
+    if not _is_linear_arithmetic_expr(phi, True):
+        return None
+
+    if strategy is None or strategy == {} or strategy == {"strategy": []}:
+        strategy_formula = phi
+    elif isinstance(strategy, Skeleton.SEmpty):
+        strategy_formula = phi
+    elif isinstance(strategy, (Skeleton.SForall, Skeleton.SExists)):
+        try:
+            strategy_formula = Skeleton.winning_formula(srk, strategy, phi)
+        except Exception:
+            return None
+    else:
+        return None
+
+    result = simsat_core(srk, qf_pre, strategy_formula)
+    if result == "Sat":
+        return True
+    if result == "Unsat":
+        return False
+    return None

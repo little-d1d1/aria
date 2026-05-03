@@ -925,7 +925,7 @@ class ExpressionBuilder:
         if isinstance(var_id_or_symbol, Symbol):
             # Called as mk_var(symbol) - use symbol's id and type
             symbol = var_id_or_symbol
-            return Var(symbol.id, symbol.typ)
+            return Var(symbol.id, symbol.typ, symbol.name)
         elif isinstance(var_id_or_symbol, int) and typ is not None:
             # Called as mk_var(var_id, typ) - use given ID and type
             if not isinstance(typ, Type):
@@ -1110,7 +1110,7 @@ def mk_var(*args) -> Var:
         elif isinstance(arg, Symbol):
             # Called as mk_var(symbol) - use default context and symbol's type
             symbol = arg
-            return _default_builder.mk_var(symbol.id, symbol.typ)
+            return _default_builder.mk_var(symbol)
         else:
             raise TypeError(
                 f"mk_var expects Symbol or Context as single argument, got {type(arg)}"
@@ -1122,7 +1122,7 @@ def mk_var(*args) -> Var:
             # Called as mk_var(context, symbol)
             context, symbol = first, second
             if isinstance(symbol, Symbol):
-                return context.mk_var(symbol.id, symbol.typ)
+                return context.mk_var(symbol)
             else:
                 raise TypeError(
                     f"Second argument must be Symbol when first is Context, got {type(symbol)}"
@@ -1592,6 +1592,30 @@ def mk_not(*args) -> Not:
         raise TypeError(f"mk_not expects (arg) or (context, arg), got {len(args)} args")
 
 
+def mk_iff(*args) -> FormulaExpression:
+    """Create Boolean equivalence.
+
+    Supports:
+    - mk_iff(left, right)
+    - mk_iff(context, left, right)
+    """
+    if len(args) == 2:
+        left, right = args
+        return mk_and([mk_or([mk_not(left), right]), mk_or([mk_not(right), left])])
+    if len(args) == 3 and isinstance(args[0], Context):
+        context, left, right = args
+        return mk_and(
+            context,
+            [
+                mk_or(context, [mk_not(context, left), right]),
+                mk_or(context, [mk_not(context, right), left]),
+            ],
+        )
+    raise TypeError(
+        f"mk_iff expects (left, right) or (context, left, right), got {len(args)} args"
+    )
+
+
 def mk_app(
     context_or_symbol: Union[Context, Symbol],
     symbol_or_args: Union[Symbol, List[Expression]],
@@ -1614,11 +1638,30 @@ def mk_app(
     if isinstance(context_or_symbol, Context) and args is not None:
         # Called as mk_app(context, symbol, args)
         context, symbol = context_or_symbol, symbol_or_args
-        return context.mk_app(symbol, args)
+        builder = make_expression_builder(context)
+        return builder.mk_app(symbol, args)
     else:
         # Called as mk_app(symbol, args) - use default context
         symbol, args = context_or_symbol, symbol_or_args
         return _default_builder.mk_app(symbol, args)
+
+
+def mk_pow(*args) -> App:
+    """Create a power term using the port's uninterpreted pow symbol."""
+    if len(args) == 2:
+        base, exponent = args
+        symbol = _default_builder.mk_symbol("pow", Type.FUN)
+        return _default_builder.mk_app(symbol, [base, exponent])
+    if len(args) == 3 and isinstance(args[0], Context):
+        context, base, exponent = args
+        builder = make_expression_builder(context)
+        symbol = context._named_symbols.get("pow")
+        if symbol is None:
+            symbol = builder.mk_symbol("pow", Type.FUN)
+        return builder.mk_app(symbol, [base, exponent])
+    raise TypeError(
+        f"mk_pow expects (base, exponent) or (context, base, exponent), got {len(args)} args"
+    )
 
 
 def mk_select(
@@ -1804,8 +1847,11 @@ def substitute(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Express
     class SubstitutionVisitor(ExpressionVisitor[Expression]):
         def __init__(self, subst_map: Dict[Symbol, Expression]):
             self.subst_map = subst_map
+            self._by_id = {symbol.id: replacement for symbol, replacement in subst_map.items()}
 
         def visit_var(self, var: Var) -> Expression:
+            if var.var_id in self._by_id:
+                return self._by_id[var.var_id]
             return var
 
         def visit_const(self, const: Const) -> Expression:
@@ -1879,22 +1925,154 @@ def substitute(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Express
             return Leq(new_left, new_right)
 
         def visit_forall(self, forall: Forall) -> Expression:
-            # For quantifiers, we need to be careful about variable capture
-            # For now, we'll substitute in the body but not rename bound variables
-            new_body = forall.body.accept(self)
+            new_body = self._visit_quantifier_body(forall.var_name, forall.body)
             return Forall(forall.var_name, forall.var_type, new_body)
 
         def visit_exists(self, exists: Exists) -> Expression:
-            # For quantifiers, we need to be careful about variable capture
-            # For now, we'll substitute in the body but not rename bound variables
-            new_body = exists.body.accept(self)
+            new_body = self._visit_quantifier_body(exists.var_name, exists.body)
             return Exists(exists.var_name, exists.var_type, new_body)
+
+        def _visit_quantifier_body(
+            self, bound_name: str, body: FormulaExpression
+        ) -> Expression:
+            active = {
+                symbol: replacement
+                for symbol, replacement in self.subst_map.items()
+                if symbol.name != bound_name
+            }
+            return substitute(body, active) if active else body
 
         def _default_visit(self, expr: Expression) -> Expression:
             return expr
 
     visitor = SubstitutionVisitor(subst_map)
     return expr.accept(visitor)
+
+
+def substitute_map(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Expression:
+    """Compatibility alias for substituting a symbol-to-expression map."""
+    return substitute(expr, subst_map)
+
+
+def free_vars(expr: Expression) -> Set[Symbol]:
+    """Extract free constant/variable symbols from an expression.
+
+    Bound quantifier names are removed by name, matching this port's quantifier
+    representation.  Function symbols are not counted as free variables.
+    """
+
+    def go(e: Expression, bound_names: Set[str]) -> Set[Symbol]:
+        if isinstance(e, Const):
+            if e.symbol.name in bound_names:
+                return set()
+            return {e.symbol}
+        if isinstance(e, Var):
+            if e.name in bound_names:
+                return set()
+            return {Symbol(e.var_id, e.name, e.var_type)}
+        if isinstance(e, App):
+            result: Set[Symbol] = set()
+            for arg in e.args:
+                result.update(go(arg, bound_names))
+            return result
+        if isinstance(e, Select):
+            return go(e.array, bound_names) | go(e.index, bound_names)
+        if isinstance(e, Store):
+            return (
+                go(e.array, bound_names)
+                | go(e.index, bound_names)
+                | go(e.value, bound_names)
+            )
+        if isinstance(e, (Add, Mul, And, Or)):
+            result: Set[Symbol] = set()
+            for arg in e.args:
+                result.update(go(arg, bound_names))
+            return result
+        if isinstance(e, Ite):
+            return (
+                go(e.condition, bound_names)
+                | go(e.then_branch, bound_names)
+                | go(e.else_branch, bound_names)
+            )
+        if isinstance(e, Not):
+            return go(e.arg, bound_names)
+        if isinstance(e, (Eq, Lt, Leq)):
+            return go(e.left, bound_names) | go(e.right, bound_names)
+        if isinstance(e, Forall):
+            return go(e.body, bound_names | {e.var_name})
+        if isinstance(e, Exists):
+            return go(e.body, bound_names | {e.var_name})
+        return set()
+
+    return go(expr, set())
+
+
+def vars(expr: Expression) -> Set[Symbol]:
+    """Compatibility alias for free variables."""
+    return free_vars(expr)
+
+
+def size(expr: Expression) -> int:
+    """Return the number of AST nodes in an expression."""
+    if isinstance(expr, (Var, Const, TrueExpr, FalseExpr)):
+        return 1
+    if isinstance(expr, App):
+        return 1 + sum(size(arg) for arg in expr.args)
+    if isinstance(expr, Select):
+        return 1 + size(expr.array) + size(expr.index)
+    if isinstance(expr, Store):
+        return 1 + size(expr.array) + size(expr.index) + size(expr.value)
+    if isinstance(expr, (Add, Mul, And, Or)):
+        return 1 + sum(size(arg) for arg in expr.args)
+    if isinstance(expr, Ite):
+        return 1 + size(expr.condition) + size(expr.then_branch) + size(expr.else_branch)
+    if isinstance(expr, Not):
+        return 1 + size(expr.arg)
+    if isinstance(expr, (Eq, Lt, Leq)):
+        return 1 + size(expr.left) + size(expr.right)
+    if isinstance(expr, (Forall, Exists)):
+        return 1 + size(expr.body)
+    return 1
+
+
+def eliminate_ite(expr: Expression) -> Expression:
+    """Eliminate Boolean ITEs by rewriting them to disjunctions."""
+    if isinstance(expr, Ite) and expr.typ == Type.BOOL:
+        condition = eliminate_ite(expr.condition)
+        then_branch = eliminate_ite(expr.then_branch)
+        else_branch = eliminate_ite(expr.else_branch)
+        return mk_or(
+            [
+                mk_and([condition, then_branch]),
+                mk_and([mk_not(condition), else_branch]),
+            ]
+        )
+    if isinstance(expr, And):
+        return And(tuple(eliminate_ite(arg) for arg in expr.args))
+    if isinstance(expr, Or):
+        return Or(tuple(eliminate_ite(arg) for arg in expr.args))
+    if isinstance(expr, Not):
+        return Not(eliminate_ite(expr.arg))
+    if isinstance(expr, Eq):
+        return Eq(eliminate_ite(expr.left), eliminate_ite(expr.right))
+    if isinstance(expr, Lt):
+        return Lt(eliminate_ite(expr.left), eliminate_ite(expr.right))
+    if isinstance(expr, Leq):
+        return Leq(eliminate_ite(expr.left), eliminate_ite(expr.right))
+    if isinstance(expr, Forall):
+        return Forall(expr.var_name, expr.var_type, eliminate_ite(expr.body))
+    if isinstance(expr, Exists):
+        return Exists(expr.var_name, expr.var_type, eliminate_ite(expr.body))
+    return expr
+
+
+def eliminate_arr_eq(expr: Expression) -> Expression:
+    """Placeholder-compatible array equality eliminator.
+
+    This port has no extensional array-elimination pass yet; return the input
+    unchanged rather than claiming a lossy rewrite.
+    """
+    return expr
 
 
 def rewrite(

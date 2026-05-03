@@ -42,7 +42,7 @@ from aria.srk.syntax import (
     symbols,
     substitute_const,
 )
-from .polynomial import Monomial, QQX
+from .polynomial import Monomial, Polynomial
 from .linear import QQVector, QQMatrix, QQ
 from .interval import Interval
 from .coordinateSystem import CoordinateSystem
@@ -63,6 +63,76 @@ logger = logging.getLogger(__name__)
 # Import BatPervasives-style functionality
 from .util import ZZ
 
+QQX = Polynomial
+
+
+def _monomial_one() -> Monomial:
+    return Monomial(())
+
+
+def _monomial_var(dim: int, total_dim: int) -> Monomial:
+    exponents = [0] * max(total_dim, dim + 1)
+    exponents[dim] = 1
+    return Monomial(exponents)
+
+
+def _normalize_monomial(monomial: Monomial, size: int) -> Monomial:
+    padding = [0] * (size - len(monomial.exponents))
+    return Monomial(list(monomial.exponents) + padding)
+
+
+def _mul_monomials(left: Monomial, right: Monomial) -> Monomial:
+    size = max(len(left.exponents), len(right.exponents))
+    left = _normalize_monomial(left, size)
+    right = _normalize_monomial(right, size)
+    return left * right
+
+
+def _up_is_zero(up: "UP") -> bool:
+    polynomial_part = getattr(up, "polynomial_part", None)
+    return bool(polynomial_part is not None and polynomial_part.is_zero())
+
+
+def _up_constant(coeff: Fraction) -> "UP":
+    return UP.scalar(coeff)
+
+
+def _up_exponential(base: Fraction, coeff: Fraction = Fraction(1)) -> "UP":
+    if coeff == 0:
+        return UP.zero()
+    return UP(QQX({_monomial_one(): coeff}), base)
+
+
+def _up_mul(left: "UP", right: "UP") -> "UP":
+    product_terms: Dict[Monomial, Fraction] = {}
+    for left_monomial, left_coeff in left.polynomial_part.enum():
+        for right_monomial, right_coeff in right.polynomial_part.enum():
+            monomial = _mul_monomials(left_monomial, right_monomial)
+            product_terms[monomial] = (
+                product_terms.get(monomial, Fraction(0)) + left_coeff * right_coeff
+            )
+    return UP(
+        QQX(product_terms),
+        left.exponential_part * right.exponential_part,
+    )
+
+
+def _up_linear_k(coeff: Fraction) -> "UP":
+    if coeff == 0:
+        return UP.zero()
+    return UP(QQX.of_dim(0, 1).scalar_mul(coeff), Fraction(1))
+
+
+def _up_constant_value(up: "UP") -> Optional[Fraction]:
+    if up.exponential_part != Fraction(1):
+        return None
+    poly = up.polynomial_part
+    if poly.is_zero():
+        return Fraction(0)
+    if poly.degree() > 0:
+        return None
+    return poly.evaluate({})
+
 
 @dataclass
 class UPXs:
@@ -73,7 +143,7 @@ class UPXs:
 
     def __post_init__(self):
         # Remove zero coefficients
-        self._terms = {m: up for m, up in self._terms.items() if up != UP.zero()}
+        self._terms = {m: up for m, up in self._terms.items() if not _up_is_zero(up)}
 
     @staticmethod
     def zero():
@@ -83,18 +153,26 @@ class UPXs:
     @staticmethod
     def scalar(coeff: UP) -> "UPXs":
         """Create scalar UPXs polynomial."""
-        if coeff == UP.zero():
+        if _up_is_zero(coeff):
             return UPXs.zero()
         upxs = UPXs()
-        if coeff != UP.zero():
-            upxs._terms[Monomial.one()] = coeff
+        if not _up_is_zero(coeff):
+            upxs._terms[_monomial_one()] = coeff
         return upxs
 
     @staticmethod
-    def add_term(coeff: UP, monomial: Monomial) -> "UPXs":
+    def add_term(
+        coeff: UP, monomial: Monomial, base: Optional["UPXs"] = None
+    ) -> "UPXs":
         """Add a term to UPXs polynomial."""
-        upxs = UPXs()
-        if coeff != UP.zero():
+        upxs = UPXs(dict(base._terms) if base is not None else {})
+        if _up_is_zero(coeff):
+            return upxs
+        if monomial in upxs._terms:
+            upxs._terms[monomial] = upxs._terms[monomial] + coeff
+            if _up_is_zero(upxs._terms[monomial]):
+                del upxs._terms[monomial]
+        else:
             upxs._terms[monomial] = coeff
         return upxs
 
@@ -108,7 +186,11 @@ class UPXs:
         result = QQX.zero()
         for up_coeff, monomial in self.enum():
             coeff_at_k = up_coeff.evaluate(k)
-            result = QQX.add_term(coeff_at_k, monomial, result)
+            if not monomial.exponents:
+                term = QQX.scalar(coeff_at_k)
+            else:
+                term = QQX({monomial: coeff_at_k})
+            result = result + term
         return result
 
     def map_coeff(self, f: Callable[[Monomial, UP], UP]) -> "UPXs":
@@ -140,7 +222,7 @@ class UPXs:
 
             # Flatten the periodic coefficients
             flattened_up = UP.flatten(period_coeffs)
-            if flattened_up != UP.zero():
+            if not _up_is_zero(flattened_up):
                 result = UPXs.add(result, UPXs.add_term(flattened_up, monomial, UPXs()))
 
         return result
@@ -151,18 +233,17 @@ class UPXs:
         for up_coeff, monomial in self.enum():
             # Substitute variables in the monomial
             substituted = QQX.zero()
-            for coeff, var in monomial.enum():
-                if var in subst:
-                    substituted = QQX.add(
-                        substituted, QQX.scalar_mul(coeff, subst[var])
-                    )
+            for var, power in enumerate(monomial.exponents):
+                if power == 0:
+                    continue
+                replacement = subst(var)
+                if replacement is not None:
+                    substituted = substituted + (replacement**power)
                 else:
-                    substituted = QQX.add_term(
-                        coeff, Monomial.singleton(var, 1), substituted
-                    )
+                    substituted = substituted + QQX({_monomial_var(var, var + 1): Fraction(1)})
 
             # For now, assume constant UP coefficients (simplified)
-            result = QQX.add(result, QQX.scalar_mul(up_coeff.evaluate(0), substituted))
+            result = result + substituted.scalar_mul(up_coeff.evaluate(0))
         return result
 
     def add(self, other: "UPXs") -> "UPXs":
@@ -171,9 +252,9 @@ class UPXs:
         for monomial, coeff in other._terms.items():
             if monomial in new_terms:
                 new_terms[monomial] = new_terms[monomial] + coeff
-                if new_terms[monomial] == UP.zero():
+                if _up_is_zero(new_terms[monomial]):
                     del new_terms[monomial]
-            elif coeff != UP.zero():
+            elif not _up_is_zero(coeff):
                 new_terms[monomial] = coeff
         result = UPXs()
         result._terms = new_terms
@@ -184,8 +265,8 @@ class UPXs:
         result = UPXs()
         for m1, c1 in self._terms.items():
             for m2, c2 in other._terms.items():
-                new_monomial = m1 * m2  # Use * operator for monomial multiplication
-                new_coeff = c1 * c2  # Use * operator for UP multiplication
+                new_monomial = _mul_monomials(m1, m2)
+                new_coeff = _up_mul(c1, c2)
                 result = UPXs.add(
                     result, UPXs.add_term(new_coeff, new_monomial, UPXs())
                 )
@@ -195,7 +276,7 @@ class UPXs:
         """Raise UPXs to a power."""
         if n == 0:
             upxs = UPXs()
-            upxs._terms[Monomial.one()] = UP.one()
+            upxs._terms[_monomial_one()] = _up_constant(Fraction(1))
             return upxs
         elif n == 1:
             return self
@@ -426,7 +507,7 @@ def monomial_closure(pm: PolynomialMap, monomials: MonomialSet) -> MonomialSet:
         new_worklist = []
         new_monomials = monomials
 
-        for _, m in QQX.enum(rhs_w):
+        for m, _ in rhs_w.enum():
             if not monomials.mem(m):
                 new_worklist.append(m)
                 new_monomials = new_monomials.add(m)
@@ -497,72 +578,104 @@ def pp_block(formatter, block: Block) -> None:
     formatter.write("@]")
 
 
+def _is_zero_polynomial(poly: QQX) -> bool:
+    return poly.is_zero()
+
+
+def _is_diagonal_matrix(matrix: List[List[Fraction]], size: int) -> bool:
+    if len(matrix) != size:
+        return False
+    for i, row in enumerate(matrix):
+        if len(row) != size:
+            return False
+        for j, coeff in enumerate(row):
+            if i != j and coeff != 0:
+                return False
+    return True
+
+
+def _upxs_variable(dim: int, total_dim: int, coeff: UP) -> UPXs:
+    return UPXs.add_term(coeff, _monomial_var(dim, total_dim))
+
+
+def _upxs_summation(upxs: UPXs) -> UPXs:
+    result = UPXs.zero()
+    for coeff, monomial in upxs.enum():
+        constant = _up_constant_value(coeff)
+        if constant is None:
+            raise NotImplementedError(
+                "summation is only implemented for k-independent polynomial terms"
+            )
+        result = result.add(UPXs.add_term(_up_linear_k(constant), monomial))
+    return result
+
+
+def _substitute_closed_forms(
+    poly: QQX, cf: List[UPXs], current_offset: int, total_dim: int
+) -> UPXs:
+    result = UPXs.zero()
+    for monomial, coeff in poly.enum():
+        term = UPXs.scalar(_up_constant(coeff))
+        for var_id, power in enumerate(monomial.exponents):
+            if power == 0:
+                continue
+            if var_id >= total_dim:
+                raise NotImplementedError(
+                    f"polynomial references variable {var_id}, outside dimension {total_dim}"
+                )
+            if var_id >= current_offset:
+                raise NotImplementedError(
+                    "additive terms may only reference previously closed dimensions"
+                )
+            term = term.mul(cf[var_id].exp(power))
+        result = result.add(term)
+    return result
+
+
 def closure_ocrs(sp: SolvablePolynomial) -> List[Any]:
-    """Compute closed-form representation using OCRS."""
-    # This would need OCRS module implementation
-    # For now, return placeholder
-    cf = [Fraction(0)] * dimension(sp)
+    """Compute a closed-form representation for supported linear cases.
 
-    def close_block(block: Block, offset: int) -> List[Any]:
-        size = block_size(block)
-        if size == 0:
-            return []
-
-        # Placeholder OCRS computation
-        return [Fraction(0)] * size
-
-    iter_blocks(lambda offset, block: close_block(block, offset), sp)
-
-    return cf
+    The OCRS backend used by the original implementation is not available in
+    this Python port.  For the supported simple/diagonal cases we return the
+    same UPXs closed forms as ``closure_periodic_rational`` instead of silently
+    fabricating zero terms.  Unsupported recurrences fail explicitly.
+    """
+    return closure_periodic_rational(sp)
 
 
 def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
     """Compute closed-form with periodic rational eigenvalues."""
-    cf = [UPXs.zero() for _ in range(dimension(sp))]
-
-    def substitute_closed_forms(p: QQX) -> "UPXs":
-        """Substitute closed forms in for a polynomial"""
-        result = UPXs.zero()
-
-        for coeff, monomial in QQX.enum(p):
-            # Start with the coefficient as an UP
-            term = UP.scalar(coeff)
-
-            # For each variable in the monomial, multiply by its closed form raised to the power
-            for var_id, power in monomial.enum():
-                if var_id < len(cf):
-                    # For now, create a simple exponential form
-                    # In a full implementation, this would use the actual closed form
-                    if power == 1:
-                        # Just use the closed form as is
-                        pass
-                    else:
-                        # Create a power series expansion
-                        # This is highly simplified
-                        pass
-
-            result = UPXs.add(result, UPXs.scalar(term))
-
-        return result
+    total_dim = dimension(sp)
+    cf = [UPXs.zero() for _ in range(total_dim)]
 
     def close_block(block: Block, offset: int) -> None:
         """Close a single block with periodic rational eigenvalues"""
         size = block_size(block)
         if size == 0:
             return
+        if not _is_diagonal_matrix(block.blk_transform, size):
+            raise NotImplementedError(
+                "closure_periodic_rational currently supports diagonal blocks only"
+            )
 
         # For each dimension in the block, compute its closed form
         for i in range(size):
             dim_idx = offset + i
+            multiplier = block.blk_transform[i][i]
+            add_poly = block.blk_add[i] if i < len(block.blk_add) else QQX.zero()
+            add_upxs = _substitute_closed_forms(add_poly, cf, offset, total_dim)
+            initial = _upxs_variable(
+                dim_idx, total_dim, _up_exponential(multiplier)
+            )
 
-            # Get the additive polynomial for this dimension
-            if i < len(block.blk_add):
-                add_poly = block.blk_add[i]
-                # Substitute closed forms into the additive polynomial
-                add_upxs = substitute_closed_forms(add_poly)
-                cf[dim_idx] = add_upxs
+            if multiplier == Fraction(1):
+                cf[dim_idx] = initial.add(_upxs_summation(add_upxs))
+            elif _is_zero_polynomial(add_poly):
+                cf[dim_idx] = initial
             else:
-                cf[dim_idx] = UPXs.zero()
+                raise NotImplementedError(
+                    "affine closed forms with non-unit multipliers are not supported"
+                )
 
     # Process each block
     iter_blocks(lambda offset, block: close_block(block, offset), sp)
@@ -572,22 +685,26 @@ def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
 
 def standard_basis_prsd(
     mA: List[List[Fraction]], size: int
-) -> List[Tuple[int, Fraction, List[Fraction]]]:
+) -> List[Tuple[int, Fraction, List[List[Fraction]]]]:
     """Compute periodic rational spectral decomposition for standard basis."""
-    # This would need proper linear algebra implementation
-    # For now, return placeholder - full implementation would:
-    # 1. Convert mA to QQMatrix
-    # 2. Compute Jordan form
-    # 3. Extract periodic rational eigenvalues and eigenvectors
+    if not _is_diagonal_matrix(mA, size):
+        raise NotImplementedError(
+            "standard_basis_prsd currently supports diagonal matrices only"
+        )
 
-    # Placeholder: assume identity transformation
-    eigenvectors = []
+    by_eigenvalue: Dict[Fraction, List[List[Fraction]]] = {}
     for i in range(size):
         eigenvector = [Fraction(0)] * size
         eigenvector[i] = Fraction(1)
-        eigenvectors.append(eigenvector)
+        by_eigenvalue.setdefault(mA[i][i], []).append(eigenvector)
 
-    return [(1, Fraction(1), eigenvectors)]
+    def period(eigenvalue: Fraction) -> int:
+        return 2 if eigenvalue == Fraction(-1) else 1
+
+    return [
+        (period(eigenvalue), eigenvalue, eigenvectors)
+        for eigenvalue, eigenvectors in by_eigenvalue.items()
+    ]
 
 
 @dataclass

@@ -5,7 +5,9 @@ Tests for the polynomial module.
 import unittest
 from fractions import Fraction
 from aria.srk.polynomial import (
+    Ideal,
     Monomial,
+    MonomialOrdering,
     Polynomial,
     UnivariatePolynomial,
     MonomialOrder,
@@ -94,6 +96,21 @@ class TestMonomial(unittest.TestCase):
 
         m2 = Monomial([0, 0, 0])
         self.assertEqual(str(m2), "1")
+
+    def test_block_ordering(self):
+        """Test monomial block ordering."""
+        x = Monomial([1, 0])
+        y = Monomial([0, 1])
+        ordering = MonomialOrdering(
+            2, MonomialOrder.LEX, blocks=[[1], [0]]
+        )
+
+        self.assertLess(ordering.compare(x, y), 0)
+
+        p = Polynomial({x: Fraction(1), y: Fraction(1)})
+        coeff, monom = p.leading_term(ordering)
+        self.assertEqual(coeff, Fraction(1))
+        self.assertEqual(monom, y)
 
 
 class TestPolynomial(unittest.TestCase):
@@ -311,6 +328,41 @@ class TestGroebnerBasis(unittest.TestCase):
         self.assertIsInstance(gb, RewriteSystem)
         # For simple cases, we might not generate rules, which is fine
         self.assertIsNotNone(gb)
+
+    def test_reduces_by_computed_basis(self):
+        """Test Groebner reduction has the expected ideal semantics."""
+        x = variable(0, 2)
+        y = variable(1, 2)
+        ideal = Ideal.make([x - y, y - 1], MonomialOrder.LEX)
+
+        self.assertTrue(ideal.mem(x - 1))
+        self.assertTrue(ideal.mem(x + y - 2))
+        self.assertFalse(ideal.mem(x))
+
+    def test_ideal_sum_product_intersection(self):
+        """Test basic Ideal operations."""
+        x = variable(0, 2)
+        y = variable(1, 2)
+        ix = Ideal.make([x], MonomialOrder.LEX)
+        iy = Ideal.make([y], MonomialOrder.LEX)
+
+        self.assertTrue(ix.sum(iy).mem(x + y))
+        self.assertTrue(ix.product(iy).mem(x * y))
+        self.assertFalse(ix.product(iy).mem(x))
+
+        intersection = ix.intersect(iy)
+        self.assertTrue(intersection.mem(x * y))
+        self.assertFalse(intersection.mem(x))
+
+    def test_ideal_projection_eliminates_variables(self):
+        """Test elimination projection keeps only requested variables."""
+        x = variable(0, 2)
+        y = variable(1, 2)
+        ideal = Ideal.make([x - y, y - 1], MonomialOrder.LEX)
+
+        projected = ideal.project({0})
+        self.assertTrue(projected.mem(x - 1))
+        self.assertFalse(projected.mem(x))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,31 @@ from aria.srk.syntax import (
 )
 
 
+def _numeric_symbol_value(symbol: Symbol) -> Optional[Tuple[Fraction, bool]]:
+    """Return a concrete numeric value encoded by SRK's numeric const symbols.
+
+    The Python port represents numerals as ``Const(Symbol(...))`` values.  When
+    those symbols reach Z3 they must become numerals, not fresh uninterpreted
+    constants named "0" or "real_1.0".
+    """
+
+    name = symbol.name
+    if name is None:
+        return None
+
+    if symbol.typ == Type.REAL and name.startswith("real_"):
+        raw = name[5:]
+    elif symbol.typ in (Type.INT, Type.REAL):
+        raw = name
+    else:
+        return None
+
+    try:
+        return Fraction(raw), symbol.typ == Type.INT
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
 class SMTResult(Enum):
     """Result of SMT query."""
 
@@ -285,6 +310,13 @@ class Z3Solver(SMTSolver):
 
     def _srk_to_z3_symbol(self, symbol: Symbol) -> Any:
         """Convert SRK symbol to Z3 symbol/const of appropriate sort."""
+        numeric = _numeric_symbol_value(symbol)
+        if numeric is not None:
+            value, is_int = numeric
+            if is_int and value.denominator == 1:
+                return self.z3.IntVal(value.numerator)
+            return self.z3.RealVal(f"{value.numerator}/{value.denominator}")
+
         if symbol in self._symbol_map:
             return self._symbol_map[symbol]
 

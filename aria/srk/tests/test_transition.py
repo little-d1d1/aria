@@ -11,6 +11,7 @@ from aria.srk.syntax import (
     mk_const,
     mk_lt,
     mk_add,
+    mk_and,
     mk_real,
 )
 from aria.srk.transition import Transition, TransitionSystem
@@ -45,6 +46,35 @@ class TestTransition(unittest.TestCase):
 
         self.assertEqual(tr1, tr2)
         self.assertNotEqual(tr1, tr3)
+
+    def test_sequential_composition_substitutes_second_rhs_and_guard(self):
+        """Sequential composition evaluates the second transition after the first."""
+        one = mk_real(self.ctx, QQ.one())
+        first = Transition.assign(self.ctx, self.x, one)
+        second_guard = mk_lt(mk_const(self.x), mk_const(self.n))
+        second = Transition(
+            transform={self.n: mk_add([mk_const(self.x), one])},
+            guard=second_guard,
+            context=self.ctx,
+        )
+
+        composed = first.mul(second)
+
+        self.assertEqual(composed.transform[self.x], one)
+        self.assertEqual(composed.transform[self.n], mk_add([one, one]))
+        self.assertEqual(
+            composed.guard,
+            mk_and(self.ctx, [first.guard, mk_lt(one, mk_const(self.n))]),
+        )
+
+    def test_nondeterministic_choice_drops_conflicting_assignments(self):
+        """Choice should not merge conflicting updates into a deterministic one."""
+        left = Transition.assign(self.ctx, self.x, mk_real(self.ctx, QQ.zero()))
+        right = Transition.assign(self.ctx, self.x, mk_real(self.ctx, QQ.one()))
+
+        choice = left.add(right)
+
+        self.assertNotIn(self.x, choice.transform)
 
 
 class TestTransitionSystem(unittest.TestCase):

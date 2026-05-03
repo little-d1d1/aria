@@ -18,6 +18,7 @@ from aria.srk.syntax import (
     Expression,
     make_expression_builder,
     symbols,
+    substitute,
 )
 from aria.srk.linear import QQVector, QQMatrix
 
@@ -95,20 +96,20 @@ class Transition:
 
     def mul(self, other: Transition) -> Transition:
         """Sequential composition of transitions."""
-        # For composition: (transform1; transform2) with guard = guard1 ∧ (guard2 ◦ transform1)
-        # This is a simplified implementation
+        # For composition: (self; other), evaluate the second transition in
+        # the post-state of the first transition.
         context = self.context or other.context
         if context is None:
             raise ValueError("Cannot compose transitions without context")
 
         builder = make_expression_builder(context)
+        subst_map = dict(self.transform)
 
-        # Combine transforms (other's transform takes precedence for conflicts)
-        combined_transform = {**self.transform, **other.transform}
+        combined_transform = dict(self.transform)
+        for var, expr in other.transform.items():
+            combined_transform[var] = substitute(expr, subst_map)
 
-        # For guards, we need to substitute self's post-state with other's pre-state
-        # This is a simplified version
-        combined_guard = builder.mk_and([self.guard, other.guard])
+        combined_guard = builder.mk_and([self.guard, substitute(other.guard, subst_map)])
 
         return Transition(
             transform=combined_transform, guard=combined_guard, context=context
@@ -122,10 +123,15 @@ class Transition:
 
         builder = make_expression_builder(context)
 
-        # Combine transforms (take union)
-        combined_transform = {**self.transform, **other.transform}
-
-        # Disjoin guards
+        # This representation has no first-class Skolem choice variable.  Keep
+        # only assignments that are syntactically identical across both arms;
+        # dropping differing assignments is a conservative over-approximation
+        # and avoids the previous unsound deterministic dict merge.
+        combined_transform = {
+            var: expr
+            for var, expr in self.transform.items()
+            if var in other.transform and other.transform[var] == expr
+        }
         combined_guard = builder.mk_or([self.guard, other.guard])
 
         return Transition(

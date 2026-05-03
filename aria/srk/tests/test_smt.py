@@ -15,6 +15,11 @@ from aria.srk.syntax import (
     And,
     TrueExpr,
     FalseExpr,
+    mk_and,
+    mk_eq,
+    mk_int,
+    mk_lt,
+    mk_var,
 )
 from aria.srk.smt import SMTInterface, SMTResult, SMTModel, check_sat, get_model
 
@@ -55,6 +60,22 @@ class TestSMTInterface(unittest.TestCase):
             const_x, self.builder.mk_var(0, Type.INT)
         )  # This is a simplified test
         # Note: This test would need more sophisticated expression building
+
+    def test_numeric_constants_are_not_fresh_variables(self):
+        """Numeric Const symbols should translate to Z3 numerals."""
+        x = self.context.mk_symbol("x", Type.INT)
+        x_term = mk_var(self.context, x)
+        zero = mk_int(self.context, 0)
+        formula = mk_and(
+            self.context,
+            [
+                mk_eq(self.context, x_term, zero),
+                mk_lt(self.context, zero, x_term),
+            ],
+        )
+
+        result = self.smt.is_sat(formula)
+        self.assertEqual(result, SMTResult.UNSAT)
 
     def test_model_extraction(self):
         """Test model extraction from satisfiable formulas."""

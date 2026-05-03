@@ -7,7 +7,16 @@ This tests the ranking function synthesis features.
 import pytest
 from fractions import Fraction
 
-from aria.srk.syntax import Context, Type
+from aria.srk.syntax import (
+    Context,
+    Type,
+    mk_add,
+    mk_and,
+    mk_const,
+    mk_eq,
+    mk_lt,
+    mk_real,
+)
 from aria.srk.termination import (
     TerminationAnalyzer,
     LinearRankingFunction,
@@ -15,6 +24,7 @@ from aria.srk.termination import (
     TerminationLLRF,
     make_termination_analyzer,
 )
+from aria.srk.transitionFormula import TransitionFormula
 from aria.srk.linear import QQVector
 from aria.srk import qQ as QQ
 
@@ -96,6 +106,49 @@ class TestTerminationAnalyzer:
         result2 = TerminationResult(False)
         assert result2.terminates == False
         assert str(result2) == "May not terminate"
+
+    def test_transition_formula_decrementing_counter(self):
+        """TransitionFormula equalities are converted to guarded transforms."""
+        ctx = Context()
+        analyzer = TerminationAnalyzer(ctx)
+        x = ctx.mk_symbol("x", Type.INT)
+        xp = ctx.mk_symbol("x'", Type.INT)
+        zero = mk_real(ctx, QQ.zero())
+        minus_one = mk_real(ctx, QQ.of_int(-1))
+        formula = mk_and(
+            ctx,
+            [
+                mk_lt(zero, mk_const(x)),
+                mk_eq(mk_const(xp), mk_add([mk_const(x), minus_one])),
+            ],
+        )
+        tf = TransitionFormula(formula=formula, symbols=[(x, xp)])
+
+        result = analyzer.prove_termination(tf)
+
+        assert result.terminates is True
+        assert result.ranking_function is not None
+
+    def test_transition_formula_with_unsupported_post_guard_is_unknown(self):
+        """Post-state guards are not silently treated as pre-state bounds."""
+        ctx = Context()
+        analyzer = TerminationAnalyzer(ctx)
+        x = ctx.mk_symbol("x", Type.INT)
+        xp = ctx.mk_symbol("x'", Type.INT)
+        zero = mk_real(ctx, QQ.zero())
+        minus_one = mk_real(ctx, QQ.of_int(-1))
+        formula = mk_and(
+            ctx,
+            [
+                mk_lt(zero, mk_const(xp)),
+                mk_eq(mk_const(xp), mk_add([mk_const(x), minus_one])),
+            ],
+        )
+        tf = TransitionFormula(formula=formula, symbols=[(x, xp)])
+
+        result = analyzer.prove_termination(tf)
+
+        assert result.terminates is False
 
 
 class TestTerminationLLRF:

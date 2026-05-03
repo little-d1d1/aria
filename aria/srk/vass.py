@@ -359,7 +359,7 @@ def abstract_to_vass(srk: syntax.Context, tf: TF.TransitionFormula) -> VASSType:
     num_sccs = len(sccs)
 
     if num_sccs == 0:
-        return VASSType([], phi, skolem_constants, sink)
+        return VASSType([], phi, sink, skolem_constants)
 
     # Compute VASS for each SCC
     vassarrays = []
@@ -367,21 +367,55 @@ def abstract_to_vass(srk: syntax.Context, tf: TF.TransitionFormula) -> VASSType:
         scc_vas = compute_single_scc_vass(exists_func, srk, tr_symbols, scc, phi)
         vassarrays.append(scc_vas)
 
-    result = VASSType(vassarrays, phi, skolem_constants, sink)
+    result = VASSType(vassarrays, phi, sink, skolem_constants)
 
     logger.info("Created VASS abstraction: %s", result)
     return result
 
 
+def _term_name(term: syntax.Term, fallback: str) -> str:
+    symbol = getattr(term, "symbol", None)
+    name = getattr(symbol, "name", None)
+    return name or fallback
+
+
+def _sum_terms(srk: syntax.Context, terms: List[syntax.Term]) -> syntax.Term:
+    if not terms:
+        return syntax.mk_zero(srk)
+    if len(terms) == 1:
+        return terms[0]
+    return syntax.mk_add(srk, terms)
+
+
+def _implies(
+    srk: syntax.Context, antecedent: syntax.Formula, consequent: syntax.Formula
+) -> syntax.Formula:
+    return syntax.mk_or(srk, [syntax.mk_not(srk, antecedent), consequent])
+
+
+def _subst(expr: syntax.Expression, mapping: Dict[syntax.Symbol, syntax.Expression]):
+    return syntax.substitute(expr, mapping)
+
+
 def create_local_s_t(
-    srk: syntax.Context, num: int
+    srk: syntax.Context, num: int, prefix: str = ""
 ) -> List[Tuple[syntax.Term, syntax.Term]]:
     """Create source and sink variables for a SCC"""
+    source_base = f"{prefix}_source" if prefix else "source"
+    sink_base = f"{prefix}_sink" if prefix else "sink"
     sources = map_terms(
-        srk, [syntax.mk_symbol(srk, f"source{i}", syntax.TyInt) for i in range(num)]
+        srk,
+        [
+            syntax.mk_symbol(srk, f"{source_base}{i}", syntax.Type.INT)
+            for i in range(num)
+        ],
     )
     sinks = map_terms(
-        srk, [syntax.mk_symbol(srk, f"sink{i}", syntax.TyInt) for i in range(num)]
+        srk,
+        [
+            syntax.mk_symbol(srk, f"{sink_base}{i}", syntax.Type.INT)
+            for i in range(num)
+        ],
     )
     return list(zip(sources, sinks))
 
@@ -393,7 +427,7 @@ def source_sink_conds_satisfied(
     tr_symbols: List[Tuple[syntax.Symbol, syntax.Symbol]],
 ) -> syntax.Formula:
     """Source and sink conditions must be satisfied"""
-    postify = syntax.substitute(srk, TF.post_map(srk, tr_symbols))
+    post_map = TF.post_map(srk, tr_symbols)
 
     constraints = []
     for i, (source, sink) in enumerate(local_s_t):
@@ -401,11 +435,13 @@ def source_sink_conds_satisfied(
             syntax.mk_and(
                 srk,
                 [
-                    syntax.mk_if(
+                    _implies(
                         srk, syntax.mk_eq(srk, source, syntax.mk_one(srk)), cs[i]
                     ),
-                    syntax.mk_if(
-                        srk, syntax.mk_eq(srk, sink, syntax.mk_one(srk)), postify(cs[i])
+                    _implies(
+                        srk,
+                        syntax.mk_eq(srk, sink, syntax.mk_one(srk)),
+                        _subst(cs[i], post_map),
                     ),
                 ],
             )
@@ -418,12 +454,14 @@ def split_terms_add_to_one(
     srk: syntax.Context, local_s_t: List[Tuple[syntax.Term, syntax.Term]]
 ) -> syntax.Formula:
     """Each control state contributes exactly one source and one sink"""
+    if not local_s_t:
+        return syntax.mk_false(srk)
     sources, sinks = zip(*local_s_t)
     return syntax.mk_and(
         srk,
         [
-            syntax.mk_eq(srk, syntax.mk_add(srk, sources), syntax.mk_one(srk)),
-            syntax.mk_eq(srk, syntax.mk_add(srk, sinks), syntax.mk_one(srk)),
+            syntax.mk_eq(srk, _sum_terms(srk, list(sources)), syntax.mk_one(srk)),
+            syntax.mk_eq(srk, _sum_terms(srk, list(sinks)), syntax.mk_one(srk)),
         ],
     )
 
@@ -432,6 +470,16 @@ def exp_each_ests_one_or_zero(
     srk: syntax.Context, local_s_t: List[Tuple[syntax.Term, syntax.Term]]
 ) -> syntax.Formula:
     """Each source/sink pair is either 0 or 1"""
+    if len(local_s_t) == 1:
+        source, sink = local_s_t[0]
+        return syntax.mk_and(
+            srk,
+            [
+                syntax.mk_eq(srk, source, syntax.mk_one(srk)),
+                syntax.mk_eq(srk, sink, syntax.mk_one(srk)),
+            ],
+        )
+
     constraints = []
     for source, sink in local_s_t:
         constraints.append(
@@ -458,6 +506,99 @@ def exp_each_ests_one_or_zero(
     return syntax.mk_and(srk, constraints)
 
 
+def _edge_transformers(vass: SCCVAS) -> List[Tuple[int, vas.Transformer, int]]:
+    edges: List[Tuple[int, vas.Transformer, int]] = []
+    for src, row in enumerate(vass.graph):
+        for dst, edge_vas in enumerate(row):
+            if edge_vas.is_empty():
+                continue
+            for transformer in edge_vas.to_list():
+                edges.append((src, transformer, dst))
+    return edges
+
+
+def _create_edge_counters(
+    srk: syntax.Context, prefix: str, count: int
+) -> List[syntax.Term]:
+    return [
+        syntax.mk_const(
+            srk, syntax.mk_symbol(srk, f"{prefix}_N{i}", syntax.Type.INT)
+        )
+        for i in range(count)
+    ]
+
+
+def _flow_conservation(
+    srk: syntax.Context,
+    num_states: int,
+    local_s_t: List[Tuple[syntax.Term, syntax.Term]],
+    edge_counters: List[syntax.Term],
+    edge_transformers: List[Tuple[int, vas.Transformer, int]],
+) -> syntax.Formula:
+    constraints = []
+    for state in range(num_states):
+        source, sink = local_s_t[state]
+        incoming = [
+            edge_counters[index]
+            for index, (_, _, dst) in enumerate(edge_transformers)
+            if dst == state
+        ]
+        outgoing = [
+            edge_counters[index]
+            for index, (src, _, _) in enumerate(edge_transformers)
+            if src == state
+        ]
+        constraints.append(
+            syntax.mk_eq(
+                srk,
+                _sum_terms(srk, [source] + incoming),
+                _sum_terms(srk, [sink] + outgoing),
+            )
+        )
+    return syntax.mk_and(srk, constraints)
+
+
+def _simple_counter_balance(
+    srk: syntax.Context,
+    tr_symbols: List[Tuple[syntax.Symbol, syntax.Symbol]],
+    edge_counters: List[syntax.Term],
+    edge_transformers: List[Tuple[int, vas.Transformer, int]],
+) -> syntax.Formula:
+    constraints = []
+    for dim, (pre_symbol, post_symbol) in enumerate(tr_symbols):
+        delta_terms = []
+        for counter, (_, transformer, _) in zip(edge_counters, edge_transformers):
+            coeff = transformer.b.get(dim, 0)
+            if coeff == 0:
+                continue
+            delta_terms.append(
+                syntax.mk_mul(srk, [syntax.mk_real(srk, coeff), counter])
+            )
+
+        balance_terms = [syntax.mk_const(srk, pre_symbol)] + delta_terms
+        constraints.append(
+            syntax.mk_eq(
+                srk,
+                syntax.mk_const(srk, post_symbol),
+                _sum_terms(srk, balance_terms),
+            )
+        )
+
+    return syntax.mk_and(srk, constraints)
+
+
+def _counter_nonnegative_constraints(
+    srk: syntax.Context, tr_symbols: List[Tuple[syntax.Symbol, syntax.Symbol]]
+) -> syntax.Formula:
+    counter_terms = []
+    for pre_symbol, post_symbol in tr_symbols:
+        if syntax.typ_symbol(pre_symbol) in (syntax.Type.INT, syntax.Type.REAL):
+            counter_terms.append(syntax.mk_const(srk, pre_symbol))
+        if syntax.typ_symbol(post_symbol) in (syntax.Type.INT, syntax.Type.REAL):
+            counter_terms.append(syntax.mk_const(srk, post_symbol))
+    return mk_all_nonnegative(srk, counter_terms)
+
+
 def closure_of_an_scc(
     srk: syntax.Context,
     tr_symbols: List[Tuple[syntax.Symbol, syntax.Symbol]],
@@ -466,24 +607,58 @@ def closure_of_an_scc(
 ) -> Tuple[syntax.Formula, List[syntax.Term]]:
     """Compute closure of a single SCC"""
     cs = vass.control_states
-    local_s_t = create_local_s_t(srk, len(cs))
+    prefix = _term_name(loop_counter, "scc")
+    local_s_t = create_local_s_t(srk, len(cs), prefix)
 
     constr1 = split_terms_add_to_one(srk, local_s_t)
     constr2 = exp_each_ests_one_or_zero(srk, local_s_t)
     constr3 = source_sink_conds_satisfied(srk, local_s_t, cs, tr_symbols)
+    constr4 = mk_all_nonnegative(srk, [loop_counter])
+    constr5 = _counter_nonnegative_constraints(srk, tr_symbols)
 
     # If no VAS transformers, require that a control state is used
-    unified_s = unify_matrices(vass.s_lst)
-    if len(getattr(unified_s, "rows", ())) == 0:
+    edge_transformers = _edge_transformers(vass)
+    if not edge_transformers:
         return (
-            syntax.mk_and(srk, [constr1, constr2, constr3]),
+            syntax.mk_and(
+                srk,
+                [
+                    constr1,
+                    constr2,
+                    constr3,
+                    constr4,
+                    constr5,
+                    syntax.mk_eq(srk, loop_counter, syntax.mk_zero(srk)),
+                ],
+            ),
             [source for source, _ in local_s_t],
         )
 
-    # More complex logic would go here for the full VAS case
-    # For now, return simplified version
+    edge_counters = _create_edge_counters(srk, prefix, len(edge_transformers))
+    constr6 = mk_all_nonnegative(srk, edge_counters)
+    constr7 = syntax.mk_eq(srk, _sum_terms(srk, edge_counters), loop_counter)
+    constr8 = _flow_conservation(
+        srk, len(cs), local_s_t, edge_counters, edge_transformers
+    )
+    constr9 = _simple_counter_balance(
+        srk, tr_symbols, edge_counters, edge_transformers
+    )
+
     return (
-        syntax.mk_and(srk, [constr1, constr2, constr3]),
+        syntax.mk_and(
+            srk,
+            [
+                constr1,
+                constr2,
+                constr3,
+                constr4,
+                constr5,
+                constr6,
+                constr7,
+                constr8,
+                constr9,
+            ],
+        ),
         [source for source, _ in local_s_t],
     )
 
@@ -513,36 +688,11 @@ def exp(
     if not sccsform.vasses:
         return no_trans_taken(srk, loop_counter, tr_symbols)
 
-    # Create symbol mappings for each SCC
-    symmappings = []
-    for i, _ in enumerate(sccsform.vasses):
-        symmappings.append(
-            [
-                (
-                    syntax.mk_symbol(srk, f"{x.name}_{i}", syntax.typ_symbol(srk, x)),
-                    syntax.mk_symbol(
-                        srk, f"{x_prime.name}_{i}", syntax.typ_symbol(srk, x_prime)
-                    ),
-                )
-                for x, x_prime in tr_symbols
-            ]
-        )
-
     # Create loop counters for each SCC
     subloop_counters = [
-        syntax.mk_const(srk, syntax.mk_symbol(srk, f"counter_{i}", syntax.TyInt))
+        syntax.mk_const(srk, syntax.mk_symbol(srk, f"counter_{i}", syntax.Type.INT))
         for i in range(len(sccsform.vasses))
     ]
-
-    # Create Skolem mappings
-    skolem_mappings_transitions = []
-    for i in range(len(sccsform.vasses)):
-        skolem_mappings_transitions.append(
-            [
-                (x, syntax.mk_symbol(srk, f"{x.name}_{i}", syntax.typ_symbol(srk, x)))
-                for x in sccsform.skolem_constants
-            ]
-        )
 
     # Compute closures for each SCC
     sccclosures_sources = [
@@ -550,27 +700,37 @@ def exp(
         for i, vass in enumerate(sccsform.vasses)
     ]
 
-    sccclosures, sources = zip(*sccclosures_sources)
-    sccclosures = list(sccclosures)
-    sources = list(sources)
+    sccclosures = [closure for closure, _ in sccclosures_sources]
+    scc_cases = []
+    for subcounter, closure in zip(subloop_counters, sccclosures):
+        other_counters_zero = [
+            syntax.mk_eq(srk, other, syntax.mk_zero(srk))
+            for other in subloop_counters
+            if other != subcounter
+        ]
+        scc_cases.append(
+            syntax.mk_and(
+                srk,
+                [
+                    closure,
+                    syntax.mk_eq(srk, subcounter, loop_counter),
+                ]
+                + other_counters_zero,
+            )
+        )
 
-    # Add sink state
-    sccclosures.append(sccsform.sink)
-    sources.append([syntax.mk_real(srk, linear.QQ.one())])
-
-    # Transform closures to use proper symbol mappings
-    subst = lambda symbol_pairs: syntax.substitute(srk, TF.post_map(srk, symbol_pairs))
-
-    # This would need more complex transformation logic
-    # For now, return a simplified version
-    constr1 = mk_all_nonnegative(srk, subloop_counters)
-
-    # More constraints would be added here
+    positive_run = syntax.mk_and(
+        srk,
+        [
+            mk_all_nonnegative(srk, [loop_counter] + subloop_counters),
+            syntax.mk_or(srk, scc_cases),
+        ],
+    )
 
     return syntax.mk_or(
         srk,
         [
-            syntax.mk_and(srk, [constr1]),  # Full constraint
-            no_trans_taken(srk, loop_counter, tr_symbols),  # No transitions case
+            positive_run,
+            no_trans_taken(srk, loop_counter, tr_symbols),
         ],
     )

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import itertools
 import math
+from functools import cmp_to_key
 
 # Optional SymPy integration for advanced polynomial operations
 try:
@@ -268,12 +269,37 @@ class Monomial:
 class MonomialOrdering:
     """Provides monomial comparison operations."""
 
-    def __init__(self, num_vars: int, order: MonomialOrder):
+    def __init__(
+        self,
+        num_vars: int,
+        order: MonomialOrder,
+        blocks: Optional[List[List[int]]] = None,
+        block_orders: Optional[List[MonomialOrder]] = None,
+    ):
         self.num_vars = num_vars
         self.order = order
+        self.blocks = blocks
+        self.block_orders = block_orders or []
+        if self.blocks is not None:
+            seen = sorted(i for block in self.blocks for i in block)
+            if seen != list(range(num_vars)):
+                raise ValueError("Monomial blocks must partition all variables")
+            if self.block_orders and len(self.block_orders) != len(self.blocks):
+                raise ValueError("block_orders must match blocks")
 
     def compare(self, m1: Monomial, m2: Monomial) -> int:
         """Compare two monomials."""
+        if self.blocks is not None:
+            for i, block in enumerate(self.blocks):
+                block_order = (
+                    self.block_orders[i] if self.block_orders else self.order
+                )
+                b1 = Monomial([m1.exponents[j] for j in block])
+                b2 = Monomial([m2.exponents[j] for j in block])
+                cmp = b1.compare(b2, block_order)
+                if cmp != 0:
+                    return cmp
+            return 0
         return m1.compare(m2, self.order)
 
     def is_greater(self, m1: Monomial, m2: Monomial) -> bool:
@@ -475,8 +501,8 @@ class Polynomial:
         if divisor_lt is None:
             raise ZeroDivisionError("Division by zero polynomial")
 
-        dividend_monom, dividend_coeff = dividend_lt
-        divisor_monom, divisor_coeff = divisor_lt
+        dividend_coeff, dividend_monom = dividend_lt
+        divisor_coeff, divisor_monom = divisor_lt
 
         # Check if leading monomial of divisor divides leading monomial of dividend
         quotient_monom = dividend_monom / divisor_monom
@@ -509,7 +535,7 @@ class Polynomial:
         return max(m.degree() for m in self.terms.keys())
 
     def leading_term(
-        self, order: Optional[MonomialOrder] = None
+        self, order: Optional[Union[MonomialOrder, MonomialOrdering]] = None
     ) -> Optional[Tuple[Fraction, Monomial]]:
         """Get the leading term according to the given order (or default order).
 
@@ -522,26 +548,30 @@ class Polynomial:
         if not self.terms:
             return None
 
-        if order is None:
-            order = MonomialOrder.DEGLEX
-
         # Get the number of variables from any monomial (they should all have the same)
         if self.terms:
             num_vars = len(list(self.terms.keys())[0].exponents)
         else:
             return None
 
-        ordering = MonomialOrdering(num_vars, order)
+        if order is None:
+            ordering = MonomialOrdering(num_vars, MonomialOrder.DEGLEX)
+        elif isinstance(order, MonomialOrdering):
+            ordering = order
+        else:
+            ordering = MonomialOrdering(num_vars, order)
 
         # Find the maximum monomial according to the ordering
         max_monom = max(
             self.terms.keys(),
-            key=lambda m: ordering.compare(m, Monomial((0,) * num_vars)),
+            key=cmp_to_key(ordering.compare),
         )
 
         return self.terms[max_monom], max_monom
 
-    def leading_coefficient(self, order: Optional[MonomialOrder] = None) -> Fraction:
+    def leading_coefficient(
+        self, order: Optional[Union[MonomialOrder, MonomialOrdering]] = None
+    ) -> Fraction:
         """Get the leading coefficient according to the given order.
 
         Args:
@@ -559,7 +589,9 @@ class Polynomial:
         coeff, _ = lt
         return coeff
 
-    def leading_monomial(self, order: Optional[MonomialOrder] = None) -> Monomial:
+    def leading_monomial(
+        self, order: Optional[Union[MonomialOrder, MonomialOrdering]] = None
+    ) -> Monomial:
         """Get the leading monomial according to the given order.
 
         Args:
@@ -1148,6 +1180,159 @@ def monomial(exponents: List[int], coeff: Fraction = Fraction(1)) -> Polynomial:
     return Polynomial({Monomial(exponents): coeff})
 
 
+def _extend_polynomial(poly: Polynomial, num_vars: int) -> Polynomial:
+    """Pad monomials with trailing zero exponents."""
+    if poly.is_zero():
+        return Polynomial()
+    if poly.num_variables() > num_vars:
+        raise ValueError("Polynomial has more variables than target ring")
+    return Polynomial(
+        {
+            Monomial(list(m.exponents) + [0] * (num_vars - len(m.exponents))): c
+            for m, c in poly.terms.items()
+        }
+    )
+
+
+def _permute_polynomial(poly: Polynomial, permutation: List[int]) -> Polynomial:
+    """Return polynomial with new variable i equal to old variable permutation[i]."""
+    return Polynomial(
+        {
+            Monomial([m.exponents[old_i] for old_i in permutation]): c
+            for m, c in poly.terms.items()
+        }
+    )
+
+
+def _inverse_permutation(permutation: List[int]) -> List[int]:
+    inverse = [0] * len(permutation)
+    for new_i, old_i in enumerate(permutation):
+        inverse[old_i] = new_i
+    return inverse
+
+
+def _uses_only(monom: Monomial, variables: Set[int]) -> bool:
+    return all(exp == 0 or i in variables for i, exp in enumerate(monom.exponents))
+
+
+def _scale_to_monic(poly: Polynomial, order: MonomialOrder) -> Polynomial:
+    if poly.is_zero():
+        return poly
+    return poly * (Fraction(1) / poly.leading_coefficient(order))
+
+
+class Ideal:
+    """Finitely generated polynomial ideal over rational coefficients."""
+
+    def __init__(
+        self,
+        generators: Optional[List[Polynomial]] = None,
+        order: MonomialOrder = MonomialOrder.DEGLEX,
+    ):
+        generators = generators or []
+        self.order = order
+        self.num_vars = max((p.num_variables() for p in generators), default=0)
+        self.generators = [
+            _extend_polynomial(p, self.num_vars) for p in generators if not p.is_zero()
+        ]
+        self._basis: Optional[RewriteSystem] = None
+
+    @classmethod
+    def make(
+        cls,
+        generators: List[Polynomial],
+        order: MonomialOrder = MonomialOrder.DEGLEX,
+    ) -> "Ideal":
+        return cls(generators, order)
+
+    def groebner_basis(self) -> "RewriteSystem":
+        if self._basis is None:
+            self._basis = groebner_basis(self.generators, self.order)
+        return self._basis
+
+    def reduce(self, poly: Polynomial) -> Polynomial:
+        return self.groebner_basis().reduce(_extend_polynomial(poly, self.num_vars))
+
+    def mem(self, poly: Polynomial) -> bool:
+        """Return True when poly is in this ideal."""
+        if poly.is_zero():
+            return True
+        return self.reduce(poly).is_zero()
+
+    def sum(self, other: "Ideal") -> "Ideal":
+        num_vars = max(self.num_vars, other.num_vars)
+        return Ideal(
+            [_extend_polynomial(p, num_vars) for p in self.generators]
+            + [_extend_polynomial(p, num_vars) for p in other.generators],
+            self.order,
+        )
+
+    def product(self, other: "Ideal") -> "Ideal":
+        num_vars = max(self.num_vars, other.num_vars)
+        left = [_extend_polynomial(p, num_vars) for p in self.generators]
+        right = [_extend_polynomial(p, num_vars) for p in other.generators]
+        return Ideal([p * q for p in left for q in right], self.order)
+
+    def intersect(self, other: "Ideal") -> "Ideal":
+        """Compute I cap J by eliminating t from tI + (1-t)J."""
+        num_vars = max(self.num_vars, other.num_vars)
+        t = variable(0, num_vars + 1)
+        one_poly = Polynomial({Monomial((0,) * (num_vars + 1)): Fraction(1)})
+
+        def shift(poly: Polynomial) -> Polynomial:
+            poly = _extend_polynomial(poly, num_vars)
+            return Polynomial(
+                {Monomial((0,) + m.exponents): c for m, c in poly.terms.items()}
+            )
+
+        generators = [t * shift(p) for p in self.generators]
+        generators.extend((one_poly - t) * shift(p) for p in other.generators)
+        eliminated = Ideal(generators, MonomialOrder.LEX).project(
+            set(range(1, num_vars + 1))
+        )
+        return Ideal(
+            [
+                Polynomial({Monomial(m.exponents[1:]): c for m, c in p.terms.items()})
+                for p in eliminated.generators
+            ],
+            self.order,
+        )
+
+    def project(self, variables: Union[Set[int], List[int], Tuple[int, ...]]) -> "Ideal":
+        """Eliminate variables not listed and return the induced ideal."""
+        keep = set(variables)
+        if not keep:
+            keep = set()
+        if any(i < 0 or i >= self.num_vars for i in keep):
+            raise ValueError("Projection variable out of range")
+
+        eliminate = [i for i in range(self.num_vars) if i not in keep]
+        keep_ordered = [i for i in range(self.num_vars) if i in keep]
+        permutation = eliminate + keep_ordered
+        inverse = _inverse_permutation(permutation) if permutation else []
+        moved = [_permute_polynomial(p, permutation) for p in self.generators]
+        eliminated_count = len(eliminate)
+        basis = _basis_polynomials(moved, MonomialOrder.LEX)
+
+        projected = []
+        for poly in basis:
+            if all(
+                all(m.exponents[i] == 0 for i in range(eliminated_count))
+                for m in poly.terms
+            ):
+                restored = _permute_polynomial(poly, inverse)
+                projected.append(
+                    Polynomial(
+                        {
+                            m: c
+                            for m, c in restored.terms.items()
+                            if _uses_only(m, keep)
+                        }
+                    )
+                )
+        return Ideal(projected, self.order)
+
+
 # Groebner basis computation (simplified implementation)
 class RewriteRule:
     """A polynomial rewrite rule for Groebner basis computation."""
@@ -1158,7 +1343,7 @@ class RewriteRule:
 
     def applies_to(self, monom: Monomial) -> bool:
         """Check if this rule applies to a monomial."""
-        return self.lhs.divides(monom) is not None
+        return self.lhs.divides(monom)
 
     def apply(self, poly: Polynomial) -> Optional[Polynomial]:
         """Apply this rule to a polynomial."""
@@ -1168,7 +1353,7 @@ class RewriteRule:
             quotient = m / self.lhs
             if quotient is not None:
                 # Replace m with quotient * rhs
-                replacement = self.rhs * c
+                replacement = self.rhs * quotient * c
                 result = result + replacement
             else:
                 result.terms[m] = c
@@ -1210,7 +1395,7 @@ class RewriteSystem:
                         else:
                             new_terms[m] = c
                     else:
-                        new_terms[m] = c
+                        new_terms[m] = new_terms.get(m, Fraction(0)) + c
 
                 if rewritten:
                     current = Polynomial(new_terms)
@@ -1220,7 +1405,9 @@ class RewriteSystem:
         return current
 
 
-def groebner_basis(polys: List[Polynomial], order: MonomialOrder) -> RewriteSystem:
+def groebner_basis(
+    polys: List[Polynomial], order: MonomialOrder = MonomialOrder.DEGLEX
+) -> RewriteSystem:
     """Compute a Groebner basis using SymPy if available, otherwise simplified implementation.
 
     Args:
@@ -1248,18 +1435,14 @@ def groebner_basis(polys: List[Polynomial], order: MonomialOrder) -> RewriteSyst
             return RewriteSystem([])
 
         # Compute Groebner basis using SymPy
-        gb = groebner(sympy_polys, order=_sympy_order(order))
+        num_vars = max(p.num_variables() for p in polys)
+        gb = groebner(
+            sympy_polys, *sp.symbols(f"x:{num_vars}"), order=_sympy_order(order)
+        )
 
-        # Convert back to our format
-        rules = []
-        for poly in gb:
-            if poly != 0:
-                our_poly = Polynomial.from_sympy(poly)
-                if our_poly.terms:
-                    lt_coeff, lt_monom = our_poly.leading_term(order)
-                    remainder = our_poly - Polynomial({lt_monom: lt_coeff})
-                    if remainder.terms:
-                        rules.append(RewriteRule(lt_monom, remainder))
+        rules = _rewrite_rules_from_basis(
+            [Polynomial.from_sympy(sp.Poly(poly, *gb.gens)) for poly in gb], order
+        )
 
         return RewriteSystem(rules)
 
@@ -1268,64 +1451,77 @@ def groebner_basis(polys: List[Polynomial], order: MonomialOrder) -> RewriteSyst
         return _groebner_basis_simplified(polys, order)
 
 
-def _groebner_basis_simplified(
+def _basis_polynomials(
     polys: List[Polynomial], order: MonomialOrder
-) -> RewriteSystem:
-    """Simplified Groebner basis implementation using basic Buchberger's algorithm."""
-    # This is a basic implementation of Buchberger's algorithm.
-    # For production use, the SymPy implementation is recommended.
-
-    if not polys:
-        return RewriteSystem([])
-
-    # Filter out zero polynomials
+) -> List[Polynomial]:
+    """Compute Groebner basis polynomials and return them in local representation."""
     polys = [p for p in polys if not p.is_zero()]
-
     if not polys:
-        return RewriteSystem([])
+        return []
+    if HAS_SYMPY:
+        try:
+            sympy_polys = [p.to_sympy() for p in polys]
+            num_vars = max(p.num_variables() for p in polys)
+            gb = groebner(
+                sympy_polys, *sp.symbols(f"x:{num_vars}"), order=_sympy_order(order)
+            )
+            return [
+                _scale_to_monic(Polynomial.from_sympy(sp.Poly(poly, *gb.gens)), order)
+                for poly in gb
+                if poly != 0
+            ]
+        except Exception:
+            pass
+    return _buchberger_basis(polys, order)
 
-    # Get number of variables (assume all polynomials have same number)
-    num_vars = polys[0].num_variables()
 
-    # Initialize basis with input polynomials
-    basis = polys.copy()
+def _rewrite_rules_from_basis(
+    basis: List[Polynomial], order: MonomialOrder
+) -> List[RewriteRule]:
     rules = []
-
-    # Buchberger's algorithm
-    changed = True
-    while changed:
-        changed = False
-        new_basis = basis.copy()
-
-        # Check all pairs of polynomials
-        for i in range(len(basis)):
-            for j in range(i + 1, len(basis)):
-                p1 = basis[i]
-                p2 = basis[j]
-
-                # Compute S-polynomial
-                s_poly = _s_polynomial(p1, p2, order)
-                if s_poly is None or s_poly.is_zero():
-                    continue
-
-                # Reduce S-polynomial with respect to current basis
-                reduced = _reduce_polynomial(s_poly, basis, order)
-                if not reduced.is_zero():
-                    # Add remainder to basis if non-zero
-                    new_basis.append(reduced)
-                    changed = True
-
-        basis = new_basis
-
-    # Convert basis to rewrite rules
     for poly in basis:
         if poly.terms:
             lt_coeff, lt_monom = poly.leading_term(order)
             remainder = poly - Polynomial({lt_monom: lt_coeff})
-            if remainder.terms:
-                rules.append(RewriteRule(lt_monom, remainder))
+            rules.append(
+                RewriteRule(lt_monom, remainder * (Fraction(-1) / lt_coeff))
+            )
+    return rules
 
-    return RewriteSystem(rules)
+
+def _groebner_basis_simplified(
+    polys: List[Polynomial], order: MonomialOrder
+) -> RewriteSystem:
+    """Simplified Groebner basis implementation using basic Buchberger's algorithm."""
+    return RewriteSystem(
+        _rewrite_rules_from_basis(_buchberger_basis(polys, order), order)
+    )
+
+
+def _buchberger_basis(polys: List[Polynomial], order: MonomialOrder) -> List[Polynomial]:
+    """Compute a small reduced Groebner basis using Buchberger's algorithm."""
+    basis = [_scale_to_monic(p, order) for p in polys if not p.is_zero()]
+    pairs = [(i, j) for i in range(len(basis)) for j in range(i + 1, len(basis))]
+
+    while pairs:
+        i, j = pairs.pop(0)
+        s_poly = _s_polynomial(basis[i], basis[j], order)
+        if s_poly is None or s_poly.is_zero():
+            continue
+        reduced = _scale_to_monic(_reduce_polynomial(s_poly, basis, order), order)
+        if reduced.is_zero() or any(reduced == existing for existing in basis):
+            continue
+        new_index = len(basis)
+        basis.append(reduced)
+        pairs.extend((i, new_index) for i in range(new_index))
+
+    reduced_basis = []
+    for i, poly in enumerate(basis):
+        others = basis[:i] + basis[i + 1 :]
+        reduced = _scale_to_monic(_reduce_polynomial(poly, others, order), order)
+        if not reduced.is_zero() and not any(reduced == p for p in reduced_basis):
+            reduced_basis.append(reduced)
+    return reduced_basis
 
 
 def _s_polynomial(
@@ -1394,8 +1590,8 @@ def _sympy_order(order: MonomialOrder) -> str:
     if order == MonomialOrder.LEX:
         return "lex"
     elif order == MonomialOrder.DEGLEX:
-        return "deglex"
+        return "grlex"
     elif order == MonomialOrder.DEGREVLEX:
-        return "degrevlex"
+        return "grevlex"
     else:
-        return "deglex"  # Default
+        return "grlex"  # Default

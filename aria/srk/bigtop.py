@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any
 import sys
 import argparse
 import random
+import re
 
 from aria.srk.syntax import (
     Context,
@@ -18,6 +19,10 @@ from aria.srk.syntax import (
     ExpressionBuilder,
     mk_symbol,
     mk_const,
+    mk_int,
+    mk_real,
+    mk_mul,
+    symbols,
 )
 from aria.srk.smt import SMTInterface, SMTResult
 from aria.srk.srkSimplify import Simplifier, make_simplifier
@@ -116,31 +121,24 @@ Examples:
         elif formula_str == "false":
             return self.builder.mk_false()
 
-        # Handle simple comparisons like "x > 0"
-        if ">" in formula_str and "<" not in formula_str:
-            parts = formula_str.split(">")
-            if len(parts) == 2:
-                left = parts[0].strip()
-                right = parts[1].strip()
-                return self._parse_comparison(left, right, "gt")
-        elif "<" in formula_str and ">" not in formula_str:
-            parts = formula_str.split("<")
-            if len(parts) == 2:
-                left = parts[0].strip()
-                right = parts[1].strip()
-                return self._parse_comparison(left, right, "lt")
-        elif ">=" in formula_str:
-            parts = formula_str.split(">=")
-            if len(parts) == 2:
-                left = parts[0].strip()
-                right = parts[1].strip()
-                return self._parse_comparison(left, right, "geq")
-        elif "<=" in formula_str:
-            parts = formula_str.split("<=")
-            if len(parts) == 2:
-                left = parts[0].strip()
-                right = parts[1].strip()
-                return self._parse_comparison(left, right, "leq")
+        # Handle conjunctions before atoms.
+        for separator in ("&&", " and "):
+            if separator in formula_str:
+                parts = [part.strip() for part in formula_str.split(separator)]
+                formulas = [self.parse_simple_formula(part) for part in parts]
+                if any(formula is None for formula in formulas):
+                    return None
+                return self.builder.mk_and(formulas)
+
+        # Handle simple comparisons like "x >= 0".  Multi-character operators
+        # must be checked first so x >= 0 does not get split as x > "= 0".
+        for token, op in ((">=", "geq"), ("<=", "leq"), ("=", "eq"), (">", "gt"), ("<", "lt")):
+            if token in formula_str:
+                parts = formula_str.split(token, 1)
+                if len(parts) == 2:
+                    left = parts[0].strip()
+                    right = parts[1].strip()
+                    return self._parse_comparison(left, right, op)
 
         print(f"Cannot parse formula: {formula_str}", file=sys.stderr)
         return None
@@ -164,6 +162,8 @@ Examples:
                 )  # x >= 0 becomes 0 <= x
             elif op == "leq":
                 return self.builder.mk_leq(left_expr, right_expr)  # x <= 0
+            elif op == "eq":
+                return self.builder.mk_eq(left_expr, right_expr)
 
         except Exception as e:
             print(f"Error parsing comparison {left} {op} {right}: {e}", file=sys.stderr)
@@ -175,19 +175,31 @@ Examples:
         """Parse a term (variable or constant)."""
         term = term.strip()
 
-        # Handle constants
-        if term.isdigit() or (term.startswith("-") and term[1:].isdigit()):
-            # Create a constant symbol for the integer
-            const_symbol = self.context.mk_symbol(f"const_{term}", Type.INT)
-            return self.builder.mk_const(const_symbol)
-        elif term.replace(".", "").replace("-", "").isdigit():
-            # Handle floats
-            const_symbol = self.context.mk_symbol(f"const_{term}", Type.REAL)
-            return self.builder.mk_const(const_symbol)
+        # Parenthesized term
+        if term.startswith("(") and term.endswith(")"):
+            return self._parse_term(term[1:-1])
 
-        # Handle variables (assume single letters for now)
-        elif term.isalpha() and len(term) == 1:
-            var_symbol = self.context.mk_symbol(term, Type.INT)
+        # Small infix multiplication support is enough for bigtop's nlsat smoke
+        # path and prevents nonlinear terms from being silently rejected.
+        mul_parts = [part.strip() for part in term.split("*")]
+        if len(mul_parts) > 1:
+            factors = [self._parse_term(part) for part in mul_parts]
+            if any(factor is None for factor in factors):
+                return None
+            return mk_mul(self.context, factors)
+
+        # Handle constants
+        if re.fullmatch(r"-?\d+", term):
+            return mk_int(self.context, int(term))
+        elif re.fullmatch(r"-?(?:\d+\.\d*|\d*\.\d+)", term):
+            return mk_real(self.context, Fraction(term))
+
+        # Handle variables.  The current lightweight bigtop parser only knows
+        # single-letter variables; richer identifiers belong to the SMT-LIB path.
+        elif re.fullmatch(r"[A-Za-z]", term):
+            var_symbol = self.context._named_symbols.get(term)
+            if var_symbol is None:
+                var_symbol = self.context.mk_symbol(term, Type.INT)
             return self.builder.mk_var(var_symbol.id, var_symbol.typ)
 
         print(f"Cannot parse term: {term}", file=sys.stderr)
@@ -219,8 +231,18 @@ Examples:
     def cmd_nlsat(self, formula_str: str) -> None:
         """Check satisfiability using non-linear solver."""
         print(f"Checking satisfiability (non-linear): {formula_str}")
-        # For now, delegate to simplex
-        self.cmd_simsat(formula_str)
+        formula = self.parse_simple_formula(formula_str)
+        if formula is None:
+            print("ERROR: Could not parse formula")
+            return
+
+        result = self.smt.is_sat(formula)
+        if result == SMTResult.SAT:
+            print("SATISFIABLE")
+        elif result == SMTResult.UNSAT:
+            print("UNSATISFIABLE")
+        else:
+            print("UNKNOWN")
 
     def cmd_convex_hull(self, constraints: List[str]) -> None:
         """Compute convex hull of constraints."""
@@ -253,8 +275,10 @@ Examples:
     def cmd_wedge_hull(self, constraints: List[str]) -> None:
         """Compute wedge hull of constraints."""
         print(f"Computing wedge hull of {len(constraints)} constraints")
-        # For now, delegate to convex hull
-        self.cmd_convex_hull(constraints)
+        print(
+            "ERROR: wedge hull requires the OCaml Wedge/APRON migration surface, "
+            "which is not implemented in this Python port"
+        )
 
     def cmd_affine_hull(self, constraints: List[str]) -> None:
         """Compute affine hull of constraints."""
@@ -266,13 +290,19 @@ Examples:
         """Eliminate quantifiers from formula."""
         print(f"Quantifier elimination: {formula_str}")
 
-        # Check if formula starts with quantifier
-        if formula_str.startswith("∃") or formula_str.startswith("forall"):
+        formula = self.parse_simple_formula(formula_str)
+        if formula is None:
+            print("ERROR: Could not parse formula")
+            return
+
+        if symbols(formula):
             print(
-                "Quantifier found - elimination not fully implemented in this version"
+                "ERROR: quantifier elimination for parsed free-variable formulas "
+                "requires the full Quantifier.qe_mbp migration surface"
             )
-        else:
-            print("No quantifiers detected")
+            return
+
+        print(formula)
 
     def cmd_statistics(self, formula_str: str) -> None:
         """Show statistics for formula."""

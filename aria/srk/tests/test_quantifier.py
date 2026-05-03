@@ -27,7 +27,13 @@ from aria.srk.syntax import (
     mk_or,
     mk_not,
 )
-from aria.srk.quantifier import QuantifierEngine, StrategyImprovementSolver
+from aria.srk.quantifier import (
+    QuantifierEngine,
+    StrategyImprovementSolver,
+    check_strategy,
+    maximize,
+    simsat,
+)
 
 
 class TestQuantifierEngine(unittest.TestCase):
@@ -278,6 +284,58 @@ class TestStrategyImprovementSolver(unittest.TestCase):
         # result = solver.solve(game)
         # self.assertIsNotNone(result)
         pass
+
+    def test_simsat_uses_quantifier_prefix_for_linear_arithmetic(self):
+        """Check a simple quantified linear arithmetic game with Z3."""
+        x = mk_symbol(self.context, "qx", Type.REAL)
+        x_const = mk_const(x)
+        zero = mk_real(self.context, 0)
+
+        formula = Exists(str(x), x.typ, mk_lt(zero, x_const))
+
+        self.assertEqual(simsat(self.context, formula), "Sat")
+
+    def test_maximize_returns_bounded_linear_optimum(self):
+        """Maximize a bounded linear objective instead of returning a fallback."""
+        x = mk_symbol(self.context, "mx", Type.REAL)
+        x_const = mk_const(x)
+        zero = mk_real(self.context, 0)
+        five = mk_real(self.context, 5)
+        constraints = mk_and([mk_leq(zero, x_const), mk_leq(x_const, five)])
+
+        result = maximize(self.context, constraints, x_const)
+
+        self.assertEqual(result, ("Bounded", 5))
+
+    def test_maximize_reports_unbounded_linear_objective(self):
+        """Recognize an unbounded supported linear optimization problem."""
+        x = mk_symbol(self.context, "ux", Type.REAL)
+        x_const = mk_const(x)
+        zero = mk_real(self.context, 0)
+        constraints = mk_leq(zero, x_const)
+
+        self.assertEqual(maximize(self.context, constraints, x_const), "Infinity")
+
+    def test_maximize_returns_unknown_for_nonlinear_objective(self):
+        """Unsupported nonlinear objectives should not get optimistic fallbacks."""
+        x = mk_symbol(self.context, "nx", Type.REAL)
+        x_const = mk_const(x)
+        zero = mk_real(self.context, 0)
+        constraints = mk_leq(zero, x_const)
+        nonlinear_objective = mk_mul([x_const, x_const])
+
+        self.assertEqual(
+            maximize(self.context, constraints, nonlinear_objective), "Unknown"
+        )
+
+    def test_check_strategy_returns_false_for_unsat_linear_game(self):
+        """Strategy validation should inspect the actual game formula."""
+        x = mk_symbol(self.context, "sx", Type.REAL)
+        x_const = mk_const(x)
+        zero = mk_real(self.context, 0)
+        formula = mk_and([mk_lt(x_const, zero), mk_leq(zero, x_const)])
+
+        self.assertFalse(check_strategy(self.context, [], formula, {"strategy": []}))
 
 
 if __name__ == "__main__":

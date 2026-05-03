@@ -47,6 +47,18 @@ class TestBigtopCLI(unittest.TestCase):
         result = self.cli.parse_simple_formula("false")
         self.assertIsNotNone(result)
 
+        # Multi-character comparisons must not be parsed through > or < first.
+        result = self.cli.parse_simple_formula("x >= 0")
+        self.assertIsNotNone(result)
+
+        result = self.cli.parse_simple_formula("x <= 0")
+        self.assertIsNotNone(result)
+
+    def test_formula_parsing_conjunction(self):
+        """Test simple conjunction parsing."""
+        result = self.cli.parse_simple_formula("x >= 0 && x <= 1")
+        self.assertIsNotNone(result)
+
     def test_formula_parsing_none_cases(self):
         """Test formula parsing that returns None."""
         # Test invalid formulas
@@ -118,11 +130,11 @@ class TestCommands(unittest.TestCase):
     @patch("sys.stdout", new_callable=StringIO)
     def test_nlsat_command(self, mock_stdout):
         """Test nlsat command."""
-        # This delegates to simsat for now
         try:
-            self.cli.cmd_nlsat("x > 0")
+            self.cli.cmd_nlsat("x * x >= 0")
             output = mock_stdout.getvalue()
-            self.assertIn("Checking satisfiability", output)
+            self.assertIn("Checking satisfiability (non-linear)", output)
+            self.assertNotIn("simplex", output)
         except Exception:
             # If SMT dependencies aren't available, that's okay
             pass
@@ -145,6 +157,7 @@ class TestCommands(unittest.TestCase):
             self.cli.cmd_wedge_hull(["x >= 0"])
             output = mock_stdout.getvalue()
             self.assertIn("Computing wedge hull", output)
+            self.assertIn("not implemented", output)
         except Exception:
             # If dependencies aren't available, that's okay
             pass

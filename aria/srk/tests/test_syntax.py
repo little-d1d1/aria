@@ -26,7 +26,17 @@ from aria.srk.syntax import (
     mk_var,
     mk_const,
     mk_eq,
+    mk_exists,
+    mk_iff,
+    mk_int,
+    mk_ite,
+    mk_lt,
+    mk_pow,
     mk_true,
+    free_vars,
+    size,
+    substitute,
+    substitute_map,
 )
 
 
@@ -167,6 +177,45 @@ class TestConvenienceFunctions(unittest.TestCase):
 
         eq = mk_eq(var, const)
         self.assertIsInstance(eq, Eq)
+
+    def test_substitute_replaces_vars_and_consts(self):
+        ctx = Context()
+        x = ctx.mk_symbol("x", Type.INT)
+        y = ctx.mk_symbol("y", Type.INT)
+        expr = mk_eq(ctx, mk_var(ctx, x), mk_const(ctx, y))
+        replacement = mk_int(ctx, 1)
+
+        result = substitute(expr, {x: replacement, y: replacement})
+
+        self.assertEqual(result, mk_eq(ctx, replacement, replacement))
+
+    def test_substitute_does_not_enter_same_named_quantifier(self):
+        ctx = Context()
+        x = ctx.mk_symbol("x", Type.INT)
+        body = mk_lt(ctx, mk_var(ctx, x), mk_int(ctx, 1))
+        quantified = mk_exists(ctx, "x", Type.INT, body)
+
+        result = substitute_map(quantified, {x: mk_int(ctx, 0)})
+
+        self.assertEqual(result, quantified)
+
+    def test_free_vars_and_size_helpers(self):
+        ctx = Context()
+        x = ctx.mk_symbol("x", Type.INT)
+        y = ctx.mk_symbol("y", Type.INT)
+        expr = mk_eq(ctx, mk_var(ctx, x), mk_const(ctx, y))
+
+        self.assertEqual({symbol.name for symbol in free_vars(expr)}, {"x", "y"})
+        self.assertEqual(size(expr), 3)
+
+    def test_mk_iff_and_mk_pow_helpers(self):
+        ctx = Context()
+        x = ctx.mk_symbol("x", Type.INT)
+        left = mk_lt(ctx, mk_var(ctx, x), mk_int(ctx, 1))
+        right = mk_true(ctx)
+
+        self.assertIsInstance(mk_iff(ctx, left, right), And)
+        self.assertIsNotNone(mk_pow(ctx, mk_var(ctx, x), mk_int(ctx, 2)))
 
 
 if __name__ == "__main__":
