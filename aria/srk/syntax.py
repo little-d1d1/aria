@@ -33,6 +33,8 @@ from typing import (
     TypeVar,
     Generic,
     Callable,
+    Iterator,
+    Iterable
 )
 from abc import ABC, abstractmethod
 from enum import Enum

@@ -5,6 +5,7 @@ This module implements algorithms for simplifying symbolic expressions,
 including constant folding, algebraic simplifications, and logical simplifications.
 """
 
+import functools
 from __future__ import annotations
 from typing import Dict, List, Set, Tuple, Optional, Union, Any, Callable
 from fractions import Fraction

@@ -739,13 +739,13 @@ def polyhedron(
 
     constraints: List[Tuple[str, "QQVector"]] = []
     for atom in wedge.to_atoms():
-        if isinstance(atom, Eq):
+        if isinstance(atom, syntax.Eq):
             from .linear import linterm_of
-            vec = linterm_of(wedge.srk, mk_sub(wedge.srk, atom.left, atom.right))
+            vec = linterm_of(wedge.srk, syntax.mk_sub(wedge.srk, atom.left, atom.right))
             constraints.append(("Eq", vec))
-        elif isinstance(atom, Leq):
+        elif isinstance(atom, syntax.Leq):
             from .linear import linterm_of
-            vec = linterm_of(wedge.srk, mk_sub(wedge.srk, atom.right, atom.left))
+            vec = linterm_of(wedge.srk, syntax.mk_sub(wedge.srk, atom.right, atom.left))
             constraints.append(("Geq", vec))
     return constraints
 
@@ -3009,7 +3009,7 @@ def farkas_equalities(wedge: "Wedge") -> List[Tuple["ArithExpression", "QQVector
             if isinstance(atom, Eq):
                 try:
                     from .linear import linterm_of
-                    diff = mk_sub(wedge.srk, atom.left, atom.right)
+                    diff = syntax.mk_sub(wedge.srk, atom.left, atom.right)
                     vec = linterm_of(wedge.srk, diff)
                     equalities.append((atom.left, vec))
                 except Exception:
@@ -3032,13 +3032,13 @@ def bounds(
     try:
         dim = wedge.cs.cs_term_id(wedge.cs, term)
         for atom in wedge.to_atoms():
-            if isinstance(atom, Eq):
+            if isinstance(atom, syntax.Eq):
                 if atom.left == term:
                     return _Int.make(0, 0)
         lo = _Int.bottom()
         hi = _Int.top()
         for atom in wedge.to_atoms():
-            if isinstance(atom, Leq):
+            if isinstance(atom, syntax.Leq):
                 if atom.left == term:
                     hi = _Int.make(None, 0)
                 if atom.right == term:
@@ -3067,9 +3067,9 @@ def reduce(wedge: "Wedge", lemma: Optional["Wedge"] = None) -> "Wedge":
 
 def cover(
     wedge: "Wedge",
-    pred: Callable[[Symbol], bool],
+    pred: Callable[[syntax.Symbol], bool],
     lemma: Optional["Wedge"] = None,
-    subterm_pred: Optional[Callable[[Symbol], bool]] = None,
+    subterm_pred: Optional[Callable[[syntax.Symbol], bool]] = None,
 ) -> "Wedge":
     """Overapproximate existential quantifier elimination via GFM.
 
@@ -3091,10 +3091,10 @@ def cover(
 
 
 def symbolic_bounds_formula(
-    exists: Callable[[Symbol], bool],
+    exists: Callable[[syntax.Symbol], bool],
     srk: "Context",
     phi: "FormulaExpression",
-    sym: Optional[Symbol] = None,
+    sym: Optional[syntax.Symbol] = None,
 ) -> "FormulaExpression":
     """Compute symbolic bounds as a formula (mirrors OCaml ``Wedge.symbolic_bounds_formula``).
 
@@ -3104,11 +3104,11 @@ def symbolic_bounds_formula(
     w = abstract_to_wedge(srk, phi) if hasattr(phi, '__class__') else phi
     if hasattr(w, 'to_formula'):
         return w.to_formula()
-    return mk_true(srk)
+    return syntax.mk_true(srk)
 
 
 def symbolic_bounds_formula_list(
-    exists: Callable[[Symbol], bool],
+    exists: Callable[[syntax.Symbol], bool],
     srk: "Context",
     phi: "FormulaExpression",
 ) -> List["FormulaExpression"]:
@@ -3116,4 +3116,4 @@ def symbolic_bounds_formula_list(
     w = abstract_to_wedge(srk, phi) if hasattr(phi, '__class__') else phi
     if hasattr(w, 'to_atoms'):
         return w.to_atoms()
-    return [mk_true(srk)]
+    return [syntax.mk_true(srk)]
