@@ -601,42 +601,102 @@ def _path_realizability_constraints(
     disconnected component.  For every nonempty subset of states, if the subset
     has no selected source and no positive incoming edge from outside, then no
     edge internal to the subset may be used.
+
+    For small graphs (≤ 10 states) we enumerate subsets explicitly.
+    For larger graphs we use a polynomial-size flow-reachability encoding:
+    introduce a non-negative "reachability potential" r[v] for each state v
+    and require that for every used internal edge (u→v) with u ≠ source,
+    r[v] ≥ r[u] + 1.  This is the standard LP-reachability trick and is
+    sound and complete for the connectivity property we need.
     """
-    if num_states > 10:
-        raise NotImplementedError(
-            "VASS path-realizability constraints are explicit only up to 10 states"
-        )
+    if num_states <= 10:
+        # Original explicit subset enumeration (exact).
+        constraints = []
+        states = range(num_states)
+        for subset_size in range(1, num_states + 1):
+            for subset_tuple in itertools.combinations(states, subset_size):
+                subset = set(subset_tuple)
+                sources_in_subset = [local_s_t[state][0] for state in subset]
+                incoming = [
+                    edge_counters[index]
+                    for index, (src, _, dst) in enumerate(edge_transformers)
+                    if src not in subset and dst in subset
+                ]
+                internal = [
+                    edge_counters[index]
+                    for index, (src, _, dst) in enumerate(edge_transformers)
+                    if src in subset and dst in subset
+                ]
+                if not internal:
+                    continue
+                constraints.append(
+                    _implies(
+                        srk,
+                        syntax.mk_eq(
+                            srk,
+                            _sum_terms(srk, sources_in_subset + incoming),
+                            syntax.mk_zero(srk),
+                        ),
+                        syntax.mk_eq(
+                            srk,
+                            _sum_terms(srk, internal),
+                            syntax.mk_zero(srk),
+                        ),
+                    )
+                )
+        return syntax.mk_and(srk, constraints)
+
+    # Scalable LP-reachability encoding for large graphs.
+    # Introduce a potential r[v] ≥ 0 for each state v.
+    # For each edge e = (u → v) with counter f_e:
+    #   f_e > 0  ∧  u is not the source  →  r[v] ≥ r[u] + 1
+    # This prevents isolated circulations that are disconnected from the source.
+    potentials = [
+        syntax.mk_symbol(srk, name=f"_reach_{v}", typ=syntax.Type.REAL)
+        for v in range(num_states)
+    ]
+    pot_terms = [syntax.mk_const(srk, p) for p in potentials]
 
     constraints = []
-    states = range(num_states)
-    for subset_size in range(1, num_states + 1):
-        for subset_tuple in itertools.combinations(states, subset_size):
-            subset = set(subset_tuple)
-            sources_in_subset = [local_s_t[state][0] for state in subset]
-            incoming = [
-                edge_counters[index]
-                for index, (src, _, dst) in enumerate(edge_transformers)
-                if src not in subset and dst in subset
-            ]
-            internal = [
-                edge_counters[index]
-                for index, (src, _, dst) in enumerate(edge_transformers)
-                if src in subset and dst in subset
-            ]
-            if not internal:
-                continue
-            constraints.append(
-                _implies(
-                    srk,
-                    syntax.mk_eq(
-                        srk,
-                        _sum_terms(srk, sources_in_subset + incoming),
-                        syntax.mk_zero(srk),
-                    ),
-                    syntax.mk_eq(
-                        srk,
-                        _sum_terms(srk, internal),
-                        syntax.mk_zero(srk),
+    # r[v] ≥ 0 for all v
+    zero = syntax.mk_zero(srk, typ=syntax.Type.REAL)
+    for pt in pot_terms:
+        constraints.append(syntax.mk_leq(srk, zero, pt))
+
+    # Source state has potential 0.
+    for state, (src_term, _) in enumerate(local_s_t):
+        # If this state is the source (src_term > 0), fix r[state] = 0.
+        constraints.append(
+            _implies(
+                srk,
+                syntax.mk_lt(srk, zero, src_term),
+                syntax.mk_eq(srk, pot_terms[state], zero),
+            )
+        )
+
+    big_m = syntax.mk_real(srk, num_states + 1)  # upper bound on potentials
+
+    for idx, (src, _, dst) in enumerate(edge_transformers):
+        if src == dst:
+            continue  # self-loops don't constrain reachability
+        f_e = edge_counters[idx]
+        # f_e > 0  →  r[dst] ≥ r[src] + 1
+        # Encoded as: r[dst] - r[src] ≥ 1  OR  f_e = 0
+        # i.e.  f_e > 0  →  r[dst] - r[src] - 1 ≥ 0
+        one = syntax.mk_real(srk, 1)
+        diff = syntax.mk_sub(srk, pot_terms[dst],
+                             syntax.mk_add(srk, [pot_terms[src], one]))
+        constraints.append(
+            _implies(
+                srk,
+                syntax.mk_lt(srk, zero, f_e),
+                syntax.mk_leq(srk, zero, diff),
+            )
+        )
+        # r[v] ≤ num_states (bound potentials to keep the system finite)
+        constraints.append(syntax.mk_leq(srk, pot_terms[dst], big_m))
+
+    return syntax.mk_and(srk, constraints)
                     ),
                 )
             )

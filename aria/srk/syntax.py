@@ -186,10 +186,23 @@ class Context:
         return Const(symbol)
 
     def register_named_symbol(self, name: str, typ: Type) -> None:
-        """Register a named symbol."""
+        """Register a named symbol.
+
+        Matches OCaml semantics: the name must be unique across *types*.
+        Calling register_named_symbol with the same name and the same type
+        is idempotent (no-op).  Calling it with the same name but a different
+        type raises ValueError.
+        """
         if name in self._named_symbols:
-            raise ValueError(f"Symbol name '{name}' already registered")
-        symbol = self.mk_symbol(name, typ)
+            existing = self._named_symbols[name]
+            if existing.typ != typ:
+                raise ValueError(
+                    f"Symbol name '{name}' already registered with type "
+                    f"{existing.typ}, cannot re-register with {typ}"
+                )
+            # Same name, same type → idempotent, nothing to do.
+            return
+        self.mk_symbol(name, typ)
 
     def is_registered_name(self, name: str) -> bool:
         """Check if a name is registered."""
@@ -207,6 +220,23 @@ class Context:
             if sym == symbol:
                 return name
         return None
+
+    def dup_symbol(self, symbol: Symbol) -> Symbol:
+        """Return a fresh symbol with the same name and type as *symbol*.
+
+        Mirrors OCaml's ``dup_symbol``: the new symbol has a distinct id but
+        inherits the name (if any) and type of the original.
+        """
+        return self.mk_symbol(name=symbol.name, typ=symbol.typ)
+
+    @staticmethod
+    def compare_symbol(a: Symbol, b: Symbol) -> int:
+        """Total order on symbols by id (mirrors OCaml's compare_symbol)."""
+        if a.id < b.id:
+            return -1
+        if a.id > b.id:
+            return 1
+        return 0
 
     def typ_symbol(self, symbol: Symbol) -> Type:
         """Get the type of a symbol."""
@@ -1425,8 +1455,8 @@ def of_linterm(srk: Context, term: Any) -> ArithExpression:
         except Exception:
             coeff = Fraction(float(coeff))
 
-        # See `linear.dim_of_sym`: variable id is encoded as (dim - 1).
-        var_id = int(dim) - 1
+        # With const_dim = -1, dimension IS the var_id directly.
+        var_id = int(dim)
 
         # Recover type/name from the context when possible.
         var_type = Type.REAL
@@ -2331,6 +2361,19 @@ def symbol_of_int(id: int) -> Symbol:
     # This is a simplified implementation - in a full implementation,
     # this would need to handle type information properly
     return Symbol(id, f"s{id}", Type.INT)
+
+
+def dup_symbol(context: Context, symbol: Symbol) -> Symbol:
+    """Return a fresh symbol with the same name and type as *symbol*.
+
+    Mirrors OCaml's ``dup_symbol``.
+    """
+    return context.dup_symbol(symbol)
+
+
+def compare_symbol(a: Symbol, b: Symbol) -> int:
+    """Total order on symbols by id (mirrors OCaml's compare_symbol)."""
+    return Context.compare_symbol(a, b)
 
 
 def substitute_const(*args) -> Expression:

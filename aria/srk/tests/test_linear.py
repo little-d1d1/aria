@@ -58,14 +58,19 @@ class TestQQVector(unittest.TestCase):
         self.assertEqual(dot, expected)
 
     def test_pivot(self):
-        """Test pivot operation."""
+        """Test pivot operation (no scaling — OCaml semantics)."""
         v = QQVector({0: Fraction(2), 1: Fraction(4)})
 
         pivot_coeff, pivoted = v.pivot(0)
 
         self.assertEqual(pivot_coeff, Fraction(2))
-        expected_pivoted = QQVector({1: Fraction(2)})  # 4/2 = 2
+        # OCaml pivot returns rest without scaling
+        expected_pivoted = QQVector({1: Fraction(4)})
         self.assertEqual(pivoted, expected_pivoted)
+
+        # Invariant: add_term(coeff, dim, rest) == original
+        restored = pivoted.add_term(pivot_coeff, 0)
+        self.assertEqual(restored, v)
 
     def test_dimension(self):
         """Test dimension calculation."""

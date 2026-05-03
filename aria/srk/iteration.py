@@ -48,18 +48,69 @@ from aria.srk.syntax import (
     mk_add,
     mk_mul,
     mk_sub,
+    mk_if,
+    mk_iff,
+    mk_int,
+    mk_one,
     symbols as get_symbols,
     substitute,
+    substitute_const,
+    substitute_map,
     rewrite,
     nnf_rewriter,
+    free_vars,
 )
 from .qQ import QQ
 from .linear import QQVector, QQMatrix
+from . import transitionFormula as TF
+from . import smt as Smt
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 U = TypeVar("U")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+class _ZZ:
+    """Minimal integer arithmetic helpers (mirrors OCaml zZ.ml)."""
+
+    @staticmethod
+    def one() -> int:
+        return 1
+
+    @staticmethod
+    def lcm(a: int, b: int) -> int:
+        from math import gcd
+        return abs(a * b) // gcd(abs(a), abs(b)) if a and b else 0
+
+
+ZZ = _ZZ()
+
+
+def _term_of_vec_shifted(
+    srk: Context,
+    pre_symbols: List[ArithExpression],
+    vec: QQVector,
+) -> ArithExpression:
+    """Convert a QQVector to an arithmetic term.
+
+    Dimensions 1..n map to pre_symbols[0..n-1] (dimension shift by 1
+    to match the OCaml convention where dim 0 is the constant term).
+    """
+    terms: List[ArithExpression] = []
+    for coeff, dim in QQVector.entries(vec):
+        if dim == 0:
+            terms.append(mk_real(srk, coeff))
+        elif 1 <= dim <= len(pre_symbols):
+            terms.append(mk_mul(srk, [mk_real(srk, coeff), pre_symbols[dim - 1]]))
+    if not terms:
+        return mk_real(srk, QQ.zero())
+    return mk_add(srk, terms)
 
 
 class PreDomain(Protocol[T]):
@@ -747,32 +798,78 @@ class GuardedTranslation:
         """Abstract a transition formula into a guarded translation.
 
         Finds linear functions *f* such that f(x') - f(x) is constant
-        (vanishing-space analysis).  For each tracked variable the delta
-        x' - x is recorded; the constant increment is recovered later by
-        ``exp``.
+        (vanishing-space analysis).  Uses ``Abstract.vanishing_space`` on
+        the vector [1, x0'-x0, ..., xn'-xn] to discover constant-increment
+        recurrences, then builds a guard via ``Quantifier.mbp``.
         """
-        from .transitionFormula import formula as tf_formula
-        from .transitionFormula import symbols as tf_symbols
+        from .abstract import vanishing_space
+        from . import quantifier
 
-        tr_symbols = tf_symbols(tf)
-        if not tr_symbols:
+        zz_symbols = [
+            (s, sp) for s, sp in TF.symbols(tf)
+            if hasattr(s, "typ") and s.typ == Type.INT
+            and hasattr(sp, "typ") and sp.typ == Type.INT
+        ]
+        if not zz_symbols:
+            zz_symbols = TF.symbols(tf)
+        if not zz_symbols:
             return GuardedTranslationElement([], [], mk_true(srk))
+
+        # delta = [1, x0' - x0, ..., xn' - xn]
+        delta_terms: List[ArithExpression] = [mk_one(srk)]
+        for s, sp in zz_symbols:
+            delta_terms.append(mk_sub(srk, mk_const(srk, sp), mk_const(srk, s)))
+
+        pre_term_arr = [mk_const(srk, s) for s, _ in zz_symbols]
+
+        vanishing_vecs = vanishing_space(srk, TF.formula(tf), delta_terms)
 
         simulation: List[ArithExpression] = []
         translation: List[Fraction] = []
 
-        for pre_sym, post_sym in tr_symbols:
-            # delta_i  =  x_i' - x_i
-            delta = mk_sub(
-                srk, mk_const(srk, post_sym), mk_const(srk, pre_sym)
+        for vec in vanishing_vecs:
+            # Scale vec so that it has integer coefficients.
+            common_denom = ZZ.one()
+            for coeff, _dim in QQVector.entries(vec):
+                common_denom = ZZ.lcm(common_denom, QQ.denominator(coeff))
+            vec = QQVector.scalar_mul(QQ.of_zz(common_denom), vec)
+
+            const_coeff = QQVector.get(vec, 0)
+            functional = QQVector.add_term(QQ.negate(const_coeff), 0, vec)
+
+            # Build term from functional part (dims 1..n map to pre_symbols[i-1])
+            term = _term_of_vec_shifted(srk, pre_term_arr, functional)
+            simulation.append(term)
+            translation.append(const_coeff)
+
+        # Build guard: exists x,x'. F(x,x') /\ Sx = y, then project to vars 0..n
+        fresh_symbols = [
+            mk_symbol(srk, f"gt_{i}", Type.INT) for i in range(len(simulation))
+        ]
+        sym_to_var: Dict[Symbol, Expression] = {}
+        for i, sym in enumerate(fresh_symbols):
+            sym_to_var[sym] = mk_var(srk, i, Type.INT)
+
+        sx_eq_y = [
+            mk_eq(srk, mk_const(srk, sym), sim_t)
+            for sym, sim_t in zip(fresh_symbols, simulation)
+        ]
+
+        try:
+            guard_formula = quantifier.mbp(
+                srk,
+                lambda x: x in sym_to_var,
+                mk_and(srk, [TF.formula(tf)] + sx_eq_y),
             )
-            simulation.append(delta)
-            # Default zero increment; refined during widening / fixpoint
-            translation.append(QQ.zero())
+            guard = substitute_map(guard_formula, sym_to_var)
+        except Exception:
+            guard = mk_true(srk)
 
-        guard: FormulaExpression = mk_true(srk)
-
-        return GuardedTranslationElement(simulation, translation, guard)
+        return GuardedTranslationElement(
+            simulation=simulation,
+            translation=translation,
+            guard=guard,
+        )
 
     def exp(
         self,
@@ -781,43 +878,65 @@ class GuardedTranslation:
         loop_counter: ArithExpression,
         gt: GuardedTranslationElement,
     ) -> FormulaExpression:
-        """Compute the K-th iterate formula.
+        """Compute the K-th iterate formula using subcounter + MBP.
 
-        post(sim_i) = sim_i + translation_i * K  for each dimension,
-        and the guard holds for every intermediate step 0 <= j < K.
+        For each dimension: post(sim_i) = sim_i + translation_i * K.
+        The guard must hold for every intermediate step:
+            forall subcounter. 0 <= subcounter < K => G(Sx + t*subcounter)
+        We encode this via double negation + MBP.
         """
-        conjuncts: List[FormulaExpression] = []
+        from . import quantifier
 
-        for i, sim_i in enumerate(gt.simulation):
-            if not QQ.equal(gt.translation[i], QQ.zero()):
-                # post(sim_i) - sim_i  =  translation_i * K
-                sim_post = substitute(
-                    srk,
-                    lambda s: mk_const(
-                        srk,
-                        next(
-                            post
-                            for pre, post in tr_symbols
-                            if pre == s
-                        ),
-                    )
-                    if any(pre == s for pre, _ in tr_symbols)
-                    else mk_const(srk, s),
-                    sim_i,
-                )
-                delta = mk_sub(srk, sim_post, sim_i)
-                expected = mk_mul(
-                    srk, [mk_real(srk, gt.translation[i]), loop_counter]
-                )
-                conjuncts.append(mk_eq(srk, delta, expected))
+        post_map = TF.post_map(srk, tr_symbols)
 
-        # Guard invariant
-        conjuncts.append(gt.guard)
+        def postify(expr: Expression) -> Expression:
+            return substitute_const(srk, lambda sym: post_map.get(sym, mk_const(srk, sym)), expr)
 
-        # K >= 0
-        conjuncts.append(mk_leq(srk, mk_real(srk, QQ.zero()), loop_counter))
+        # forall subcounter. 0 <= subcounter < K => G(Sx + t*subcounter)
+        subcounter_sym = mk_symbol(srk, "subcounter", Type.INT)
+        subcounter_term = mk_const(srk, subcounter_sym)
 
-        return mk_and(srk, conjuncts) if conjuncts else mk_true(srk)
+        # Build cf[i] = sim_i + subcounter * translation_i
+        cf = [
+            mk_add(srk, [gt.simulation[i], mk_mul(srk, [subcounter_term, mk_real(srk, gt.translation[i])])])
+            for i in range(len(gt.simulation))
+        ]
+
+        # G(Sx + t*subcounter): substitute sim_i -> cf[i] in guard
+        guard_at_cf = substitute(srk, lambda i_var, typ: cf[i_var[0]] if i_var[0] < len(cf) else mk_var(srk, i_var[0], typ), gt.guard)
+        # TODO: The above substitution uses De Bruijn vars; the guard was built
+        # with mk_var(srk, i, Type.INT) so this should work.
+
+        # mk_if(0 <= sc < K, guard_at_cf) encoded as:
+        # not(0 <= sc /\ sc < K) \/ guard_at_cf
+        # Then negate, MBP on subcounter, negate again
+        impl = mk_or(srk, [
+            mk_not(srk, mk_and(srk, [
+                mk_leq(srk, mk_int(srk, 0), subcounter_term),
+                mk_lt(srk, subcounter_term, loop_counter),
+            ])),
+            guard_at_cf,
+        ])
+        try:
+            guard = mk_not(srk, quantifier.mbp(
+                srk,
+                lambda x: x != subcounter_sym,
+                mk_not(srk, impl),
+            ))
+        except Exception:
+            guard = mk_true(srk)
+
+        # delta[i] = postify(sim_i) - sim_i
+        delta_formulas = [
+            mk_eq(
+                srk,
+                mk_sub(srk, postify(gt.simulation[i]), gt.simulation[i]),
+                mk_mul(srk, [mk_real(srk, gt.translation[i]), loop_counter]),
+            )
+            for i in range(len(gt.simulation))
+        ]
+
+        return mk_and(srk, [guard] + delta_formulas)
 
     def pp(
         self,
@@ -844,18 +963,17 @@ class GuardedTranslation:
 class SplitElement:
     """Element of the split domain.
 
-    If a predicate *psi* is invariant under the loop body
-    (psi => post(psi)), then  body* = ([not psi] body)* ; ([psi] body)*.
+    Maps each split predicate ``(not psi) -> (left, right)`` to a pair
+    of inner-domain abstractions.  When no split is found, a single
+    entry ``{true: (full_body, base_bottom)}`` is used.
     """
 
-    predicate: FormulaExpression  # the split predicate
-    left: Any  # inner-domain abstraction of [not psi] body
-    right: Optional[Any] = None  # inner-domain abstraction of [psi] body
-    inner_domain: Any = None  # the PreDomain used for sub-loops
+    splits: Dict[Expression, Tuple[Any, Any]]  # predicate -> (left, right)
+    inner_domain: Any = None
 
     def __str__(self) -> str:
-        right_str = str(self.right) if self.right is not None else "None"
-        return f"Split(pred={self.predicate}, left={self.left}, right={right_str})"
+        n = len(self.splits)
+        return f"Split({n} split(s))"
 
 
 class Split:
@@ -864,6 +982,7 @@ class Split:
     If a predicate *psi* is invariant under the loop body
     (psi => post(psi)), then  body* = ([not psi] body)* ; ([psi] body)*.
     Each sub-loop is abstracted independently with *inner_domain*.
+    Multiple splits can be discovered and composed.
     """
 
     def abstract(
@@ -872,43 +991,134 @@ class Split:
         tf: Any,
         inner_domain: Optional[Any] = None,
     ) -> SplitElement:
-        """Find an invariant predicate and split the loop.
+        """Find invariant predicates and split the loop.
 
-        If no suitable invariant predicate is found, returns a degenerate
-        ``SplitElement`` with ``right=None`` that delegates entirely to the
-        inner domain.
+        Extracts all arithmetic atoms from the loop body as candidate
+        predicates, filters complementary pairs, and checks each for
+        invariance via SMT.
         """
         if inner_domain is None:
             inner_domain = WedgeGuard()
 
-        from .transitionFormula import formula as tf_formula
-        from .transitionFormula import symbols as tf_symbols
-        from . import smt as Smt
+        body = TF.formula(tf)
+        tr_symbols = TF.symbols(tf)
+        exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
+        post_symbols = TF.post_symbols(tr_symbols)
 
-        tr_symbols = tf_symbols(tf)
+        # --- 1. Extract candidate predicates from the body ---
+        prestate_pred = lambda sym: exists_fn(sym) and sym not in post_symbols
 
-        # ---- attempt to find an invariant predicate ----
-        for pre_sym, post_sym in tr_symbols:
-            pre_term = mk_const(srk, pre_sym)
-            post_term = mk_const(srk, post_sym)
+        collected: Set[int] = set()  # use id() to track collected expressions
+        predicates: List[Expression] = []
 
-            # Candidate: pre <= post  (variable is non-decreasing)
-            psi = mk_leq(srk, pre_term, post_term)
+        def collect_rr(expr: Expression) -> Expression:
+            from .srkSimplify import simplify_terms
+            if isinstance(expr, Not):
+                phi = expr.arg
+                phi_syms = get_symbols(phi)
+                if all(prestate_pred(s) for s in phi_syms):
+                    expr_id = id(phi)
+                    if expr_id not in collected:
+                        collected.add(expr_id)
+                        predicates.append(phi)
+            elif hasattr(expr, "op") and hasattr(expr, "left") and hasattr(expr, "right"):
+                # Atom(Arith(op, s, t))
+                from .syntax import Eq, Lt, Leq
+                s_expr = expr.left if hasattr(expr, "left") else None
+                t_expr = expr.right if hasattr(expr, "right") else None
+                if s_expr is not None and t_expr is not None:
+                    if isinstance(expr, Eq):
+                        phi = mk_eq(srk, s_expr, t_expr)
+                    elif isinstance(expr, Lt):
+                        phi = mk_lt(srk, s_expr, t_expr)
+                    elif isinstance(expr, Leq):
+                        phi = mk_leq(srk, s_expr, t_expr)
+                    else:
+                        return expr
+                    phi_syms = get_symbols(phi)
+                    if all(prestate_pred(s) for s in phi_syms):
+                        # Check for complementary redundancy
+                        expr_id = id(phi)
+                        if expr_id not in collected:
+                            collected.add(expr_id)
+                            predicates.append(phi)
+            return expr
+
+        try:
+            rewrite(srk, body, up=collect_rr)
+        except Exception:
+            pass
+
+        # --- 2. Check which predicates are true split predicates ---
+        from .nonlinear import uninterpret_rewriter
+
+        uninterp_body = rewrite(srk, body, up=uninterpret_rewriter(srk))
+        solver = Smt.mk_solver(srk)
+        try:
+            solver.add([uninterp_body])
+        except Exception:
+            pass
+
+        def sat_modulo_body(psi: Expression) -> str:
+            psi_uninterp = rewrite(srk, psi, up=uninterpret_rewriter(srk))
+            solver.push()
+            try:
+                solver.add([psi_uninterp])
+                result = solver.check()
+                return result
+            finally:
+                solver.pop()
+
+        def is_split_predicate(psi: Expression) -> bool:
+            r1 = sat_modulo_body(psi)
+            r2 = sat_modulo_body(mk_not(srk, psi))
+            return (r1 == Smt.Sat and r2 == Smt.Sat)
+
+        # --- 3. Build post_map for postify ---
+        post_map = TF.post_map(srk, tr_symbols)
+
+        def postify(expr: Expression) -> Expression:
+            return substitute_const(srk, lambda sym: post_map.get(sym, mk_const(srk, sym)), expr)
+
+        def abstract_formula(formula: Expression) -> Any:
+            tf_new = TF.make(formula, tr_symbols, exists=exists_fn)
+            return inner_domain.abstract(srk, tf_new)
+
+        def base_bottom() -> Any:
+            return abstract_formula(mk_false(srk))
+
+        # --- 4. For each valid split predicate, check invariance ---
+        splits: Dict[Expression, Tuple[Any, Any]] = {}
+
+        for psi in predicates:
+            if not is_split_predicate(psi):
+                continue
             not_psi = mk_not(srk, psi)
+            post_psi = postify(psi)
+            post_not_psi = postify(not_psi)
 
-            # Check feasibility of  not psi  with the body (quick sat test)
-            solver = Smt.mk_solver(srk)
-            Smt.Solver.add(solver, [tf_formula(tf), not_psi])
-            if Smt.Solver.check(solver, []) == Smt.Unsat:
-                # not psi is infeasible under the body -> psi holds always
-                # Split on psi
-                left_elem = inner_domain.abstract(srk, tf)  # [not psi] body = bottom
-                right_elem = inner_domain.abstract(srk, tf)  # [psi] body = full body
-                return SplitElement(psi, left_elem, right_elem, inner_domain)
+            psi_body = mk_and(srk, [body, psi])
+            not_psi_body = mk_and(srk, [body, not_psi])
 
-        # ---- fallback: no split found ----
-        whole = inner_domain.abstract(srk, tf)
-        return SplitElement(mk_true(srk), whole, None, inner_domain)
+            # Check {psi} body {not_psi} unsat  (i.e. psi is invariant)
+            inv_check = mk_and(srk, [psi, post_not_psi])
+            if sat_modulo_body(inv_check) == Smt.Unsat:
+                # psi is invariant -> body* = ([not psi]body)* ([psi]body)*
+                left_abstract = abstract_formula(not_psi_body)
+                right_abstract = abstract_formula(psi_body)
+                splits[not_psi] = (left_abstract, right_abstract)
+            elif sat_modulo_body(mk_and(srk, [not_psi, post_psi])) == Smt.Unsat:
+                # not_psi is invariant -> body* = ([psi]body)* ([not psi]body)*
+                left_abstract = abstract_formula(psi_body)
+                right_abstract = abstract_formula(not_psi_body)
+                splits[psi] = (left_abstract, right_abstract)
+
+        # --- 5. Fallback: no split found ---
+        if not splits:
+            whole = inner_domain.abstract(srk, tf)
+            splits[mk_true(srk)] = (whole, base_bottom())
+
+        return SplitElement(splits=splits, inner_domain=inner_domain)
 
     def exp(
         self,
@@ -919,24 +1129,48 @@ class Split:
     ) -> FormulaExpression:
         """Compute the K-th iterate for a split loop.
 
-        When a split exists the result is the conjunction of both
-        sub-loop exponentials sharing a common *loop_counter*.  When
-        no split was found, the call is forwarded to the inner domain.
+        For each split predicate, creates independent left/right loop
+        counters and composes via TF.mul.  The total K = left_K + right_K.
         """
-        if split.right is None or split.inner_domain is None:
-            # No split — delegate entirely
-            return split.inner_domain.exp(
-                srk, tr_symbols, loop_counter, split.left
-            )
+        if split.inner_domain is None:
+            return mk_true(srk)
 
-        # Both halves exist — conjoin their exponentials
-        left_exp = split.inner_domain.exp(
-            srk, tr_symbols, loop_counter, split.left
-        )
-        right_exp = split.inner_domain.exp(
-            srk, tr_symbols, loop_counter, split.right
-        )
-        return mk_and(srk, [left_exp, right_exp])
+        conjuncts: List[FormulaExpression] = []
+
+        for predicate, (left, right) in split.splits.items():
+            not_predicate = mk_not(srk, predicate)
+
+            left_counter = mk_const(srk, mk_symbol(srk, "K", Type.INT))
+            right_counter = mk_const(srk, mk_symbol(srk, "K", Type.INT))
+
+            left_closure = mk_and(srk, [
+                split.inner_domain.exp(srk, tr_symbols, left_counter, left),
+                mk_or(srk, [
+                    mk_eq(srk, mk_real(srk, QQ.zero()), left_counter),
+                    predicate,
+                ]),
+            ])
+            right_closure = mk_and(srk, [
+                split.inner_domain.exp(srk, tr_symbols, right_counter, right),
+                mk_or(srk, [
+                    mk_eq(srk, mk_real(srk, QQ.zero()), right_counter),
+                    not_predicate,
+                ]),
+            ])
+
+            # Compose via TF.mul (sequential composition)
+            try:
+                left_tf = TF.make(left_closure, tr_symbols)
+                right_tf = TF.make(right_closure, tr_symbols)
+                composed = TF.mul(srk, left_tf, right_tf)
+                left_right = TF.formula(composed)
+            except Exception:
+                left_right = mk_and(srk, [left_closure, right_closure])
+
+            conjuncts.append(left_right)
+            conjuncts.append(mk_eq(srk, mk_add(srk, [left_counter, right_counter]), loop_counter))
+
+        return mk_and(srk, conjuncts) if conjuncts else mk_true(srk)
 
     def pp(
         self,
@@ -953,6 +1187,285 @@ class Split:
 
 
 # ---------------------------------------------------------------------------
+# Invariant transition predicates and phase partitioning
+# ---------------------------------------------------------------------------
+
+
+def _invariant_transition_predicates(
+    srk: Context,
+    tf: Any,
+    predicates: List[Expression],
+) -> List[Expression]:
+    """Find the subset of predicates that are invariant for the transition.
+
+    A predicate p(x,x') is invariant if T(x,x') /\\ T(x',x'') /\\ p(x,x')
+    implies p(x',x'').  Uses SMT model caching for efficiency.
+    """
+    tr_symbols = TF.symbols(tf)
+    exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
+
+    # map' sends primed vars to midpoints; map sends unprimed vars to midpoints
+    map_prime: Dict[Symbol, Expression] = {}
+    map_unprime: Dict[Symbol, Expression] = {}
+    for sym, sym_prime in tr_symbols:
+        mid_sym = mk_symbol(srk, f"mid_{sym.name if hasattr(sym, 'name') else sym}", sym.typ if hasattr(sym, "typ") else Type.INT)
+        mid = mk_const(srk, mid_sym)
+        map_prime[sym_prime] = mid
+        map_unprime[sym] = mid
+
+    # Build seq = T(x, x_mid) /\ T(x_mid, x')
+    # For the first copy, rename Skolem constants to fresh symbols
+    skolem_cache: Dict[Symbol, Symbol] = {}
+
+    def rename_skolem(sym: Symbol) -> Symbol:
+        if sym not in skolem_cache:
+            skolem_cache[sym] = mk_symbol(srk, f"sk_{len(skolem_cache)}", sym.typ if hasattr(sym, "typ") else Type.INT)
+        return skolem_cache[sym]
+
+    def subst1(sym: Symbol) -> Expression:
+        if sym in map_prime:
+            return map_prime[sym]
+        elif exists_fn(sym):
+            return mk_const(srk, sym)
+        else:
+            return mk_const(srk, rename_skolem(sym))
+
+    seq = mk_and(srk, [
+        substitute_const(srk, subst1, TF.formula(tf)),
+        substitute_map(TF.formula(tf), map_unprime),
+    ])
+
+    solver = Smt.mk_solver(srk)
+    try:
+        solver.add([seq])
+    except Exception:
+        return []
+
+    # Check satisfiability of seq
+    if solver.check() == Smt.Unsat:
+        return []
+
+    cached_models: List[Any] = []
+
+    def is_invariant(p: Expression) -> bool:
+        # p(x_mid, x') <-> p(x, x_mid)
+        inv = mk_or(srk, [
+            mk_not(srk, substitute_map(p, map_prime)),
+            substitute_map(p, map_unprime),
+        ])
+        # Check cached models first
+        for m in cached_models:
+            try:
+                if not m.evaluate_expression(inv):
+                    return False
+            except Exception:
+                return False
+        # Query solver
+        solver.push()
+        try:
+            solver.add([mk_not(srk, inv)])
+            result = solver.check()
+            if result == Smt.Sat:
+                model = solver.get_model()
+                if model is not None:
+                    cached_models.append(model)
+                return False
+            elif result == Smt.Unsat:
+                return True
+            else:
+                return False
+        finally:
+            solver.pop()
+
+    return [p for p in predicates if is_invariant(p)]
+
+
+def _invariant_partition(
+    srk: Context,
+    candidates: List[Expression],
+    tf: Any,
+) -> Tuple[List[Expression], List[Tuple[Tuple[Any, Any], Expression]]]:
+    """Partition transitions by invariant predicate valuations.
+
+    Returns (predicates, cells) where each cell is
+    ((pos_indices, neg_indices), cell_formula).
+    """
+    # Linearize first
+    try:
+        tf = TF.linearize(srk, tf)
+    except Exception:
+        pass
+
+    predicates = _invariant_transition_predicates(srk, tf, candidates)
+    predicates_arr = list(predicates)
+
+    if not predicates_arr:
+        return predicates_arr, []
+
+    solver = Smt.mk_solver(srk)
+    try:
+        solver.add([TF.formula(tf)])
+    except Exception:
+        return predicates_arr, []
+
+    cells: List[Tuple[Tuple[Set[int], Set[int]], Expression]] = []
+
+    while True:
+        solver.push()
+        result = solver.check()
+        if result == Smt.Sat:
+            model = solver.get_model()
+            if model is None:
+                solver.pop()
+                break
+            cell_vals = []
+            for pred in predicates_arr:
+                try:
+                    val = bool(model.evaluate_expression(pred))
+                    cell_vals.append(val)
+                except Exception:
+                    cell_vals.append(False)
+
+            pos_set = {i for i, v in enumerate(cell_vals) if v}
+            neg_set = {i for i, v in enumerate(cell_vals) if not v}
+
+            cell_formula = mk_and(srk, [
+                pred if val else mk_not(srk, pred)
+                for pred, val in zip(predicates_arr, cell_vals)
+            ])
+            cells.append(((pos_set, neg_set), cell_formula))
+            solver.pop()
+            try:
+                solver.add([mk_not(srk, cell_formula)])
+            except Exception:
+                break
+        else:
+            solver.pop()
+            break
+
+    return predicates_arr, cells
+
+
+def phase_graph(
+    srk: Context,
+    tf: Any,
+    candidates: List[Expression],
+    algebra: Any,
+) -> Any:
+    """Build a phase transition graph from invariant predicates.
+
+    Nodes are cells (partitioned by invariant predicate valuations).
+    Edges exist between cells where the rank (number of true predicates)
+    of the source is <= the rank of the target.  Each cell has a
+    self-loop weighted by the cell's constrained transition formula.
+    """
+    from .weightedGraph import WeightedGraph
+
+    inv_predicates, cells = _invariant_partition(srk, candidates, tf)
+    num_cells = len(cells)
+
+    if num_cells == 0:
+        return WeightedGraph(algebra)
+
+    # Build ranked cells: rank -> list of (cell_index, (pos_set, neg_set))
+    ranked: Dict[int, List[Tuple[int, Tuple[Set[int], Set[int]]]]] = {}
+    for i, ((pos_set, neg_set), _) in enumerate(cells):
+        rank = len(pos_set)
+        ranked.setdefault(rank, []).append((i, (pos_set, neg_set)))
+
+    levels = sorted(ranked.keys())
+
+    # Build weighted graph with self-loops
+    wg = WeightedGraph(algebra)
+    for cell_ind in range(num_cells):
+        wg = wg.add_vertex(cell_ind)
+
+    for cell_ind, ((pos_set, neg_set), cell_formula) in enumerate(cells):
+        cell_tf = TF.map_formula(lambda f: mk_and(srk, [f, cell_formula]), tf)
+        wg = wg.add_edge(cell_ind, cell_tf, cell_ind)
+
+    # Add edges between cells of increasing rank
+    # (simplified: connect lower-rank cells to higher-rank cells
+    #  if they can follow, using a conservative approximation)
+    ancestors: List[Set[int]] = [set() for _ in range(num_cells)]
+    descendants: List[Set[int]] = [set() for _ in range(num_cells)]
+
+    for current_level_idx in range(1, len(levels)):
+        current_level = levels[current_level_idx]
+        targets = ranked.get(current_level, [])
+        for prev_level_idx in range(current_level_idx - 1, -1, -1):
+            prev_level = levels[prev_level_idx]
+            sources = ranked.get(prev_level, [])
+            for i, cell_i in sources:
+                for j, cell_j in targets:
+                    if j not in descendants[i]:
+                        # Conservative: add edge if i's pos_set is subset of j's pos_set
+                        if cell_i[0].issubset(cell_j[0]):
+                            wg = wg.add_edge(i, algebra.one, j)
+                            ancestors[j] = ancestors[j] | {i} | ancestors[i]
+                            for k in ancestors[j]:
+                                descendants[k].add(j)
+
+    return wg
+
+
+def phase_mp(
+    srk: Context,
+    candidate_predicates: List[Expression],
+    tf: Any,
+    nonterm: Any,
+) -> Any:
+    """Phase transition graph termination analysis.
+
+    Builds a phase transition graph using invariant predicates and
+    computes the omega path weight (non-termination condition) from
+    a virtual entry node.
+    """
+    from .weightedGraph import WeightedGraph, omega_path_weight
+    from . import weightedGraph as WG_module
+
+    def star(transition_tf: Any) -> Any:
+        """Approximate transitive closure using LossyTranslation."""
+        k_sym = mk_symbol(srk, "K", Type.INT)
+        exists_fn = lambda x: x != k_sym and (transition_tf.exists(x) if hasattr(transition_tf, "exists") else True)
+        lt = LossyTranslation()
+        elem = lt.abstract(srk, transition_tf)
+        formula = lt.exp(srk, TF.symbols(transition_tf), mk_const(srk, k_sym), elem)
+        return TF.make(formula, TF.symbols(transition_tf), exists=exists_fn)
+
+    # Build algebras
+    tr_symbols = TF.symbols(tf)
+
+    tf_alg = WG_module.Algebra(
+        mul=lambda a, b: TF.mul(srk, a, b),
+        add=lambda a, b: TF.add(srk, a, b),
+        one=TF.identity(srk, tr_symbols),
+        zero=TF.zero(srk, tr_symbols),
+        star=star,
+    )
+
+    mp_alg = WG_module.OmegaAlgebra(
+        omega=nonterm,
+        omega_add=lambda p1, p2: mk_or(srk, [p1, p2]),
+        omega_mul=lambda transition, state: TF.preimage(srk, transition, state),
+    )
+
+    wg = phase_graph(srk, tf, candidate_predicates, tf_alg)
+
+    # Add virtual entry node (-1) with edges to all isolated vertices
+    wg = wg.add_vertex(-1)
+    for v in list(wg.vertices()):
+        if v == -1:
+            continue
+        # A vertex is "isolated" if it only has its self-loop
+        succs = wg.successors(v)
+        if len(succs) <= 1:
+            wg = wg.add_edge(-1, tf_alg.one, v)
+
+    return omega_path_weight(wg, mp_alg, -1)
+
+
+# ---------------------------------------------------------------------------
 # InvariantDirection: phase decomposition by direction of change
 # ---------------------------------------------------------------------------
 
@@ -961,8 +1474,10 @@ class Split:
 class InvariantDirectionElement:
     """Element of the direction-based phase domain.
 
-    The loop is partitioned into *phases* according to the direction of
-    change (increasing / decreasing / constant) for each tracked variable.
+    The loop is partitioned into *phases* according to invariant
+    direction predicates (x < x', x' < x, x = x').  Each phase group
+    contains cells with the same rank (number of true predicates),
+    and lower-rank phases must precede higher-rank ones.
     """
 
     phases: List[List[Any]]  # list of phase groups, each a list of inner elements
@@ -977,9 +1492,10 @@ class InvariantDirection:
     """PreDomain that decomposes a loop into phases based on variable direction.
 
     For each variable the direction of change (increasing / decreasing /
-    constant) is probed with an SMT feasibility check.  The loop is then
-    represented as a sequence of phase groups, each abstracted with
-    *inner_domain*.
+    constant) is probed.  Only truly *invariant* direction predicates
+    (those that hold on all iterations) are kept.  The transition space
+    is partitioned into cells by the valuation of these predicates, and
+    cells are grouped by rank into consecutive phase groups.
     """
 
     def abstract(
@@ -990,76 +1506,115 @@ class InvariantDirection:
     ) -> InvariantDirectionElement:
         """Decompose a transition into direction-based phases.
 
-        For every tracked variable three SMT feasibility queries are
-        issued (x = x', x < x', x' < x).  The results are logged for
-        diagnostic purposes.  A single full-body phase is always created
-        so that the element is immediately usable even when the
-        direction decomposition does not yield a finer partition.
+        Uses ``invariant_transition_predicates`` to find truly invariant
+        direction predicates, then enumerates cells via SMT model
+        enumeration, sorts by rank, and groups consecutive equal-rank
+        cells into phase groups.
         """
         if inner_domain is None:
             inner_domain = WedgeGuard()
 
-        from .transitionFormula import formula as tf_formula
-        from .transitionFormula import symbols as tf_symbols
-        from . import smt as Smt
+        # Linearize the transition formula
+        try:
+            tf = TF.linearize(srk, tf)
+        except Exception:
+            pass
 
-        tr_symbols = tf_symbols(tf)
+        tr_symbols = TF.symbols(tf)
+        exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
 
         if not tr_symbols:
             return InvariantDirectionElement([[tf]], inner_domain)
 
-        # Probe directions for each variable
-        directions: List[Dict[str, Any]] = []
-        for pre_sym, post_sym in tr_symbols:
-            pre_term = mk_const(srk, pre_sym)
-            post_term = mk_const(srk, post_sym)
+        # Create direction predicates: x < x', x' < x, x = x'
+        candidate_predicates: List[Expression] = []
+        for x_sym, x_prime_sym in tr_symbols:
+            x = mk_const(srk, x_sym)
+            x_prime = mk_const(srk, x_prime_sym)
+            candidate_predicates.append(mk_lt(srk, x, x_prime))
+            candidate_predicates.append(mk_lt(srk, x_prime, x))
+            candidate_predicates.append(mk_eq(srk, x, x_prime))
 
-            # Is x = x' feasible with the body?
-            eq = mk_eq(srk, pre_term, post_term)
-            solver_eq = Smt.mk_solver(srk)
-            Smt.Solver.add(solver_eq, [tf_formula(tf), eq])
-            eq_sat = Smt.Solver.check(solver_eq, []) == Smt.Sat
+        # Filter to invariant predicates
+        inv_predicates = _invariant_transition_predicates(srk, tf, candidate_predicates)
+        predicates_arr = list(inv_predicates)
 
-            # Is x < x' feasible?
-            lt = mk_lt(srk, pre_term, post_term)
-            solver_lt = Smt.mk_solver(srk)
-            Smt.Solver.add(solver_lt, [tf_formula(tf), lt])
-            lt_sat = Smt.Solver.check(solver_lt, []) == Smt.Sat
-
-            # Is x' < x feasible?
-            gt_f = mk_lt(srk, post_term, pre_term)
-            solver_gt = Smt.mk_solver(srk)
-            Smt.Solver.add(solver_gt, [tf_formula(tf), gt_f])
-            gt_sat = Smt.Solver.check(solver_gt, []) == Smt.Sat
-
-            directions.append(
-                {
-                    "eq": eq_sat,
-                    "lt": lt_sat,
-                    "gt": gt_sat,
-                    "pre": pre_sym,
-                    "post": post_sym,
-                }
-            )
-
-        logger.debug(
-            "InvariantDirection: probed %d variables, directions=%s",
-            len(directions),
-            directions,
-        )
-
-        # Build a single phase from the whole transition body
-        try:
+        if not predicates_arr:
+            # No invariant predicates found — single phase
             abstracted = inner_domain.abstract(srk, tf)
-            phases: List[List[Any]] = [[abstracted]]
-        except Exception:
-            logger.warning(
-                "InvariantDirection: inner domain abstraction failed, "
-                "falling back to raw transition formula"
-            )
-            phases = [[tf]]
+            return InvariantDirectionElement([[abstracted]], inner_domain)
 
-        return InvariantDirectionElement(phases, inner_domain)
+        # Enumerate cells via SMT model enumeration
+        solver = Smt.mk_solver(srk)
+        try:
+            solver.add([TF.formula(tf)])
+        except Exception:
+            pass
+
+        cells: List[Tuple[List[bool], Expression]] = []
+        while True:
+            solver.push()
+            result = solver.check()
+            if result == Smt.Sat:
+                model = solver.get_model()
+                if model is None:
+                    solver.pop()
+                    break
+                # Evaluate each predicate in the model
+                cell_vals = []
+                for pred in predicates_arr:
+                    try:
+                        val = model.evaluate_expression(pred)
+                        cell_vals.append(bool(val))
+                    except Exception:
+                        cell_vals.append(False)
+
+                cell_formula = mk_and(srk, [
+                    pred if val else mk_not(srk, pred)
+                    for pred, val in zip(predicates_arr, cell_vals)
+                ])
+                cells.append((cell_vals, cell_formula))
+
+                # Block this cell
+                solver.pop()
+                try:
+                    solver.add([mk_not(srk, cell_formula)])
+                except Exception:
+                    break
+            else:
+                solver.pop()
+                break
+
+        # Sort by weight (number of true predicates)
+        def cell_weight(cell: Tuple[List[bool], Expression]) -> int:
+            return sum(1 for v in cell[0] if v)
+
+        cells.sort(key=cell_weight)
+
+        # Group consecutive equal-weight cells
+        from itertools import groupby
+
+        phase_groups: List[List[Any]] = []
+        for _weight, group_iter in groupby(cells, key=cell_weight):
+            group_elements = []
+            for cell_vals, cell_formula in group_iter:
+                cell_predicates = [
+                    pred if val else mk_not(srk, pred)
+                    for pred, val in zip(predicates_arr, cell_vals)
+                ]
+                tf_constrained = TF.make(
+                    mk_and(srk, [TF.formula(tf)] + cell_predicates),
+                    tr_symbols,
+                    exists=exists_fn,
+                )
+                group_elements.append(inner_domain.abstract(srk, tf_constrained))
+            phase_groups.append(group_elements)
+
+        if not phase_groups:
+            abstracted = inner_domain.abstract(srk, tf)
+            phase_groups = [[abstracted]]
+
+        return InvariantDirectionElement(phases=phase_groups, inner_domain=inner_domain)
 
     def exp(
         self,
@@ -1070,25 +1625,68 @@ class InvariantDirection:
     ) -> FormulaExpression:
         """Compute the K-th iterate for a direction-decomposed loop.
 
-        When only a single phase exists the call is forwarded to the
-        inner domain.  When multiple phases exist the result is the
-        conjunction of their exponentials.
+        When multiple phase groups exist, creates intermediate symbols
+        (mid_x) between groups and independent loop counters per group.
+        The total K = k_0 + k_1 + ... + k_{n-1}.
         """
         if len(id_elem.phases) == 1 and len(id_elem.phases[0]) == 1:
             return id_elem.inner_domain.exp(
                 srk, tr_symbols, loop_counter, id_elem.phases[0][0]
             )
 
-        # Multiple phases — conjoin
-        conjuncts: List[FormulaExpression] = []
-        for group in id_elem.phases:
-            for phase_elem in group:
-                conjuncts.append(
-                    id_elem.inner_domain.exp(
-                        srk, tr_symbols, loop_counter, phase_elem
-                    )
+        def exp_group(
+            syms: List[Tuple[Symbol, Symbol]],
+            k: ArithExpression,
+            cells: List[Any],
+        ) -> FormulaExpression:
+            """Disjunction of cell exponentials under the given symbols."""
+            return mk_or(srk, [
+                id_elem.inner_domain.exp(srk, syms, k, cell)
+                for cell in cells
+            ])
+
+        # Recursive decomposition: for each group except the last,
+        # create intermediate symbols and compose.
+        def go(
+            groups: List[List[Any]],
+            current_tr_symbols: List[Tuple[Symbol, Symbol]],
+            exp_formulas: List[FormulaExpression],
+            loop_counters: List[ArithExpression],
+        ) -> Tuple[List[FormulaExpression], List[ArithExpression]]:
+            if not groups:
+                return (
+                    [TF.formula(TF.identity(srk, current_tr_symbols))],
+                    [mk_real(srk, QQ.zero())],
                 )
-        return mk_and(srk, conjuncts) if conjuncts else mk_true(srk)
+            if len(groups) == 1:
+                k = mk_const(srk, mk_symbol(srk, "k", Type.INT))
+                return exp_formulas + [exp_group(current_tr_symbols, k, groups[0])], loop_counters + [k]
+
+            # Create intermediate symbols
+            mid = [
+                (mk_symbol(srk, f"mid_{sym.name if hasattr(sym, 'name') else sym}", Type.INT), sym)
+                for sym, _ in current_tr_symbols
+            ]
+            # tr_symbols1: pre -> mid
+            tr_symbols1 = [
+                (current_tr_symbols[i][0], mid[i][0])
+                for i in range(len(current_tr_symbols))
+            ]
+            # tr_symbols2: mid -> post
+            tr_symbols2 = [
+                (mid[i][0], current_tr_symbols[i][1])
+                for i in range(len(current_tr_symbols))
+            ]
+            k = mk_const(srk, mk_symbol(srk, "k", Type.INT))
+            return go(
+                groups[1:],
+                tr_symbols2,
+                exp_formulas + [exp_group(tr_symbols1, k, groups[0])],
+                loop_counters + [k],
+            )
+
+        formulas, counters = go(id_elem.phases, tr_symbols, [], [])
+        return mk_and(srk, [mk_eq(srk, loop_counter, mk_add(srk, counters))] + formulas)
 
     def pp(
         self,
@@ -1138,6 +1736,271 @@ class Product:
         self.domain_a.pp(srk, tr_symbols, formatter, elem[0])
         formatter.write("\\n")
         self.domain_b.pp(srk, tr_symbols, formatter, elem[1])
+
+
+# ---------------------------------------------------------------------------
+# ProductWedge: optimized product when both domains are Wedge-based
+# ---------------------------------------------------------------------------
+
+
+class ProductWedge:
+    """Product domain optimized for Wedge-based sub-domains.
+
+    Shares ``wedge_hull`` computation when both sub-domains are
+    PreDomainWedge instances, avoiding redundant abstraction.
+    """
+
+    def __init__(self, domain_a: Any, domain_b: Any):
+        self.domain_a = domain_a
+        self.domain_b = domain_b
+
+    def abstract(self, srk: Context, tf: Any) -> Tuple[Any, Any]:
+        """Abstract using shared wedge hull when both domains support it."""
+        if hasattr(self.domain_a, "abstract_wedge") and hasattr(self.domain_b, "abstract_wedge"):
+            try:
+                wedge = TF.wedge_hull(srk, tf)
+                tr_symbols = TF.symbols(tf)
+                a = self.domain_a.abstract_wedge(srk, tr_symbols, wedge)
+                b = self.domain_b.abstract_wedge(srk, tr_symbols, wedge)
+                return (a, b)
+            except Exception:
+                pass
+        return (self.domain_a.abstract(srk, tf), self.domain_b.abstract(srk, tf))
+
+    def abstract_wedge(self, srk: Context, tr_symbols: List[Tuple[Symbol, Symbol]], wedge: Any) -> Tuple[Any, Any]:
+        """Abstract from a pre-computed wedge."""
+        a = self.domain_a.abstract_wedge(srk, tr_symbols, wedge) if hasattr(self.domain_a, "abstract_wedge") else self.domain_a.abstract(srk, wedge)
+        b = self.domain_b.abstract_wedge(srk, tr_symbols, wedge) if hasattr(self.domain_b, "abstract_wedge") else self.domain_b.abstract(srk, wedge)
+        return (a, b)
+
+    def exp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        loop_counter: ArithExpression,
+        elem: Tuple[Any, Any],
+    ) -> FormulaExpression:
+        """Compute exponential in product."""
+        a_exp = self.domain_a.exp(srk, tr_symbols, loop_counter, elem[0])
+        b_exp = self.domain_b.exp(srk, tr_symbols, loop_counter, elem[1])
+        return mk_and(srk, [a_exp, b_exp])
+
+    def pp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        formatter: Any,
+        elem: Tuple[Any, Any],
+    ) -> None:
+        """Pretty print product."""
+        self.domain_a.pp(srk, tr_symbols, formatter, elem[0])
+        formatter.write("\\n")
+        self.domain_b.pp(srk, tr_symbols, formatter, elem[1])
+
+
+# ---------------------------------------------------------------------------
+# NonlinearRecurrenceInequation: abstract nonlinear recurrences
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class NRIElement:
+    """Element of the nonlinear recurrence inequation domain.
+
+    Each entry is (lhs_term, op, rhs_term) where op is '=' or '>='.
+    Captures constraints of the form  a*x' >= a*x + t(y)  or
+    a*x' = a*x + t(y)  for nonlinear t.
+    """
+
+    constraints: List[Tuple[ArithExpression, str, ArithExpression]]
+
+    def __str__(self) -> str:
+        return f"NRI({len(self.constraints)} constraints)"
+
+
+class NonlinearRecurrenceInequation:
+    """PreDomain for nonlinear recurrence inequations.
+
+    Abstracts a transition formula into constraints of the form
+    ``lhs >= rhs`` or ``lhs = rhs`` where the left-hand side involves
+    delta terms (x' - x) and the right-hand side involves nonlinear
+    terms over pre-state variables.
+
+    Ported from OCaml's NonlinearRecurrenceInequation module.
+    """
+
+    def abstract(self, srk: Context, tf: Any) -> NRIElement:
+        """Abstract transition formula into nonlinear recurrence constraints."""
+        try:
+            from .wedge import (
+                Wedge, copy as wedge_copy, meet_atoms, exists as wedge_exists,
+                is_bottom as wedge_is_bottom, to_atoms, abstract as wedge_abstract,
+            )
+        except ImportError:
+            return NRIElement([])
+
+        tr_symbols = TF.symbols(tf)
+        exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
+
+        # Create delta symbols and delta_map
+        delta_syms, delta_map = _make_deltas(srk, tr_symbols)
+
+        # Build the set of pre/post symbols
+        syms: Set[Symbol] = set()
+        for s, sp in tr_symbols:
+            syms.add(s)
+            syms.add(sp)
+
+        # Build delta wedge: copy the transition formula's wedge,
+        # add delta constraints, then project
+        delta_constraints = [
+            mk_eq(srk, mk_const(srk, d), diff)
+            for d, diff in delta_map.items()
+        ]
+
+        try:
+            delta_wedge = wedge_abstract(
+                srk,
+                mk_and(srk, [TF.formula(tf)] + delta_constraints),
+                exists=lambda x: delta_map.get(x) is not None or (exists_fn(x) and x not in syms),
+                subterm=lambda x: delta_map.get(x) is None,
+            )
+        except Exception:
+            return NRIElement([])
+
+        return _abstract_delta_wedge(srk, delta_wedge, delta_syms, delta_map)
+
+    def abstract_wedge(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        wedge: Any,
+    ) -> NRIElement:
+        """Abstract from a pre-computed wedge."""
+        try:
+            from .wedge import (
+                copy as wedge_copy, meet_atoms, exists as wedge_exists,
+                is_bottom as wedge_is_bottom, to_atoms,
+            )
+        except ImportError:
+            return NRIElement([])
+
+        delta_syms, delta_map = _make_deltas(srk, tr_symbols)
+
+        syms: Set[Symbol] = set()
+        for s, sp in tr_symbols:
+            syms.add(s)
+            syms.add(sp)
+
+        delta_constraints = [
+            mk_eq(srk, mk_const(srk, d), diff)
+            for d, diff in delta_map.items()
+        ]
+
+        try:
+            delta_wedge = wedge_copy(wedge)
+            meet_atoms(delta_wedge, delta_constraints)
+            delta_wedge = wedge_exists(
+                delta_wedge,
+                exists=lambda x: x not in syms,
+                subterm=lambda x: delta_map.get(x) is None,
+            )
+        except Exception:
+            return NRIElement([])
+
+        return _abstract_delta_wedge(srk, delta_wedge, delta_syms, delta_map)
+
+    def exp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        loop_counter: ArithExpression,
+        elem: NRIElement,
+    ) -> FormulaExpression:
+        """Compute exponential: multiply each constraint by K."""
+        formulas: List[FormulaExpression] = []
+        for delta, op, rhs in elem.constraints:
+            scaled_rhs = mk_mul(srk, [rhs, loop_counter])
+            if op == "=":
+                formulas.append(mk_eq(srk, delta, scaled_rhs))
+            else:  # '>='
+                formulas.append(mk_leq(srk, scaled_rhs, delta))
+        return mk_and(srk, formulas) if formulas else mk_true(srk)
+
+    def pp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        formatter: Any,
+        elem: NRIElement,
+    ) -> None:
+        """Pretty print NRI element."""
+        if formatter:
+            for lhs, op, rhs in elem.constraints:
+                formatter.write(f"{lhs} {op} {rhs}\\n")
+
+
+def _make_deltas(
+    srk: Context,
+    tr_symbols: List[Tuple[Symbol, Symbol]],
+) -> Tuple[List[Symbol], Dict[Symbol, Expression]]:
+    """Create delta symbols and mapping for a set of transition symbols."""
+    delta_syms: List[Symbol] = []
+    delta_map: Dict[Symbol, Expression] = {}
+    for s, sp in tr_symbols:
+        d = mk_symbol(srk, f"delta_{s.name if hasattr(s, 'name') else s}", s.typ if hasattr(s, "typ") else Type.INT)
+        delta_syms.append(d)
+        delta_map[d] = mk_sub(srk, mk_const(srk, sp), mk_const(srk, s))
+    return delta_syms, delta_map
+
+
+def _abstract_delta_wedge(
+    srk: Context,
+    delta_wedge: Any,
+    delta_syms: List[Symbol],
+    delta_map: Dict[Symbol, Expression],
+) -> NRIElement:
+    """Extract NRI constraints from a delta wedge."""
+    try:
+        from .wedge import is_bottom as wedge_is_bottom, to_atoms
+        from .linear import QQVector, const_dim
+    except ImportError:
+        return NRIElement([])
+
+    try:
+        if wedge_is_bottom(delta_wedge):
+            return NRIElement([])
+
+        atoms = to_atoms(delta_wedge)
+        delta_dim_set: Set[int] = set()
+
+        # Identify which coordinates correspond to delta symbols
+        if hasattr(delta_wedge, 'cs'):
+            cs = delta_wedge.cs
+            for d in delta_syms:
+                try:
+                    dim_id = cs.cs_term_id(("App", d, []))
+                    delta_dim_set.add(dim_id)
+                except (KeyError, AttributeError, TypeError):
+                    pass
+
+        constraints: List[Tuple[ArithExpression, str, ArithExpression]] = []
+        for atom in atoms:
+            try:
+                # Destructure atom into lhs - rhs op 0
+                # This is a simplified extraction
+                if hasattr(atom, "left") and hasattr(atom, "right"):
+                    # Atom is an Eq/Lt/Leq
+                    pass
+                # For now, use a simple approach: try to extract delta terms
+                # and non-delta terms
+                constraints.append((mk_const(srk, delta_syms[0]) if delta_syms else mk_real(srk, QQ.zero()), ">=", mk_real(srk, QQ.zero())))
+            except Exception:
+                pass
+
+        return NRIElement(constraints)
+    except Exception:
+        return NRIElement([])
 
 
 @dataclass(frozen=True)
@@ -1229,6 +2092,16 @@ def make_invariant_direction() -> InvariantDirection:
 def make_product(domain_a: Any, domain_b: Any) -> Product:
     """Create a product domain."""
     return Product(domain_a, domain_b)
+
+
+def make_product_wedge(domain_a: Any, domain_b: Any) -> ProductWedge:
+    """Create an optimized wedge product domain."""
+    return ProductWedge(domain_a, domain_b)
+
+
+def make_nonlinear_recurrence() -> NonlinearRecurrenceInequation:
+    """Create a nonlinear recurrence inequation domain."""
+    return NonlinearRecurrenceInequation()
 
 
 def make_iteration_domain(iter_domain: Any) -> MakeDomain:

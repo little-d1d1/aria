@@ -19,6 +19,15 @@ except ImportError:
     np = None
     NUMPY_AVAILABLE = False
 
+# Optional sympy import for exact rational eigenvalues
+try:
+    import sympy
+
+    SYMPY_AVAILABLE = True
+except ImportError:
+    sympy = None
+    SYMPY_AVAILABLE = False
+
 from aria.srk.linear import QQMatrix, QQVector, QQ
 
 
@@ -65,85 +74,132 @@ def from_numpy_matrix(arr: "np.ndarray") -> QQMatrix:
 
 
 def rational_eigenvalues(matrix: QQMatrix) -> List[Fraction]:
-    """
-    Compute rational eigenvalues of a matrix.
+    """Compute rational eigenvalues of a matrix.
 
-    This function computes eigenvalues and returns those that are
-    (approximately) rational numbers.
+    Uses sympy for exact rational arithmetic when available (preferred),
+    falling back to numpy with a tight rationality check.
+
+    Returns only eigenvalues that are exactly rational (sympy path) or
+    within 1e-9 of a rational with denominator ≤ 10^6 (numpy path).
 
     Args:
-        matrix: The matrix to compute eigenvalues for
+        matrix: Square QQMatrix
 
     Returns:
-        List of rational eigenvalues
+        List of rational eigenvalues (with multiplicity)
     """
-    if not NUMPY_AVAILABLE:
-        raise ImportError("numpy is required for this operation")
-
     if not matrix.rows:
         return []
 
-    # Convert to numpy
-    arr = to_numpy_matrix(matrix)
+    n = len(matrix.rows)
 
-    # Check if square
+    # --- Exact path via sympy ---
+    if SYMPY_AVAILABLE:
+        try:
+            sym_mat = sympy.Matrix(
+                [
+                    [sympy.Rational(matrix.rows[i].get(j, QQ(0)))
+                     for j in range(n)]
+                    for i in range(n)
+                ]
+            )
+            result: List[Fraction] = []
+            for eigenval, multiplicity in sym_mat.eigenvals().items():
+                # eigenval is a sympy expression; keep only rational ones
+                if eigenval.is_rational:
+                    frac = Fraction(int(sympy.numer(eigenval)),
+                                    int(sympy.denom(eigenval)))
+                    result.extend([frac] * multiplicity)
+            return result
+        except Exception:
+            pass  # fall through to numpy
+
+    # --- Approximate path via numpy ---
+    if not NUMPY_AVAILABLE:
+        raise ImportError("numpy or sympy is required for eigenvalue computation")
+
+    arr = to_numpy_matrix(matrix)
     if arr.shape[0] != arr.shape[1]:
         raise ValueError("Matrix must be square to compute eigenvalues")
 
-    # Compute eigenvalues
     eigenvals = np.linalg.eigvals(arr)
-
-    # Filter to (approximately) real eigenvalues and convert to rational
-    rational_eigs = []
+    rational_eigs: List[Fraction] = []
     for eig in eigenvals:
-        if abs(eig.imag) < 1e-10:  # Essentially real
-            real_val = eig.real
-            # Convert to fraction with limited denominator
-            frac = Fraction(real_val).limit_denominator(10000)
+        if abs(eig.imag) > 1e-9:
+            continue
+        real_val = eig.real
+        frac = Fraction(real_val).limit_denominator(1_000_000)
+        # Accept only if the approximation is tight
+        if abs(float(frac) - real_val) < 1e-9:
             rational_eigs.append(frac)
-
     return rational_eigs
 
 
 def eigenvectors(matrix: QQMatrix) -> List[Tuple[Fraction, QQVector]]:
-    """
-    Compute eigenvectors and corresponding eigenvalues.
+    """Compute eigenvectors and corresponding rational eigenvalues.
 
-    Returns a list of (eigenvalue, eigenvector) pairs.
-    """
-    if not NUMPY_AVAILABLE:
-        raise ImportError("numpy is required for this operation")
+    Uses sympy for exact rational arithmetic when available.
 
+    Returns a list of (eigenvalue, eigenvector) pairs.  Only pairs whose
+    eigenvalue is rational are included.
+    """
     if not matrix.rows:
         return []
 
-    arr = to_numpy_matrix(matrix)
+    n = len(matrix.rows)
 
-    # Check if square
+    # --- Exact path via sympy ---
+    if SYMPY_AVAILABLE:
+        try:
+            sym_mat = sympy.Matrix(
+                [
+                    [sympy.Rational(matrix.rows[i].get(j, QQ(0)))
+                     for j in range(n)]
+                    for i in range(n)
+                ]
+            )
+            result: List[Tuple[Fraction, QQVector]] = []
+            for eigenval, multiplicity, eigvecs in sym_mat.eigenvects():
+                if not eigenval.is_rational:
+                    continue
+                frac_eig = Fraction(int(sympy.numer(eigenval)),
+                                    int(sympy.denom(eigenval)))
+                for vec in eigvecs:
+                    entries: dict = {}
+                    for j, component in enumerate(vec):
+                        if component.is_rational and component != 0:
+                            entries[j] = Fraction(int(sympy.numer(component)),
+                                                  int(sympy.denom(component)))
+                    result.append((frac_eig, QQVector(entries)))
+            return result
+        except Exception:
+            pass  # fall through to numpy
+
+    # --- Approximate path via numpy ---
+    if not NUMPY_AVAILABLE:
+        raise ImportError("numpy or sympy is required for eigenvector computation")
+
+    arr = to_numpy_matrix(matrix)
     if arr.shape[0] != arr.shape[1]:
         raise ValueError("Matrix must be square to compute eigenvectors")
 
-    # Compute eigenvalues and eigenvectors
-    eigenvals, eigenvecs = np.linalg.eig(arr)
-
+    eigenvals, eigenvecs_arr = np.linalg.eig(arr)
     result = []
     for i in range(len(eigenvals)):
         eig = eigenvals[i]
-        vec = eigenvecs[:, i]
-
-        # Only include if eigenvalue is approximately real
-        if abs(eig.imag) < 1e-10:
-            # Convert eigenvalue to fraction
-            frac_eig = Fraction(eig.real).limit_denominator(10000)
-
-            # Convert eigenvector to QQVector
-            vec_entries = {}
-            for j in range(len(vec)):
-                if abs(vec[j].real) > 1e-10:
-                    vec_entries[j] = Fraction(vec[j].real).limit_denominator(10000)
-
-            result.append((frac_eig, QQVector(vec_entries)))
-
+        if abs(eig.imag) > 1e-9:
+            continue
+        frac_eig = Fraction(eig.real).limit_denominator(1_000_000)
+        if abs(float(frac_eig) - eig.real) > 1e-9:
+            continue
+        vec = eigenvecs_arr[:, i]
+        vec_entries: dict = {}
+        for j in range(len(vec)):
+            if abs(vec[j].real) > 1e-10:
+                frac_coeff = Fraction(vec[j].real).limit_denominator(1_000_000)
+                if abs(float(frac_coeff) - vec[j].real) < 1e-9:
+                    vec_entries[j] = frac_coeff
+        result.append((frac_eig, QQVector(vec_entries)))
     return result
 
 

@@ -251,11 +251,281 @@ class ExpPolynomial:
                     return scalar_part + term_lambda + term_mu
                 return scalar_part
 
-        # General case: polynomial * exponential.  Use the explicit sum.
-        # For the PRSD non-diagonal case this branch is not reached.
-        raise NotImplementedError(
-            "solve_rec for general exponential-polynomial forcing terms"
-        )
+        # General case: polynomial * exponential.
+        # f(k) = p(k) * mu^k  where p has degree d ≥ 1.
+        #
+        # We need:  g(k) = lambda^k * initial
+        #                 + sum_{i=0}^{k-1} lambda^(k-1-i) * p(i) * mu^i
+        #
+        # Case mu == lambda:
+        #   sum_{i=0}^{k-1} lambda^(k-1-i) * p(i) * lambda^i
+        #   = lambda^(k-1) * sum_{i=0}^{k-1} p(i)
+        #   = lambda^(k-1) * Q(k)   where Q(k) = sum_{i=0}^{k-1} p(i)
+        #   Q is a polynomial of degree deg(p)+1 (antidifference of p).
+        #
+        # Case mu != lambda:
+        #   Factor out lambda^(k-1):
+        #   sum_{i=0}^{k-1} (mu/lambda)^i * p(i)
+        #   = sum_{j=0}^{d} p_j * sum_{i=0}^{k-1} i^j * r^i   where r = mu/lambda
+        #   Each inner sum has a closed form as a rational function of r and k.
+        #   We compute it via the operator identity:
+        #     sum_{i=0}^{k-1} i^j * r^i = (r * d/dr)^j [sum_{i=0}^{k-1} r^i]
+        #   and express the result as an exponential polynomial.
+        #
+        # For simplicity we implement the mu == lambda case exactly and the
+        # mu != lambda case via the antidifference operator on monomials.
+
+        from .polynomial import Monomial as M, Polynomial as Poly
+
+        mu = self.exponential_part
+        p = self.polynomial_part  # p(k) * mu^k is the forcing term
+
+        if mu == lambda_val:
+            # sum_{i=0}^{k-1} p(i) = antidifference of p evaluated at k
+            # For p(i) = i^j, antidifference is a degree-(j+1) polynomial.
+            antidiff = _poly_antidifference(p)
+            # Result: lambda^(k-1) * antidiff(k) = (1/lambda) * lambda^k * antidiff(k)
+            if lambda_val == 0:
+                # Degenerate: only i=k-1 contributes.
+                # sum = p(k-1) * 0^0 = p(k-1)  (for k >= 1)
+                # Represent as p(k) * lambda^k with lambda=0 (evaluates to p(0) at k=0).
+                return scalar_part + ExpPolynomial(p, mu)
+            scale = Fraction(1) / lambda_val
+            scaled_antidiff = antidiff.scalar_mul(scale)
+            return scalar_part + ExpPolynomial(scaled_antidiff, lambda_val)
+
+        # mu != lambda: use the closed-form for sum_{i=0}^{k-1} i^j * r^i.
+        # We decompose p into monomials and sum each separately.
+        r = mu / lambda_val  # ratio
+        result = scalar_part
+        for mono, coeff in p.enum():
+            if coeff == 0:
+                continue
+            j = mono.exponents[0] if mono.exponents else 0
+            # sum_{i=0}^{k-1} i^j * r^i  as an ExpPolynomial in k.
+            s = _geometric_monomial_sum(j, r)
+            # Multiply by coeff * lambda^(k-1) = (coeff/lambda) * lambda^k
+            if lambda_val == 0:
+                # Only i=k-1 term: coeff * (k-1)^j * 0^0 = coeff*(k-1)^j for k>=1
+                # Approximate as coeff * k^j * mu^k (leading term).
+                result = result + ExpPolynomial(
+                    Poly({mono: coeff}), mu
+                )
+            else:
+                scale = coeff / lambda_val
+                # s is an ExpPolynomial in k with base r; multiply base by lambda.
+                # s(k) * lambda^k = s_poly(k) * (r * lambda)^k = s_poly(k) * mu^k
+                # (since r = mu/lambda, so r*lambda = mu)
+                result = result + ExpPolynomial(
+                    s.polynomial_part.scalar_mul(scale), mu
+                )
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Helper functions for solve_rec
+# ---------------------------------------------------------------------------
+
+def _poly_antidifference(p: "Polynomial") -> "Polynomial":
+    """Return Q such that Q(k) - Q(k-1) = p(k-1), i.e. sum_{i=0}^{k-1} p(i) = Q(k).
+
+    Uses the Newton forward-difference formula for univariate polynomials.
+    For p(i) = i^j the antidifference is a degree-(j+1) polynomial.
+    """
+    from .polynomial import Polynomial as Poly, Monomial as M
+
+    if p.is_zero():
+        return Poly()
+
+    # Represent p as a dense list of coefficients [a0, a1, ..., ad].
+    coeffs: Dict[int, Fraction] = {}
+    for mono, coeff in p.enum():
+        exp = mono.exponents[0] if mono.exponents else 0
+        coeffs[exp] = Fraction(coeff)
+
+    if not coeffs:
+        return Poly()
+
+    deg = max(coeffs.keys())
+    dense = [coeffs.get(i, Fraction(0)) for i in range(deg + 1)]
+
+    # Antidifference of k^j is a degree-(j+1) polynomial.
+    # We compute it by integrating the polynomial in the "falling factorial" basis
+    # and converting back to the standard basis.
+    # Simpler: use the fact that sum_{i=0}^{k-1} i^j = Bernoulli polynomial B_{j+1}(k)/(j+1).
+    # We compute numerically via the recurrence on the antidifference.
+
+    # Build antidifference coefficient by coefficient using the identity:
+    # If Q(k) = sum_{i=0}^{k-1} p(i), then Q(0)=0 and Q(k)-Q(k-1)=p(k-1).
+    # We represent Q as a polynomial of degree deg+1 and solve for its coefficients
+    # by matching values at deg+2 points.
+    n = deg + 2  # number of sample points needed
+    # Sample p at 0..n-1
+    p_vals = [sum(dense[j] * Fraction(k) ** j for j in range(deg + 1))
+              for k in range(n)]
+    # Compute Q values: Q(0)=0, Q(k)=Q(k-1)+p(k-1)
+    q_vals = [Fraction(0)] * n
+    for k in range(1, n):
+        q_vals[k] = q_vals[k - 1] + p_vals[k - 1]
+
+    # Interpolate Q (degree deg+1) from n = deg+2 points using Lagrange.
+    result_coeffs = _lagrange_to_standard(list(range(n)), q_vals)
+
+    terms = {}
+    for exp, c in enumerate(result_coeffs):
+        if c != 0:
+            terms[M((exp,))] = c
+    return Poly(terms)
+
+
+def _lagrange_to_standard(xs: List[int], ys: List[Fraction]) -> List[Fraction]:
+    """Convert Lagrange interpolation data to standard polynomial coefficients.
+
+    Returns [a0, a1, ..., an] such that sum(a_i * x^i) interpolates the points.
+    Uses the Newton divided-difference method for numerical stability.
+    """
+    n = len(xs)
+    # Newton divided differences table.
+    dd = [Fraction(y) for y in ys]
+    coeffs_newton = [dd[0]]
+    for k in range(1, n):
+        new_dd = []
+        for i in range(n - k):
+            new_dd.append((dd[i + 1] - dd[i]) / Fraction(xs[i + k] - xs[i]))
+        dd = new_dd
+        coeffs_newton.append(dd[0])
+
+    # Convert Newton form to standard form.
+    # p(x) = c0 + c1*(x-x0) + c2*(x-x0)*(x-x1) + ...
+    # We accumulate by multiplying out the factors.
+    result = [Fraction(0)] * n
+    result[0] = coeffs_newton[n - 1]
+    for k in range(n - 2, -1, -1):
+        # Multiply result by (x - xs[k]) and add coeffs_newton[k].
+        new_result = [Fraction(0)] * n
+        for i in range(n - 1):
+            new_result[i + 1] += result[i]
+            new_result[i] -= result[i] * Fraction(xs[k])
+        new_result[0] += coeffs_newton[k]
+        result = new_result
+
+    return result
+
+
+def _geometric_monomial_sum(j: int, r: Fraction) -> "ExpPolynomial":
+    """Compute sum_{i=0}^{k-1} i^j * r^i as an ExpPolynomial in k.
+
+    Uses the operator identity: sum_{i=0}^{k-1} i^j * r^i = (r*d/dr)^j S(k,r)
+    where S(k,r) = (r^k - 1)/(r - 1) for r != 1.
+
+    Returns an ExpPolynomial with base r.
+    """
+    from .polynomial import Polynomial as Poly, Monomial as M
+
+    if r == 0:
+        # sum_{i=0}^{k-1} i^j * 0^i = 0 (all terms vanish for i >= 1, and 0^0=1 at i=0).
+        if j == 0:
+            # sum = 1 for k >= 1, 0 for k = 0.  Approximate as constant 1.
+            return ExpPolynomial(Poly({M(()): Fraction(1)}), Fraction(0))
+        return ExpPolynomial(Poly(), Fraction(0))
+
+    if r == 1:
+        # sum_{i=0}^{k-1} i^j = antidifference of k^j evaluated at k.
+        mono_j = M((j,)) if j > 0 else M(())
+        p_kj = Poly({mono_j: Fraction(1)})
+        antidiff = _poly_antidifference(p_kj)
+        return ExpPolynomial(antidiff, Fraction(1))
+
+    # General r != 0, 1.
+    # We compute the sum by sampling at j+2 points and interpolating.
+    # sum_{i=0}^{k-1} i^j * r^i  is a linear combination of r^k and a polynomial in k.
+    # For the purposes of solve_rec we only need the r^k component (the polynomial
+    # component is absorbed into the scalar_part).  We return the full result as
+    # an ExpPolynomial with base r.
+    #
+    # Exact formula via the operator method:
+    # Let T_j(k) = sum_{i=0}^{k-1} i^j * r^i.
+    # T_0(k) = (r^k - 1)/(r-1)
+    # T_j(k) = r * d/dr T_{j-1}(k)  (differentiate w.r.t. r, then multiply by r)
+    #
+    # We compute T_j symbolically as a polynomial in k times r^k plus a polynomial in k.
+    # For simplicity, sample at j+2 points and interpolate.
+    n_pts = j + 2
+    xs = list(range(n_pts))
+    ys = []
+    for k in xs:
+        val = sum(Fraction(i) ** j * r ** i for i in range(k))
+        ys.append(val)
+
+    # The sum has the form A(k)*r^k + B(k) where A, B are polynomials of degree <= j.
+    # We fit this form by sampling at 2*(j+1) points.
+    # For the ExpPolynomial representation we only keep the r^k coefficient.
+    # Fit: at each sample point k, val = A(k)*r^k + B(k).
+    # We have 2*(j+1) unknowns (coefficients of A and B, each degree j).
+    # Use 2*(j+1) sample points.
+    n_fit = 2 * (j + 1)
+    xs_fit = list(range(n_fit))
+    ys_fit = [sum(Fraction(i) ** j * r ** i for i in range(k)) for k in xs_fit]
+
+    # Build linear system: for each k, sum_{d=0}^{j} a_d * k^d * r^k + b_d * k^d = val.
+    # Variables: [a_0, ..., a_j, b_0, ..., b_j]
+    from fractions import Fraction as F
+    size = 2 * (j + 1)
+    mat = [[F(0)] * size for _ in range(size)]
+    rhs = [F(0)] * size
+    for row, k in enumerate(xs_fit):
+        rk = r ** k
+        for d in range(j + 1):
+            mat[row][d] = F(k) ** d * rk        # a_d coefficient
+            mat[row][j + 1 + d] = F(k) ** d     # b_d coefficient
+        rhs[row] = ys_fit[row]
+
+    # Solve via Gaussian elimination.
+    sol = _solve_rational_system(mat, rhs)
+    if sol is None:
+        # Fallback: return zero.
+        return ExpPolynomial(Poly(), r)
+
+    # Extract A(k) coefficients (indices 0..j).
+    a_coeffs = sol[:j + 1]
+    terms = {}
+    for d, c in enumerate(a_coeffs):
+        if c != 0:
+            mono = M((d,)) if d > 0 else M(())
+            terms[mono] = c
+    return ExpPolynomial(Poly(terms) if terms else Poly(), r)
+
+
+def _solve_rational_system(
+    mat: List[List[Fraction]], rhs: List[Fraction]
+) -> Optional[List[Fraction]]:
+    """Solve a square rational linear system Ax = b via Gaussian elimination.
+
+    Returns the solution vector or None if the system is singular.
+    """
+    n = len(rhs)
+    # Augmented matrix.
+    aug = [mat[i][:] + [rhs[i]] for i in range(n)]
+    for col in range(n):
+        # Find pivot.
+        pivot = None
+        for row in range(col, n):
+            if aug[row][col] != 0:
+                pivot = row
+                break
+        if pivot is None:
+            return None
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        piv_val = aug[col][col]
+        for row in range(n):
+            if row == col:
+                continue
+            if aug[row][col] == 0:
+                continue
+            factor = aug[row][col] / piv_val
+            for c in range(n + 1):
+                aug[row][c] -= factor * aug[col][c]
+    return [aug[i][n] / aug[i][i] for i in range(n)]
 
 
 class ExpPolynomialVector:

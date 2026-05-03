@@ -81,7 +81,7 @@ def linterm_of(srk_context, term) -> QQVector:
         Mul,
     )
 
-    def _linterm_of_rec(t, const_dim=0):
+    def _linterm_of_rec(t, const_dim=-1):
         """Recursive helper to convert term to linear form."""
         if isinstance(t, Const):
             # Constant term - add to constant dimension

@@ -1,64 +1,94 @@
 """
 Core linear algebra operations over rational numbers.
 
-This module provides the fundamental vector and matrix classes and basic operations
-that form the foundation for symbolic reasoning algorithms in SRK.
+Ported from OCaml srk/src/linear.ml and srk/src/ring.ml.
 
-Key Features:
-- Sparse vector representation for memory efficiency
-- Rational number arithmetic using Python's Fraction type
-- Basic matrix operations for linear transformations
-- Vector space operations (addition, scalar multiplication, etc.)
-
-Example:
-    >>> from aria.srk.linear import QQVector
-    >>> v1 = QQVector({0: Fraction(1, 2), 1: Fraction(1, 3)})
-    >>> v2 = QQVector({0: Fraction(1, 4), 2: Fraction(2, 3)})
-    >>> v3 = v1 + v2
-    >>> print(v3.entries)  # {0: Fraction(3, 4), 1: Fraction(1, 3), 2: Fraction(2, 3)}
+Key conventions (matching OCaml):
+  - const_dim = -1  (dimension reserved for the constant 1)
+  - Dimensions >= 0 correspond directly to symbol IDs
+  - QQVector.pivot does NOT scale (returns (coeff, rest) where add_term(coeff, dim, rest) == original)
+  - QQMatrix uses a sparse Dict[int, QQVector] representation internally
+  - add_row(i, vec, mat) ADDS vec to row i (not inserts)
 """
 
 from __future__ import annotations
-from typing import Dict, List, Set, Tuple, Optional, Union, Any, Iterator
+from typing import Dict, List, Set, Tuple, Optional, Union, Iterator
 from fractions import Fraction
-from dataclasses import dataclass, field
-from abc import ABC, abstractmethod
+import math
 
 # Type aliases
-QQ = Fraction  # Rational numbers
-VectorSpace = Dict[int, QQ]  # Maps dimension to coefficient
+QQ = Fraction
+ZZ = int
+
+# ---------------------------------------------------------------------------
+# Affine term conventions  (matching OCaml const_dim = -1)
+# ---------------------------------------------------------------------------
+const_dim: int = -1
 
 
-@dataclass(frozen=True)
+def sym_of_dim(dim: int):
+    """Map a dimension to a symbol.  Returns None for const_dim (-1).
+
+    Satisfies: sym_of_dim(dim_of_sym(sym)) == Some(sym)
+    Satisfies: sym_of_dim(const_dim) == None
+    """
+    if dim >= 0:
+        from .syntax import symbol_of_int
+        return symbol_of_int(dim)
+    return None
+
+
+def dim_of_sym(symbol) -> int:
+    """Map a symbol to a dimension (directly uses symbol.id).
+
+    Satisfies: sym_of_dim(dim_of_sym(sym)) == Some(sym)
+    """
+    if hasattr(symbol, "id"):
+        return int(symbol.id)
+    if hasattr(symbol, "var_id"):
+        return int(symbol.var_id)
+    if hasattr(symbol, "name") and symbol.name is not None:
+        return hash(symbol.name) % (2**30)
+    return 0
+
+
+def const_linterm(k: QQ) -> QQVector:
+    """Representation of a rational number as an affine term."""
+    return QQVector.of_term(k, const_dim)
+
+
+def const_of_linterm(v: QQVector) -> Optional[QQ]:
+    """Extract constant from affine term, or None if not constant."""
+    coeff, rest = v.pivot(const_dim)
+    if rest.is_zero():
+        return coeff
+    return None
+
+
+# ---------------------------------------------------------------------------
+# QQVector — sparse vector over rationals  (matching OCaml Ring.MakeVector(QQ))
+# ---------------------------------------------------------------------------
+
 class QQVector:
-    """Vector over rational numbers with sparse representation.
+    """Sparse vector over QQ with integer dimensions.
 
-    This class represents vectors in a vector space over the rational numbers
-    using a sparse dictionary representation. Only non-zero entries are stored,
-    making it memory-efficient for high-dimensional sparse vectors.
+    Internal representation: ``entries: Dict[int, QQ]`` mapping dimension to
+    coefficient.  Only non-zero entries are stored.
 
-    The vector is immutable (frozen) to ensure hashability and thread safety.
-    All operations return new instances rather than modifying existing ones.
-
-    Attributes:
-        entries (Dict[int, QQ]): Dictionary mapping dimension indices to rational coefficients.
-                                Only non-zero entries are stored.
-
-    Example:
-        >>> v = QQVector({0: Fraction(1, 2), 1: Fraction(1, 3), 5: Fraction(2, 1)})
-        >>> print(len(v.entries))  # 3 (only non-zero entries stored)
+    Matching OCaml semantics:
+      - ``pivot(dim)`` returns ``(coeff, rest)`` WITHOUT scaling, such that
+        ``add_term(coeff, dim, rest) == original``
+      - ``coeff(dim, vec)`` is a static method returning the coefficient
     """
 
-    entries: Dict[int, QQ]  # dimension -> coefficient
+    __slots__ = ("entries",)
 
-    def __init__(self, entries: Optional[Dict[int, QQ]] = None):
-        """Initialize a vector with the given entries.
+    def __init__(self, entries: Optional[Dict[int, QQ]] = None) -> None:
+        self.entries: Dict[int, QQ] = entries if entries is not None else {}
 
-        Args:
-            entries: Dictionary of dimension -> coefficient mappings.
-                    If None, creates an empty vector (zero vector).
-        """
-        object.__setattr__(self, "entries", entries or {})
+    # ------------------------------------------------------------------
+    # Equality / hashing
+    # ------------------------------------------------------------------
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, QQVector):
@@ -68,180 +98,226 @@ class QQVector:
     def __hash__(self) -> int:
         return hash(tuple(sorted(self.entries.items())))
 
+    # ------------------------------------------------------------------
+    # Arithmetic  (all return new QQVector; QQVector is effectively immutable)
+    # ------------------------------------------------------------------
+
     def __add__(self, other: QQVector) -> QQVector:
-        """Add two vectors component-wise.
-
-        Args:
-            other (QQVector): The vector to add to this vector.
-
-        Returns:
-            QQVector: A new vector representing the sum.
-
-        Example:
-            >>> v1 = QQVector({0: 1, 1: 2})
-            >>> v2 = QQVector({0: 3, 2: 4})
-            >>> v3 = v1 + v2  # QQVector({0: 4, 1: 2, 2: 4})
-        """
-        result = self.entries.copy()
-
+        result = dict(self.entries)
         for dim, coeff in other.entries.items():
-            result[dim] = result.get(dim, QQ(0)) + coeff
-
-        # Remove zero entries
-        zero_dims = [dim for dim, coeff in result.items() if coeff == 0]
-        for dim in zero_dims:
-            del result[dim]
-
+            new_val = result.get(dim, QQ(0)) + coeff
+            if new_val == 0:
+                result.pop(dim, None)
+            else:
+                result[dim] = new_val
         return QQVector(result)
 
     def __sub__(self, other: QQVector) -> QQVector:
-        """Subtract two vectors component-wise.
-
-        Args:
-            other (QQVector): The vector to subtract from this vector.
-
-        Returns:
-            QQVector: A new vector representing the difference.
-        """
         return self + (-other)
 
     def __neg__(self) -> QQVector:
-        """Negate all components of the vector.
-
-        Returns:
-            QQVector: A new vector with all components negated.
-        """
-        return QQVector({dim: -coeff for dim, coeff in self.entries.items()})
+        return QQVector({d: -c for d, c in self.entries.items()})
 
     def __mul__(self, scalar: QQ) -> QQVector:
-        """Multiply vector by a scalar.
-
-        Args:
-            scalar (QQ): The scalar to multiply by.
-
-        Returns:
-            QQVector: A new vector scaled by the scalar.
-        """
         if scalar == 0:
             return QQVector()
-
-        return QQVector({dim: coeff * scalar for dim, coeff in self.entries.items()})
+        return QQVector({d: c * scalar for d, c in self.entries.items()})
 
     def __rmul__(self, scalar: QQ) -> QQVector:
-        """Right multiplication by scalar (for symmetry with left multiplication)."""
         return self * scalar
 
     def dot(self, other: QQVector) -> QQ:
-        """Compute the dot product with another vector.
-
-        Args:
-            other (QQVector): The vector to compute dot product with.
-
-        Returns:
-            QQ: The dot product as a rational number.
-
-        Example:
-            >>> v1 = QQVector({0: 1, 1: 2})
-            >>> v2 = QQVector({0: 3, 1: 4})
-            >>> print(v1.dot(v2))  # 1*3 + 2*4 = 11
-        """
+        """Inner product: sum_i(self[i] * other[i])."""
         result = QQ(0)
-
-        # Get all dimensions from both vectors
-        all_dims = set(self.entries.keys()) | set(other.entries.keys())
-
-        for dim in all_dims:
-            coeff1 = self.entries.get(dim, QQ(0))
-            coeff2 = other.entries.get(dim, QQ(0))
-            result += coeff1 * coeff2
-
+        for dim, coeff in self.entries.items():
+            oc = other.entries.get(dim)
+            if oc is not None:
+                result += coeff * oc
         return result
 
-    def norm_squared(self) -> QQ:
-        """Squared Euclidean norm."""
-        return self.dot(self)
+    def scalar_mul(self, scalar: QQ) -> QQVector:
+        """Multiply by scalar (method form for OCaml compatibility)."""
+        return self * scalar
+
+    # ------------------------------------------------------------------
+    # Access
+    # ------------------------------------------------------------------
+
+    def get(self, dim: int, default: QQ = QQ(0)) -> QQ:
+        """Get coefficient at dimension *dim*."""
+        return self.entries.get(dim, default)
+
+    @staticmethod
+    def coeff(dim: int, vec: "QQVector") -> QQ:
+        """Get coefficient at *dim* (static, OCaml-compatible)."""
+        return vec.entries.get(dim, QQ(0))
+
+    def set(self, dim: int, coeff: QQ) -> QQVector:
+        """Return a new vector with *dim* set to *coeff*."""
+        new = dict(self.entries)
+        if coeff == 0:
+            new.pop(dim, None)
+        else:
+            new[dim] = coeff
+        return QQVector(new)
+
+    def add_term(self, coeff: QQ, dim: int) -> QQVector:
+        """Return a new vector with *coeff* added to position *dim*."""
+        new_val = self.entries.get(dim, QQ(0)) + coeff
+        return self.set(dim, new_val)
+
+    def is_zero(self) -> bool:
+        return len(self.entries) == 0
+
+    def dimensions(self) -> Set[int]:
+        return set(self.entries.keys())
 
     def dimension(self) -> int:
         """Number of non-zero entries."""
         return len(self.entries)
 
-    def dimensions(self) -> Set[int]:
-        """Set of dimensions with non-zero coefficients."""
-        return set(self.entries.keys())
+    # ------------------------------------------------------------------
+    # Pivot  (NO scaling — matching OCaml semantics)
+    # ------------------------------------------------------------------
 
-    def get(self, dim: int, default: QQ = QQ(0)) -> QQ:
-        """Get coefficient for dimension."""
-        return self.entries.get(dim, default)
+    def pivot(self, target_dim: int) -> Tuple[QQ, QQVector]:
+        """Extract coefficient at *target_dim* and return ``(coeff, rest)``.
 
-    def set(self, dim: int, coeff: QQ) -> QQVector:
-        """Set coefficient for dimension."""
-        new_entries = self.entries.copy()
-        if coeff == 0:
-            new_entries.pop(dim, None)
-        else:
-            new_entries[dim] = coeff
-        return QQVector(new_entries)
+        ``rest`` is ``self`` with the *target_dim* entry removed.
+        Invariant: ``add_term(coeff, target_dim, rest) == self``.
 
-    def add_term(self, coeff: QQ, dim: int) -> QQVector:
-        """Add a term to the vector."""
-        return self.set(dim, self.get(dim) + coeff)
+        Raises ``KeyError`` if *target_dim* is not present.
+        """
+        if target_dim not in self.entries:
+            raise KeyError(f"Dimension {target_dim} not in QQVector")
+        coeff = self.entries[target_dim]
+        rest = {d: c for d, c in self.entries.items() if d != target_dim}
+        return coeff, QQVector(rest)
 
-    def vector_left_mul(self, vector: QQVector) -> QQVector:
-        """Multiply this vector by another vector (component-wise)."""
-        result_entries = {}
-        for dim, coeff in self.entries.items():
-            multiplier = vector.get(dim, QQ(0))
-            if multiplier != 0:
-                result_entries[dim] = coeff * multiplier
-        return QQVector(result_entries)
+    def pop(self) -> Tuple[Tuple[int, QQ], QQVector]:
+        """Extract the entry with the smallest dimension and return the rest.
+
+        Returns ``((dim, coeff), rest)``.
+        """
+        if not self.entries:
+            raise ValueError("Cannot pop from zero vector")
+        min_dim = min(self.entries.keys())
+        coeff = self.entries[min_dim]
+        rest = {d: c for d, c in self.entries.items() if d != min_dim}
+        return (min_dim, coeff), QQVector(rest)
+
+    # ------------------------------------------------------------------
+    # Enumeration / fold / map / merge
+    # ------------------------------------------------------------------
+
+    def enum(self) -> List[Tuple[QQ, int]]:
+        """Enumerate non-zero entries as ``(coefficient, dimension)`` pairs."""
+        return [(c, d) for d, c in self.entries.items()]
+
+    @staticmethod
+    def of_enum(pairs) -> QQVector:
+        """Build a vector from an iterable of ``(coefficient, dimension)`` pairs."""
+        result: Dict[int, QQ] = {}
+        for coeff, dim in pairs:
+            if coeff != 0:
+                new_val = result.get(dim, QQ(0)) + coeff
+                if new_val == 0:
+                    result.pop(dim, None)
+                else:
+                    result[dim] = new_val
+        return QQVector(result)
+
+    @staticmethod
+    def of_list(pairs) -> QQVector:
+        return QQVector.of_enum(pairs)
 
     @staticmethod
     def of_term(coeff: QQ, dim: int) -> QQVector:
-        """Create a vector with a single term."""
+        """All-zero vector except *coeff* at *dim*."""
+        if coeff == 0:
+            return QQVector()
         return QQVector({dim: coeff})
 
     @staticmethod
     def zero() -> QQVector:
-        """Create a zero vector."""
         return QQVector()
 
-    def pivot(self, target_dim: int) -> Tuple[QQ, QQVector]:
-        """Get pivot element and eliminate target dimension.
+    def map(self, f) -> QQVector:
+        """Apply ``f(dim, coeff) -> coeff`` to each entry."""
+        result: Dict[int, QQ] = {}
+        for d, c in self.entries.items():
+            new_c = f(d, c)
+            if new_c != 0:
+                result[d] = new_c
+        return QQVector(result)
 
-        Returns (pivot_coefficient, vector_with_target_eliminated).
-        """
-        if target_dim not in self.entries:
-            raise ValueError(f"Target dimension {target_dim} not in vector")
+    def merge(self, f, other: QQVector) -> QQVector:
+        """Merge two vectors using ``f(dim, coeff1, coeff2) -> coeff``."""
+        all_dims = set(self.entries.keys()) | set(other.entries.keys())
+        result: Dict[int, QQ] = {}
+        for d in all_dims:
+            c1 = self.entries.get(d, QQ(0))
+            c2 = other.entries.get(d, QQ(0))
+            new_c = f(d, c1, c2)
+            if new_c != 0:
+                result[d] = new_c
+        return QQVector(result)
 
-        pivot_coeff = self.entries[target_dim]
+    def fold(self, f, init):
+        """Fold over entries: ``f(dim, coeff, acc) -> acc``."""
+        acc = init
+        for d, c in self.entries.items():
+            acc = f(d, c, acc)
+        return acc
 
-        if pivot_coeff == 0:
-            raise ValueError("Cannot pivot on zero coefficient")
+    # ------------------------------------------------------------------
+    # Interlace / deinterlace  (for pushout)
+    # ------------------------------------------------------------------
 
-        # Create new vector without the target dimension
-        new_entries = self.entries.copy()
-        del new_entries[target_dim]
+    @staticmethod
+    def interlace(u: QQVector, v: QQVector) -> QQVector:
+        """Interlace: u's entries at even positions, v's at odd."""
+        result: Dict[int, QQ] = {}
+        for coeff, dim in u.enum():
+            result[2 * dim] = coeff
+        for coeff, dim in v.enum():
+            result[2 * dim + 1] = coeff
+        return QQVector(result)
 
-        # Scale so that target coefficient becomes 1
-        scale_factor = QQ(1) / pivot_coeff
-        scaled_entries = {
-            dim: coeff * scale_factor for dim, coeff in new_entries.items()
-        }
+    def deinterlace(self) -> Tuple[QQVector, QQVector]:
+        """Split into even-indexed and odd-indexed parts."""
+        v: Dict[int, QQ] = {}
+        w: Dict[int, QQ] = {}
+        for coeff, dim in self.enum():
+            if dim % 2 == 0:
+                v[dim // 2] = coeff
+            else:
+                w[dim // 2] = coeff
+        return QQVector(v), QQVector(w)
 
-        return pivot_coeff, QQVector(scaled_entries)
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
 
-    def is_zero(self) -> bool:
-        """Check if vector is zero."""
-        return len(self.entries) == 0
+    @staticmethod
+    def compare(a: QQVector, b: QQVector) -> int:
+        """Lexicographic comparison by (dim, coeff)."""
+        for d in sorted(set(a.entries.keys()) | set(b.entries.keys())):
+            ca = a.entries.get(d, QQ(0))
+            cb = b.entries.get(d, QQ(0))
+            if ca < cb:
+                return -1
+            if ca > cb:
+                return 1
+        return 0
 
-    def enum(self) -> List[Tuple[QQ, int]]:
-        """Enumerate non-zero entries as (coefficient, dimension) pairs."""
-        return [(coeff, dim) for dim, coeff in self.entries.items()]
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
 
     def __str__(self) -> str:
         if not self.entries:
             return "0"
-
         terms = []
         for dim in sorted(self.entries.keys()):
             coeff = self.entries[dim]
@@ -251,644 +327,1064 @@ class QQVector:
                 terms.append(f"-e{dim}")
             else:
                 terms.append(f"{coeff}*e{dim}")
-
         return " + ".join(terms)
 
     def __repr__(self) -> str:
         return f"QQVector({dict(self.entries)})"
 
 
-@dataclass(frozen=True)
+# ---------------------------------------------------------------------------
+# ZZVector — integer-coefficient sparse vector
+# ---------------------------------------------------------------------------
+
+class ZZVector:
+    """Sparse vector over the integers (matching OCaml ZZVector)."""
+
+    __slots__ = ("entries",)
+
+    def __init__(self, entries: Optional[Dict[int, int]] = None) -> None:
+        self.entries: Dict[int, int] = {}
+        if entries:
+            for dim, coeff in entries.items():
+                if coeff != 0:
+                    self.entries[dim] = int(coeff)
+
+    def __add__(self, other: ZZVector) -> ZZVector:
+        result: Dict[int, int] = dict(self.entries)
+        for dim, coeff in other.entries.items():
+            new_val = result.get(dim, 0) + coeff
+            if new_val == 0:
+                result.pop(dim, None)
+            else:
+                result[dim] = new_val
+        return ZZVector(result)
+
+    def __sub__(self, other: ZZVector) -> ZZVector:
+        return self + (-other)
+
+    def __neg__(self) -> ZZVector:
+        return ZZVector({d: -c for d, c in self.entries.items()})
+
+    def __mul__(self, scalar: int) -> ZZVector:
+        if scalar == 0:
+            return ZZVector()
+        return ZZVector({d: c * scalar for d, c in self.entries.items()})
+
+    def __rmul__(self, scalar: int) -> ZZVector:
+        return self * scalar
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ZZVector):
+            return False
+        return self.entries == other.entries
+
+    def __hash__(self) -> int:
+        return hash(tuple(sorted(self.entries.items())))
+
+    def get(self, dim: int, default: int = 0) -> int:
+        return self.entries.get(dim, default)
+
+    @staticmethod
+    def coeff(dim: int, vec: ZZVector) -> int:
+        return vec.entries.get(dim, 0)
+
+    def set(self, dim: int, coeff: int) -> ZZVector:
+        new = dict(self.entries)
+        if coeff == 0:
+            new.pop(dim, None)
+        else:
+            new[dim] = int(coeff)
+        return ZZVector(new)
+
+    def add_term(self, coeff: int, dim: int) -> ZZVector:
+        return self.set(dim, self.get(dim) + coeff)
+
+    def is_zero(self) -> bool:
+        return len(self.entries) == 0
+
+    def dimensions(self) -> Set[int]:
+        return set(self.entries.keys())
+
+    def enum(self) -> List[Tuple[int, int]]:
+        return [(c, d) for d, c in self.entries.items()]
+
+    def pivot(self, target_dim: int) -> Tuple[int, ZZVector]:
+        """Extract coefficient (NO scaling)."""
+        if target_dim not in self.entries:
+            raise KeyError(f"Dimension {target_dim} not in ZZVector")
+        a = self.entries[target_dim]
+        rest = {d: c for d, c in self.entries.items() if d != target_dim}
+        return a, ZZVector(rest)
+
+    def dot(self, other: ZZVector) -> int:
+        result = 0
+        for dim, coeff in self.entries.items():
+            oc = other.entries.get(dim)
+            if oc is not None:
+                result += coeff * oc
+        return result
+
+    def gcd_normalize(self) -> Tuple[int, ZZVector]:
+        if not self.entries:
+            return (0, ZZVector())
+        g = 0
+        for coeff in self.entries.values():
+            g = math.gcd(g, abs(coeff))
+        if g == 0:
+            return (0, ZZVector())
+        return (g, ZZVector({d: c // g for d, c in self.entries.items()}))
+
+    def to_qq(self) -> QQVector:
+        return QQVector({d: Fraction(c) for d, c in self.entries.items()})
+
+    @staticmethod
+    def of_qq(v: QQVector) -> ZZVector:
+        result: Dict[int, int] = {}
+        for dim, coeff in v.entries.items():
+            if coeff.denominator != 1:
+                raise ValueError(f"Cannot convert {coeff} to ZZVector")
+            if coeff.numerator != 0:
+                result[dim] = coeff.numerator
+        return ZZVector(result)
+
+    @staticmethod
+    def zero() -> ZZVector:
+        return ZZVector()
+
+    @staticmethod
+    def of_term(coeff: int, dim: int) -> ZZVector:
+        return ZZVector({dim: coeff})
+
+    def __str__(self) -> str:
+        if not self.entries:
+            return "0"
+        terms = []
+        for dim in sorted(self.entries.keys()):
+            coeff = self.entries[dim]
+            if coeff == 1:
+                terms.append(f"e{dim}")
+            elif coeff == -1:
+                terms.append(f"-e{dim}")
+            else:
+                terms.append(f"{coeff}*e{dim}")
+        return " + ".join(terms)
+
+    def __repr__(self) -> str:
+        return f"ZZVector({dict(self.entries)})"
+
+
+# ---------------------------------------------------------------------------
+# QQMatrix — sparse matrix over rationals  (matching OCaml Ring.MakeMatrix(QQ))
+# ---------------------------------------------------------------------------
+
 class QQMatrix:
-    """Matrix over rational numbers."""
+    """Sparse matrix over QQ.
 
-    rows: Tuple[QQVector, ...]  # Each row is a vector
+    Internal representation: ``_rows: Dict[int, QQVector]`` mapping row index
+    to row vector (only non-zero rows are stored).
 
-    def __init__(self, rows: Optional[List[QQVector]] = None):
+    Matching OCaml semantics:
+      - ``add_row(i, vec, mat)`` ADDS *vec* to row *i* (not inserts)
+      - ``add_entry(i, j, k, mat)`` ADDS *k* to entry (i, j)
+      - All operations are sparse-aware
+    """
+
+    __slots__ = ("_rows",)
+
+    def __init__(self, rows=None) -> None:
         if rows is None:
-            rows = []
-        object.__setattr__(self, "rows", tuple(rows))
+            self._rows: Dict[int, QQVector] = {}
+        elif isinstance(rows, dict):
+            self._rows = {i: v for i, v in rows.items() if not v.is_zero()}
+        elif isinstance(rows, (list, tuple)):
+            self._rows = {i: v for i, v in enumerate(rows) if not v.is_zero()}
+        else:
+            self._rows = {}
+
+    # ------------------------------------------------------------------
+    # Backward-compatible ``rows`` property
+    # ------------------------------------------------------------------
+
+    @property
+    def rows(self) -> Tuple[QQVector, ...]:
+        """Padded tuple of rows for backward compatibility."""
+        if not self._rows:
+            return ()
+        max_idx = max(self._rows.keys())
+        return tuple(self._rows.get(i, QQVector()) for i in range(max_idx + 1))
+
+    # ------------------------------------------------------------------
+    # Equality / hashing
+    # ------------------------------------------------------------------
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, QQMatrix):
             return False
-        return self.rows == other.rows
-
-    def __hash__(self) -> int:
-        return hash(self.rows)
-
-    def __add__(self, other: QQMatrix) -> QQMatrix:
-        """Add two matrices."""
-        if len(self.rows) != len(other.rows):
-            raise ValueError("Matrices must have same number of rows")
-
-        if not self.rows:
-            return QQMatrix()
-
-        # Check that all rows have same dimensions
-        self_dims = len(self.rows[0].entries)
-        other_dims = len(other.rows[0].entries)
-
-        if self_dims != other_dims:
-            raise ValueError("Matrices must have same dimensions")
-
-        new_rows = []
-        for row1, row2 in zip(self.rows, other.rows):
-            new_rows.append(row1 + row2)
-
-        return QQMatrix(new_rows)
-
-    def __mul__(
-        self, other: Union[QQMatrix, QQVector, QQ]
-    ) -> Union[QQMatrix, QQVector]:
-        """Matrix multiplication."""
-        if isinstance(other, QQMatrix):
-            return self._matrix_multiply(other)
-        elif isinstance(other, QQVector):
-            return self._matrix_vector_multiply(other)
-        elif isinstance(other, (int, Fraction)):
-            # Scalar multiplication
-            new_rows = [row * other for row in self.rows]
-            return QQMatrix(new_rows)
-        else:
-            raise TypeError(f"Cannot multiply QQMatrix by {type(other)}")
-
-    def _matrix_multiply(self, other: QQMatrix) -> QQMatrix:
-        """Matrix-matrix multiplication."""
-        if not self.rows or not other.rows:
-            return QQMatrix()
-
-        # Get dimensions
-        m = len(self.rows)  # number of rows in self
-        p = len(other.rows)  # number of columns in self / rows in other
-
-        # For sparse matrices, we need to determine the actual dimensions
-        # Find the maximum dimension used in self (columns)
-        self_max_dim = -1
-        for row in self.rows:
-            if row.entries:
-                self_max_dim = max(self_max_dim, max(row.entries.keys()))
-
-        # Find the maximum dimension used in other (both rows and columns)
-        other_max_dim = -1
-        for row in other.rows:
-            if row.entries:
-                other_max_dim = max(other_max_dim, max(row.entries.keys()))
-
-        # For matrix multiplication: self (m x p) * other (p x n)
-        # The maximum dimension in self should be less than p (for 0-based indexing)
-        if self_max_dim >= p:
-            raise ValueError("Incompatible matrix dimensions for multiplication")
-
-        # The maximum dimension in other rows should be less than p
-        n = other_max_dim + 1 if other_max_dim >= 0 else 0
-
-        # Create result matrix
-        result_rows = []
-
-        for i in range(m):
-            result_row = QQVector()
-            for j in range(n):
-                # Compute dot product of row i of self with column j of other
-                dot_product = QQ(0)
-                for k in range(p):
-                    self_coeff = self.rows[i].get(k, QQ(0))
-                    other_coeff = other.rows[k].get(j, QQ(0))
-                    dot_product += self_coeff * other_coeff
-                if dot_product != 0:
-                    result_row = result_row.set(j, dot_product)
-            result_rows.append(result_row)
-
-        return QQMatrix(result_rows)
-
-    def _matrix_vector_multiply(self, vector: QQVector) -> QQVector:
-        """Matrix-vector multiplication."""
-        if not self.rows:
-            return QQVector()
-
-        result = QQVector()
-
-        for row in self.rows:
-            # Each row gives a component of the result
-            component = QQ(0)
-            for dim, coeff in row.entries.items():
-                component += coeff * vector.get(dim, QQ(0))
-            if component != 0:
-                # This is a simplified approach - in reality we'd need to track which
-                # component this corresponds to. For now, we'll sum everything.
-                result = result.set(0, result.get(0) + component)
-
-        return result
-
-    def transpose(self) -> QQMatrix:
-        """Transpose the matrix."""
-        if not self.rows:
-            return QQMatrix()
-
-        # Get all dimensions
-        all_dims = set()
-        for row in self.rows:
-            all_dims.update(row.entries.keys())
-
-        if not all_dims:
-            return QQMatrix()
-
-        max_dim = max(all_dims)
-
-        # Create transpose rows
-        transpose_rows = []
-        for dim in range(max_dim + 1):
-            new_row = QQVector()
-            for i, row in enumerate(self.rows):
-                coeff = row.get(dim, QQ(0))
-                if coeff != 0:
-                    new_row = new_row.set(i, coeff)
-            transpose_rows.append(new_row)
-
-        return QQMatrix(transpose_rows)
-
-    def rank(self) -> int:
-        """Compute the rank of the matrix using Gaussian elimination."""
-        if not self.rows:
-            return 0
-
-        # Convert to mutable list for row operations
-        rows_list = [QQVector(row.entries.copy()) for row in self.rows]
-
-        # Get dimensions
-        m = len(rows_list)
-        if m == 0:
-            return 0
-
-        # Find all column indices
-        all_cols = set()
-        for row in rows_list:
-            all_cols.update(row.dimensions())
-        if not all_cols:
-            return 0
-
-        n = max(all_cols) + 1
-
-        rank = 0
-        for col in range(n):
-            # Find pivot in current column
-            pivot_row = None
-            for row_idx in range(rank, m):
-                if rows_list[row_idx].get(col, QQ(0)) != 0:
-                    pivot_row = row_idx
-                    break
-
-            if pivot_row is None:
-                continue  # No pivot in this column
-
-            # Swap rows to bring pivot to current position
-            if pivot_row != rank:
-                rows_list[rank], rows_list[pivot_row] = (
-                    rows_list[pivot_row],
-                    rows_list[rank],
-                )
-
-            # Eliminate below
-            pivot_coeff = rows_list[rank].get(col)
-            if pivot_coeff == 0:
-                continue
-
-            for row_idx in range(rank + 1, m):
-                factor = rows_list[row_idx].get(col, QQ(0)) / pivot_coeff
-                if factor != 0:
-                    rows_list[row_idx] = rows_list[row_idx] - (
-                        rows_list[row_idx] * factor
-                    )
-
-            rank += 1
-
-        return rank
-
-    def copy(self) -> QQMatrix:
-        """Create a copy of the matrix."""
-        return QQMatrix([QQVector(row.entries.copy()) for row in self.rows])
-
-    def __str__(self) -> str:
-        if not self.rows:
-            return "[]"
-
-        return "\n".join(str(row) for row in self.rows)
-
-    def __repr__(self) -> str:
-        return f"QQMatrix([{', '.join(repr(row) for row in self.rows)}])"
-
-    def row_set(self) -> Set[int]:
-        """Get the set of row indices that are non-zero."""
-        result = set()
-        for i, row in enumerate(self.rows):
-            if not row.is_zero():
-                result.add(i)
-        return result
-
-    @staticmethod
-    def row_set(matrix: QQMatrix) -> Set[int]:
-        """Get the set of row indices that are non-zero."""
-        result = set()
-        for i, row in enumerate(matrix.rows):
-            if not row.is_zero():
-                result.add(i)
-        return result
-
-    def nb_rows(self) -> int:
-        """Get the number of rows in the matrix."""
-        return len(self.rows)
-
-    @staticmethod
-    def nb_rows(matrix: QQMatrix) -> int:
-        """Get the number of rows in the matrix."""
-        return len(matrix.rows)
-
-    @staticmethod
-    def rowsi(matrix: QQMatrix) -> List[Tuple[int, QQVector]]:
-        """Get list of (index, row) pairs for non-zero rows."""
-        return [(i, row) for i, row in enumerate(matrix.rows) if not row.is_zero()]
-
-    @staticmethod
-    def interlace_columns(m1: QQMatrix, m2: QQMatrix) -> QQMatrix:
-        """Interlace columns of two matrices."""
-        # Get all dimensions from both matrices
-        all_dims = set()
-        for row in m1.rows:
-            all_dims.update(row.dimensions())
-        for row in m2.rows:
-            all_dims.update(row.dimensions())
-
-        if not all_dims:
-            return QQMatrix([])
-
-        max_dim = max(all_dims) + 1
-        interlaced_rows = []
-
-        for i in range(len(m1.rows)):
-            row1 = m1.rows[i] if i < len(m1.rows) else QQVector()
-            row2 = m2.rows[i] if i < len(m2.rows) else QQVector()
-
-            interlaced_entries = {}
-            # Add entries from row1 at even positions
-            for dim, coeff in row1.entries.items():
-                interlaced_entries[2 * dim] = coeff
-            # Add entries from row2 at odd positions
-            for dim, coeff in row2.entries.items():
-                interlaced_entries[2 * dim + 1] = coeff
-
-            interlaced_rows.append(QQVector(interlaced_entries))
-
-        return QQMatrix(interlaced_rows)
-
-    @staticmethod
-    def scalar_mul(scalar: QQ, matrix: QQMatrix) -> QQMatrix:
-        """Multiply matrix by a scalar."""
-        new_rows = [row * scalar for row in matrix.rows]
-        return QQMatrix(new_rows)
-
-    def add_row(self, index: int, vector: QQVector) -> QQMatrix:
-        """Add a row to the matrix at the specified index."""
-        new_rows = list(self.rows)
-        new_rows.insert(index, vector)
-        return QQMatrix(new_rows)
-
-    @staticmethod
-    def add_row(index: int, vector: QQVector, matrix: QQMatrix) -> QQMatrix:
-        """Add a row to the matrix at the specified index."""
-        new_rows = list(matrix.rows)
-        new_rows.insert(index, vector)
-        return QQMatrix(new_rows)
-
-    def row(self, index: int) -> QQVector:
-        """Get a row from the matrix."""
-        if index < 0 or index >= len(self.rows):
-            return QQVector()
-        return self.rows[index]
-
-    @staticmethod
-    def row(index: int, matrix: QQMatrix) -> QQVector:
-        """Get a row from the matrix."""
-        if index < 0 or index >= len(matrix.rows):
-            return QQVector()
-        return matrix.rows[index]
-
-    @staticmethod
-    def zero() -> QQMatrix:
-        """Create a zero matrix."""
-        return QQMatrix([])
-
-    @staticmethod
-    def identity(dimensions: List[int]) -> QQMatrix:
-        """Create an identity matrix for the given dimensions."""
-        rows = []
-        for dim in dimensions:
-            row_entries = {dim: QQ(1)}
-            rows.append(QQVector(row_entries))
-        return QQMatrix(rows)
+        return self._rows == other._rows
 
     @staticmethod
     def equal(m1: QQMatrix, m2: QQMatrix) -> bool:
-        """Check if two matrices are equal."""
-        if len(m1.rows) != len(m2.rows):
-            return False
-        for row1, row2 in zip(m1.rows, m2.rows):
-            if row1.entries != row2.entries:
-                return False
-        return True
+        return m1._rows == m2._rows
+
+    def __hash__(self) -> int:
+        items = tuple(sorted((i, hash(v)) for i, v in self._rows.items()))
+        return hash(items)
+
+    # ------------------------------------------------------------------
+    # Arithmetic
+    # ------------------------------------------------------------------
+
+    def __add__(self, other: QQMatrix) -> QQMatrix:
+        new = dict(self._rows)
+        for i, row in other._rows.items():
+            if i in new:
+                s = new[i] + row
+                if s.is_zero():
+                    del new[i]
+                else:
+                    new[i] = s
+            else:
+                new[i] = row
+        return QQMatrix(new)
+
+    @staticmethod
+    def add(m1: QQMatrix, m2: QQMatrix) -> QQMatrix:
+        return m1 + m2
+
+    def __neg__(self) -> QQMatrix:
+        return QQMatrix({i: -v for i, v in self._rows.items()})
+
+    def __sub__(self, other: QQMatrix) -> QQMatrix:
+        return self + (-other)
+
+    def __mul__(self, other):
+        if isinstance(other, QQMatrix):
+            return self._mat_mul(other)
+        elif isinstance(other, QQVector):
+            return self._mat_vec_mul(other)
+        elif isinstance(other, (int, Fraction)):
+            if other == 0:
+                return QQMatrix()
+            if other == 1:
+                return self
+            return QQMatrix({i: v * other for i, v in self._rows.items()})
+        return NotImplemented
+
+    @staticmethod
+    def scalar_mul(scalar: QQ, mat: QQMatrix) -> QQMatrix:
+        if scalar == 0:
+            return QQMatrix()
+        if scalar == 1:
+            return mat
+        return QQMatrix({i: v * scalar for i, v in mat._rows.items()})
+
+    # ------------------------------------------------------------------
+    # Matrix multiplication  (matching OCaml Ring.MakeMatrix(QQ).mul)
+    # ------------------------------------------------------------------
+
+    def _mat_mul(self, other: QQMatrix) -> QQMatrix:
+        """self * other  (row-col via transpose trick)."""
+        other_T = other.transpose()
+        result: Dict[int, QQVector] = {}
+        for i, row_i in self._rows.items():
+            entries: Dict[int, QQ] = {}
+            for j, col_j in other_T._rows.items():
+                d = row_i.dot(col_j)
+                if d != 0:
+                    entries[j] = d
+            if entries:
+                result[i] = QQVector(entries)
+        return QQMatrix(result)
+
+    def _mat_vec_mul(self, vector: QQVector) -> QQVector:
+        """self * vector.  result[i] = dot(row_i, vector)."""
+        entries: Dict[int, QQ] = {}
+        for i, row_i in self._rows.items():
+            d = row_i.dot(vector)
+            if d != 0:
+                entries[i] = d
+        return QQVector(entries)
+
+    def vector_right_mul(self, vector: QQVector) -> QQVector:
+        """m * v  (OCaml-compatible name)."""
+        return self._mat_vec_mul(vector)
+
+    def vector_left_mul(self, vector: QQVector) -> QQVector:
+        """v^T * m.  result[j] = sum_i(vector[i] * m[i][j])."""
+        result = QQVector()
+        for i, scalar in vector.entries.items():
+            row_i = self._rows.get(i)
+            if row_i is not None:
+                result = result + row_i.scalar_mul(scalar)
+        return result
+
+    # ------------------------------------------------------------------
+    # Transpose  (sparse — matching OCaml)
+    # ------------------------------------------------------------------
 
     def transpose(self) -> QQMatrix:
-        """Transpose the matrix."""
-        if not self.rows:
-            return QQMatrix([])
+        result: Dict[int, QQVector] = {}
+        for i, row_i in self._rows.items():
+            for j, coeff in row_i.entries.items():
+                if j in result:
+                    result[j] = result[j].add_term(coeff, i)
+                else:
+                    result[j] = QQVector({i: coeff})
+        return QQMatrix(result)
 
-        # Get all dimensions
-        all_dims = set()
-        for row in self.rows:
-            all_dims.update(row.entries.keys())
+    # ------------------------------------------------------------------
+    # Matrix exponentiation  (matching OCaml QQMatrix.exp)
+    # ------------------------------------------------------------------
 
-        if not all_dims:
-            return QQMatrix([])
+    def exp(self, p: int) -> QQMatrix:
+        """M^p for p >= 0."""
+        dims = sorted(set(self.row_set()) | self.column_set())
+        one = QQMatrix.identity(dims)
+        result = one
+        base = self
+        while p > 0:
+            if p % 2 == 1:
+                result = result * base
+            base = base * base
+            p //= 2
+        return result
 
-        max_dim = max(all_dims) + 1
+    @staticmethod
+    def _exp(mat: QQMatrix, p: int) -> QQMatrix:
+        return mat.exp(p)
 
-        # Create transpose rows
-        transpose_rows = []
-        for dim in range(max_dim):
-            new_row = QQVector()
-            for i, row in enumerate(self.rows):
-                coeff = row.get(dim, QQ(0))
-                if coeff != 0:
-                    new_row = new_row.set(i, coeff)
-            transpose_rows.append(new_row)
+    # ------------------------------------------------------------------
+    # Row / column access
+    # ------------------------------------------------------------------
 
-        return QQMatrix(transpose_rows)
+    def row(self, dim_or_index, _matrix=None) -> QQVector:
+        """Get row at index.  Supports both ``mat.row(i)`` and ``QQMatrix.row(i, mat)``."""
+        if _matrix is not None:
+            return _matrix._rows.get(dim_or_index, QQVector())
+        return self._rows.get(dim_or_index, QQVector())
+
+    def column(self, j: int) -> QQVector:
+        """Column *j* as a vector."""
+        entries: Dict[int, QQ] = {}
+        for i, row_i in self._rows.items():
+            c = row_i.entries.get(j)
+            if c is not None:
+                entries[i] = c
+        return QQVector(entries)
+
+    def entry(self, i: int, j: int) -> QQ:
+        """Entry at (i, j)."""
+        r = self._rows.get(i)
+        if r is None:
+            return QQ(0)
+        return r.entries.get(j, QQ(0))
+
+    def rowsi(self, _matrix=None) -> List[Tuple[int, QQVector]]:
+        """Non-zero rows as ``(index, vector)`` pairs.  Supports static call."""
+        target = _matrix if _matrix is not None else self
+        return sorted(target._rows.items())
+
+    def min_row(self) -> Tuple[int, QQVector]:
+        """Row with the smallest index."""
+        if not self._rows:
+            raise ValueError("Empty matrix")
+        min_i = min(self._rows.keys())
+        return min_i, self._rows[min_i]
+
+    def row_set(self, _matrix=None) -> Set[int]:
+        """Set of row indices with non-zero entries.  Supports static call."""
+        target = _matrix if _matrix is not None else self
+        return set(target._rows.keys())
+
+    def column_set(self) -> Set[int]:
+        cols: Set[int] = set()
+        for row in self._rows.values():
+            cols.update(row.entries.keys())
+        return cols
+
+    def nb_rows(self, _matrix=None) -> int:
+        """Number of non-zero rows.  Supports static call."""
+        target = _matrix if _matrix is not None else self
+        return len(target._rows)
+
+    def nb_columns(self) -> int:
+        return len(self.column_set())
+
+    def entries(self):
+        """All non-zero entries as ``(i, j, coeff)`` triples."""
+        for i, row_i in self._rows.items():
+            for j, coeff in row_i.entries.items():
+                yield (i, j, coeff)
+
+    # ------------------------------------------------------------------
+    # Row / column manipulation
+    # ------------------------------------------------------------------
+
+    def add_row(self, dim_or_index, vector=None, _matrix=None) -> QQMatrix:
+        """ADD *vector* to row (OCaml semantics: add, not insert).
+
+        Supports both calling conventions:
+        - ``mat.add_row(dim, vector)``           (instance method)
+        - ``QQMatrix.add_row(dim, vector, mat)`` (static-style)
+        """
+        if vector is not None and _matrix is not None:
+            # Static-style: QQMatrix.add_row(dim, vector, mat)
+            dim = dim_or_index
+            mat = _matrix
+            existing = mat._rows.get(dim, QQVector())
+            new_row = existing + vector
+            new_rows = dict(mat._rows)
+            if new_row.is_zero():
+                new_rows.pop(dim, None)
+            else:
+                new_rows[dim] = new_row
+            return QQMatrix(new_rows)
+        elif vector is not None:
+            # Instance-style: mat.add_row(dim, vector)
+            dim = dim_or_index
+            existing = self._rows.get(dim, QQVector())
+            new_row = existing + vector
+            new_rows = dict(self._rows)
+            if new_row.is_zero():
+                new_rows.pop(dim, None)
+            else:
+                new_rows[dim] = new_row
+            return QQMatrix(new_rows)
+        else:
+            raise TypeError("add_row requires at least 2 arguments")
+
+    def add_column(self, j: int, vec: QQVector) -> QQMatrix:
+        """ADD *vec* as column *j*."""
+        new_rows = dict(self._rows)
+        for i, coeff in vec.entries.items():
+            existing = new_rows.get(i, QQVector())
+            new_rows[i] = existing.add_term(coeff, j)
+        return QQMatrix(new_rows)
+
+    def add_entry(self, i: int, j: int, k: QQ) -> QQMatrix:
+        """ADD *k* to entry (i, j)."""
+        if k == 0:
+            return self
+        existing = self._rows.get(i, QQVector())
+        return self.add_row(i, QQVector({j: k}))
+
+    def pivot(self, dim: int) -> Tuple[QQVector, QQMatrix]:
+        """Extract row *dim* and remove it."""
+        row = self._rows.get(dim, QQVector())
+        new_rows = {i: v for i, v in self._rows.items() if i != dim}
+        return row, QQMatrix(new_rows)
+
+    def pivot_column(self, j: int) -> Tuple[QQVector, QQMatrix]:
+        """Extract column *j* and remove it."""
+        column_entries: Dict[int, QQ] = {}
+        new_rows: Dict[int, QQVector] = {}
+        for i, row_i in self._rows.items():
+            coeff = row_i.entries.get(j)
+            if coeff is not None:
+                column_entries[i] = coeff
+            rest = {d: c for d, c in row_i.entries.items() if d != j}
+            if rest:
+                new_rows[i] = QQVector(rest)
+        return QQVector(column_entries), QQMatrix(new_rows)
+
+    def map_rows(self, f) -> QQMatrix:
+        """Apply *f(row) -> new_row* to each non-zero row."""
+        new_rows: Dict[int, QQVector] = {}
+        for i, row_i in self._rows.items():
+            new_row = f(row_i)
+            if not new_row.is_zero():
+                new_rows[i] = new_row
+        return QQMatrix(new_rows)
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def zero() -> QQMatrix:
+        return QQMatrix()
+
+    @staticmethod
+    def identity(dimensions: List[int]) -> QQMatrix:
+        """Identity restricted to *dimensions*."""
+        rows: Dict[int, QQVector] = {}
+        for d in dimensions:
+            rows[d] = QQVector({d: QQ(1)})
+        return QQMatrix(rows)
+
+    @staticmethod
+    def of_rows(vecs: List[QQVector]) -> QQMatrix:
+        """Matrix whose row *i* is *vecs[i]*."""
+        rows: Dict[int, QQVector] = {}
+        for i, v in enumerate(vecs):
+            if not v.is_zero():
+                rows[i] = v
+        return QQMatrix(rows)
+
+    @staticmethod
+    def of_dense(dense) -> QQMatrix:
+        """From a 2D list/array."""
+        rows: Dict[int, QQVector] = {}
+        for i, dense_row in enumerate(dense):
+            entries: Dict[int, QQ] = {}
+            for j, val in enumerate(dense_row):
+                v = QQ(val) if not isinstance(val, QQ) else val
+                if v != 0:
+                    entries[j] = v
+            if entries:
+                rows[i] = QQVector(entries)
+        return QQMatrix(rows)
+
+    def dense_of(self, num_rows: int, num_cols: int):
+        """To a dense 2D list."""
+        result = [[QQ(0)] * num_cols for _ in range(num_rows)]
+        for i, row_i in self._rows.items():
+            if i < num_rows:
+                for j, coeff in row_i.entries.items():
+                    if j < num_cols:
+                        result[i][j] = coeff
+        return result
+
+    # ------------------------------------------------------------------
+    # Interlace columns  (for pushout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def interlace_columns(m: QQMatrix, n: QQMatrix) -> QQMatrix:
+        """Interlace columns: even cols from *m*, odd cols from *n*."""
+        all_rows = set(m._rows.keys()) | set(n._rows.keys())
+        result: Dict[int, QQVector] = {}
+        for i in all_rows:
+            row_m = m._rows.get(i, QQVector())
+            row_n = n._rows.get(i, QQVector())
+            interlaced = QQVector.interlace(row_m, row_n)
+            if not interlaced.is_zero():
+                result[i] = interlaced
+        return QQMatrix(result)
+
+    # ------------------------------------------------------------------
+    # Rank  (Gaussian elimination)
+    # ------------------------------------------------------------------
+
+    def rank(self) -> int:
+        if not self._rows:
+            return 0
+        # Work on a mutable copy
+        working = {i: dict(v.entries) for i, v in self._rows.items()}
+        all_cols = self.column_set()
+        if not all_cols:
+            return 0
+        rank = 0
+        for col in sorted(all_cols):
+            # Find pivot
+            pivot_row = None
+            for r in sorted(working.keys()):
+                if working[r].get(col, QQ(0)) != 0:
+                    pivot_row = r
+                    break
+            if pivot_row is None:
+                continue
+            # Eliminate
+            pivot_coeff = working[pivot_row][col]
+            for r in sorted(working.keys()):
+                if r == pivot_row:
+                    continue
+                factor = working[r].get(col, QQ(0))
+                if factor != 0:
+                    scale = factor / pivot_coeff
+                    for d, c in working[pivot_row].items():
+                        working[r][d] = working[r].get(d, QQ(0)) - c * scale
+                    # Clean zeros
+                    working[r] = {d: c for d, c in working[r].items() if c != 0}
+            rank += 1
+        return rank
+
+    # ------------------------------------------------------------------
+    # Copy
+    # ------------------------------------------------------------------
+
+    def copy(self) -> QQMatrix:
+        return QQMatrix({i: QQVector(dict(v.entries)) for i, v in self._rows.items()})
+
+    # ------------------------------------------------------------------
+    # Display
+    # ------------------------------------------------------------------
+
+    def __str__(self) -> str:
+        if not self._rows:
+            return "[]"
+        return "\n".join(str(row) for _, row in self.rowsi())
+
+    def __repr__(self) -> str:
+        return f"QQMatrix({dict(self._rows)})"
+
+    # ------------------------------------------------------------------
+    # Rational eigenvalues  (porting OCaml QQMatrix.rational_eigenvalues)
+    # ------------------------------------------------------------------
+
+    def rational_eigenvalues(self, dims: List[int]) -> List[Tuple[QQ, int]]:
+        """Compute rational eigenvalues with algebraic multiplicities."""
+        if not dims:
+            return []
+        # Scale to integer matrix
+        denom = ZZ(1)
+        for i in dims:
+            for j in dims:
+                e = self.entry(i, j)
+                denom = math.lcm(denom, e.denominator)
+        n = len(dims)
+        int_mat = [[0] * n for _ in range(n)]
+        for ii, di in enumerate(dims):
+            for jj, dj in enumerate(dims):
+                e = self.entry(di, dj)
+                int_mat[ii][jj] = int(e * denom)
+        # Use sympy for characteristic polynomial factoring
+        try:
+            import sympy
+            x = sympy.Symbol("x")
+            M = sympy.Matrix(int_mat)
+            cp = M.charpoly(x)
+            factors = sympy.factor_list(cp.as_expr(), x)
+            result: List[Tuple[QQ, int]] = []
+            for factor, mult in factors[1]:
+                if sympy.degree(factor, x) == 1:
+                    coeffs = sympy.Poly(factor, x).all_coeffs()
+                    a_val = int(coeffs[0])
+                    b_val = int(coeffs[1])
+                    eigenvalue = QQ(-b_val, a_val * denom)
+                    result.append((eigenvalue, mult))
+            return result
+        except (ImportError, Exception):
+            return []
 
 
-# Vector space operations
+# ---------------------------------------------------------------------------
+# Row echelon form / nullspace / solve  (porting OCaml)
+# ---------------------------------------------------------------------------
+
+class NoSolution(Exception):
+    pass
+
+
+def _row_echelon_form(mat: QQMatrix, b_column: int) -> List[Tuple[int, QQVector]]:
+    """Gaussian elimination returning ``(pivot_col, scaled_row)`` pairs.
+
+    Each pair represents the equation ``pivot_col = dot(soln, scaled_row)``.
+    """
+    working = {i: QQVector(dict(v.entries)) for i, v in mat._rows.items()}
+    finished: List[Tuple[int, QQVector]] = []
+
+    while working:
+        # Find min row
+        row_num = min(working.keys())
+        next_row = working.pop(row_num)
+        # Find first column != b_column
+        column = None
+        for _, dim in next_row.enum():
+            if dim != b_column:
+                column = dim
+                break
+        if column is None:
+            raise NoSolution("Singular system")
+        # Pivot: extract coefficient and rest
+        cell = next_row.entries.get(column, QQ(0))
+        rest = {d: c for d, c in next_row.entries.items() if d != column}
+        rest_vec = QQVector(rest)
+        # Scale: next_row' = -(1/cell) * rest  (so that column = dot(soln, next_row'))
+        neg_inv = -QQ(1) / cell
+        scaled = rest_vec * neg_inv
+        # Eliminate column from remaining rows
+        new_working: Dict[int, QQVector] = {}
+        for r, row_r in working.items():
+            coeff_r = row_r.entries.get(column, QQ(0))
+            if coeff_r != 0:
+                # row_r' = row_r_rest + coeff_r * scaled
+                rest_r = {d: c for d, c in row_r.entries.items() if d != column}
+                new_row = QQVector(rest_r) + scaled * coeff_r
+                if not new_row.is_zero():
+                    new_working[r] = new_row
+            else:
+                new_working[r] = row_r
+        working = new_working
+        finished.append((column, scaled))
+
+    # Reverse to match OCaml order (last-processed row first) for backpropagation
+    finished.reverse()
+    return finished
+
+
+def nullspace(mat: QQMatrix, dimensions: List[int]) -> List[QQVector]:
+    """Nullspace of *mat* projected onto *dimensions*."""
+    columns = mat.column_set()
+    b_column = 1 + (max(columns) if columns else 0)
+    b_column = max(b_column, max(dimensions) + 1 if dimensions else 0)
+    rr = _row_echelon_form(mat, b_column)
+
+    def backprop(soln: QQVector, pairs: List[Tuple[int, QQVector]]) -> QQVector:
+        for lhs, rhs in pairs:
+            soln = soln.add_term(soln.dot(rhs), lhs)
+        return soln
+
+    pivot_cols = {col for col, _ in rr}
+    free_dims = [d for d in dimensions if d not in pivot_cols]
+    return [backprop(QQVector.of_term(QQ(1), d), rr) for d in free_dims]
+
+
+def solve_exn(mat: QQMatrix, b: QQVector) -> QQVector:
+    """Solve mat * x = b.  Raises NoSolution if unsolvable."""
+    columns = mat.column_set()
+    b_column = 1 + (max(columns) if columns else 0)
+    augmented = mat.add_column(b_column, b)
+    rr = _row_echelon_form(augmented, b_column)
+
+    def backprop(soln: QQVector, pairs: List[Tuple[int, QQVector]]) -> QQVector:
+        for lhs, rhs in pairs:
+            soln = soln.add_term(soln.dot(rhs), lhs)
+        return soln
+
+    soln = backprop(QQVector.of_term(QQ(1), b_column), rr)
+    # Extract solution: pivot out b_column, negate
+    b_coeff = soln.entries.get(b_column, QQ(0))
+    rest = {d: c for d, c in soln.entries.items() if d != b_column}
+    return -QQVector(rest)
+
+
+def solve(mat: QQMatrix, b: QQVector) -> Optional[QQVector]:
+    try:
+        return solve_exn(mat, b)
+    except NoSolution:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Vector space operations  (porting OCaml QQVectorSpace)
+# ---------------------------------------------------------------------------
+
+def _mem_vector_space(basis: List[QQVector], v: QQVector) -> bool:
+    """Check if *v* is in the span of *basis*."""
+    if not basis:
+        return v.is_zero()
+    mA = QQMatrix.of_rows(basis)
+    return solve(mA.transpose(), v) is not None
+
+
 class QQVectorSpace:
-    """Represents a vector space over rational numbers."""
+    """Vector space represented by a list of basis vectors.
+
+    Matching OCaml ``QQVectorSpace`` module.
+    """
 
     def __init__(self, basis: List[QQVector]):
         self.basis = basis
 
-    def dimension(self) -> int:
-        """Dimension of the vector space."""
-        return len(self.basis)
-
-    def contains(self, vector: QQVector) -> bool:
-        """Check if a vector is in this vector space."""
-        if not self.basis:
-            return vector.is_zero()
-
-        # Check if vector is a linear combination of basis vectors
-        # Build matrix with basis vectors as columns
-        # Check if Ax = vector has a solution
-
-        # Get all dimensions
-        all_dims = set(vector.dimensions())
-        for basis_vec in self.basis:
-            all_dims.update(basis_vec.dimensions())
-
-        if not all_dims:
-            return vector.is_zero()
-
-        # Build coefficient matrix
-        rows = []
-        for dim in sorted(all_dims):
-            row_entries = {}
-            for i, basis_vec in enumerate(self.basis):
-                coeff = basis_vec.get(dim, QQ(0))
-                if coeff != 0:
-                    row_entries[i] = coeff
-            rows.append(QQVector(row_entries))
-
-        A = QQMatrix(rows)
-        b = QQVector(
-            {i: vector.get(dim, QQ(0)) for i, dim in enumerate(sorted(all_dims))}
-        )
-
-        # Try to solve Ax = b
-        from .linear_utils import solve_linear_system
-
-        solution = solve_linear_system(A, b)
-        return solution is not None
-
-    def intersect(self, other: QQVectorSpace) -> QQVectorSpace:
-        """Intersection of two vector spaces."""
-        if not self.basis or not other.basis:
-            return QQVectorSpace([])
-
-        # Compute intersection using the sum of null spaces
-        # V1 ∩ V2 = ker([B1 | -B2]^T) where B1, B2 are bases
-
-        # Get all dimensions
-        all_dims = set()
-        for vec in self.basis + other.basis:
-            all_dims.update(vec.dimensions())
-
-        if not all_dims:
-            return QQVectorSpace([])
-
-        # Build augmented matrix [B1 | -B2]
-        rows = []
-        for dim in sorted(all_dims):
-            row_entries = {}
-            # Add B1 columns
-            for i, vec in enumerate(self.basis):
-                coeff = vec.get(dim, QQ(0))
-                if coeff != 0:
-                    row_entries[i] = coeff
-            # Add -B2 columns
-            for i, vec in enumerate(other.basis):
-                coeff = vec.get(dim, QQ(0))
-                if coeff != 0:
-                    row_entries[len(self.basis) + i] = -coeff
-            rows.append(QQVector(row_entries))
-
-        # Compute null space (simplified)
-        # For now, return empty intersection
-        # A full implementation would compute the actual null space
-        return QQVectorSpace([])
-
-    def sum(self, other: QQVectorSpace) -> QQVectorSpace:
-        """Sum of two vector spaces."""
-        return QQVectorSpace(self.basis + other.basis)
-
-    def simplify(self) -> QQVectorSpace:
-        """Simplify the vector space basis by removing zero vectors."""
-        simplified_basis = [vec for vec in self.basis if not vec.is_zero()]
-        return QQVectorSpace(simplified_basis)
-
-    @staticmethod
-    def simplify(basis: List[QQVector]) -> List[QQVector]:
-        """Simplify a list of basis vectors by removing zero vectors."""
-        return [vec for vec in basis if not vec.is_zero()]
-
-    def basis(self) -> List[QQVector]:
-        """Get the basis vectors."""
+    @property
+    def _t(self) -> List[QQVector]:
         return self.basis
 
     @staticmethod
-    def of_matrix(matrix: QQMatrix) -> QQVectorSpace:
-        """Create a vector space from the rows of a matrix."""
-        basis = []
-        for row in matrix.rows:
-            if not row.is_zero():
-                basis.append(row)
-        return QQVectorSpace(basis)
+    def empty() -> QQVectorSpace:
+        return QQVectorSpace([])
+
+    def is_empty(self) -> bool:
+        return len(self.basis) == 0
+
+    def mem(self, v: QQVector) -> bool:
+        return _mem_vector_space(self.basis, v)
+
+    def subspace(self, other: QQVectorSpace) -> bool:
+        return all(_mem_vector_space(other.basis, v) for v in self.basis)
+
+    def equal(self, other: QQVectorSpace) -> bool:
+        return self.subspace(other) and other.subspace(self)
+
+    def matrix_of(self) -> QQMatrix:
+        return QQMatrix.of_rows(self.basis)
 
     @staticmethod
-    def equal(space1: QQVectorSpace, space2: QQVectorSpace) -> bool:
-        """Check if two vector spaces are equal."""
-        if len(space1.basis) != len(space2.basis):
-            return False
-        # Simple check: same dimension and same basis vectors
-        return space1.dimension() == space2.dimension()
+    def of_matrix(m: QQMatrix) -> QQVectorSpace:
+        return QQVectorSpace([row for _, row in m.rowsi()])
+
+    def intersect(self, other: QQVectorSpace) -> QQVectorSpace:
+        mU = self.matrix_of()
+        mV = other.matrix_of()
+        mC, _ = intersect_rowspace(mU, mV)
+        return QQVectorSpace.of_matrix(mC * mU)
+
+    def sum(self, other: QQVectorSpace) -> QQVectorSpace:
+        result = list(self.basis)
+        for v in other.basis:
+            if not _mem_vector_space(result, v):
+                result.append(v)
+        return QQVectorSpace(result)
+
+    def diff(self, other: QQVectorSpace) -> QQVectorSpace:
+        result: List[QQVector] = []
+        combined = result + other.basis
+        for v in self.basis:
+            if not _mem_vector_space(combined, v):
+                result.append(v)
+                combined = result + other.basis
+        return QQVectorSpace(result)
+
+    @staticmethod
+    def standard_basis(dim: int) -> QQVectorSpace:
+        return QQVectorSpace([QQVector.of_term(QQ(1), d) for d in range(dim)])
+
+    @staticmethod
+    def basis_from_vectors(vecs: List[QQVector]) -> QQVectorSpace:
+        result: List[QQVector] = []
+        for v in vecs:
+            if not _mem_vector_space(result, v):
+                result.append(v)
+        return QQVectorSpace(result)
+
+    def simplify(self) -> QQVectorSpace:
+        """Gauss-Jordan simplification."""
+        basis = list(self.basis)
+        result: List[QQVector] = []
+        remaining = list(basis)
+        while remaining:
+            y = remaining.pop(0)
+            if y.is_zero():
+                continue
+            # Find leading dimension
+            min_dim = min(y.entries.keys())
+            coeff = y.entries[min_dim]
+            # Normalize so leading coefficient is 1
+            inv = QQ(1) / coeff
+            y_norm = y * inv
+            # Eliminate leading dimension from all other vectors
+            def reduce_vec(x: QQVector) -> QQVector:
+                c = x.entries.get(min_dim, QQ(0))
+                if c == 0:
+                    return x
+                return x + y_norm * (-c)
+
+            result = [reduce_vec(x) for x in result]
+            remaining = [reduce_vec(x) for x in remaining]
+            result.append(y_norm)
+        return QQVectorSpace(result)
+
+    def scale_integer(self) -> QQVectorSpace:
+        scaled = []
+        for vec in self.basis:
+            lcm_denom = 1
+            for coeff in vec.entries.values():
+                lcm_denom = math.lcm(lcm_denom, coeff.denominator)
+            scaled.append(vec * QQ(lcm_denom))
+        return QQVectorSpace(scaled)
+
+    def dimension(self) -> int:
+        return len(self.basis)
+
+    def contains(self, vector: QQVector) -> bool:
+        return self.mem(vector)
+
+    @staticmethod
+    def equal_static(s1: QQVectorSpace, s2: QQVectorSpace) -> bool:
+        return s1.equal(s2)
 
     def __str__(self) -> str:
         return f"VectorSpace(dimension={self.dimension()})"
 
 
-# Utility functions - imported locally to avoid cyclic imports
-def zero_vector(dimensions: int):
-    """Create a zero vector."""
-    from .linear_utils import zero_vector as _zero_vector
+# ---------------------------------------------------------------------------
+# intersect_rowspace  (porting OCaml)
+# ---------------------------------------------------------------------------
 
-    return _zero_vector(dimensions)
+def intersect_rowspace(a: QQMatrix, b: QQMatrix) -> Tuple[QQMatrix, QQMatrix]:
+    """Compute C, D such that C*A = D*B is a basis for rowspace(A) ∩ rowspace(B)."""
+    # Build lambda_1*A - lambda_2*B = 0 system
+    # lambda_1 at even columns, lambda_2 at odd columns
+    mat_a = QQMatrix()
+    for i, j, k in a.entries():
+        mat_a = mat_a.add_entry(j, 2 * i, k)
 
+    mat = mat_a
+    for i, j, k in b.entries():
+        mat = mat.add_entry(j, 2 * i + 1, -k)
 
-def unit_vector(dim: int, size: int):
-    """Create a unit vector in the given dimension."""
-    from .linear_utils import unit_vector as _unit_vector
+    c = QQMatrix()
+    d = QQMatrix()
+    c_rows = 0
+    d_rows = 0
+    mat_rows = max(r for r, _ in mat.rowsi()) + 1 if mat._rows else 0
 
-    return _unit_vector(dim, size)
+    # For each column in the row space, try to find a vector in the intersection
+    # with 1 in that column's entry
+    for col, _ in mat.rowsi():
+        # Add constraint: row col of mat_a must match
+        mat_prime = mat.add_row(mat_rows, mat_a.row(col))
+        target = QQVector.of_term(QQ(1), mat_rows)
+        solution = solve(mat_prime, target)
+        if solution is not None:
+            c_row = QQVector()
+            d_row = QQVector()
+            for entry, i in solution.enum():
+                if i % 2 == 0:
+                    c_row = c_row.add_term(entry, i // 2)
+                else:
+                    d_row = d_row.add_term(entry, i // 2)
+            c = c.add_row(c_rows, c_row)
+            d = d.add_row(d_rows, d_row)
+            c_rows += 1
+            d_rows += 1
+            mat_rows += 1
+            mat = mat_prime
 
-
-def identity_matrix(size: int):
-    """Create an identity matrix."""
-    from .linear_utils import identity_matrix as _identity_matrix
-
-    return _identity_matrix(size)
-
-
-def vector_from_list(values):
-    """Create a vector from a list of values."""
-    from .linear_utils import vector_from_list as _vector_from_list
-
-    return _vector_from_list(values)
-
-
-def matrix_from_lists(rows):
-    """Create a matrix from a list of row lists."""
-    from .linear_utils import matrix_from_lists as _matrix_from_lists
-
-    return _matrix_from_lists(rows)
-
-
-def mk_vector(values):
-    """Create a vector from a list of values."""
-    from .linear_utils import mk_vector as _mk_vector
-
-    return _mk_vector(values)
-
-
-def mk_matrix(rows):
-    """Create a matrix from a list of row lists."""
-    from .linear_utils import mk_matrix as _mk_matrix
-
-    return _mk_matrix(rows)
+    return c, d
 
 
-def solve_linear_system(matrix, vector):
-    """Solve a linear system Ax = b."""
-    from .linear_utils import solve_linear_system as _solve_linear_system
+# ---------------------------------------------------------------------------
+# pushout  (porting OCaml)
+# ---------------------------------------------------------------------------
 
-    return _solve_linear_system(matrix, vector)
+def pushout(mA: QQMatrix, mB: QQMatrix) -> Tuple[QQMatrix, QQMatrix]:
+    """Pushout in the category of rational vector spaces.
 
-
-#
-# Compatibility helpers for symbolic linear terms
-#
-# Dimension 0 is reserved for the constant term; symbols/vars map to (id + 1).
-const_dim = 0
-
-
-def dim_of_sym(symbol) -> int:
-    """Map a symbol/var to a QQVector dimension (0 is reserved for constants)."""
-    if hasattr(symbol, "var_id"):
-        return int(symbol.var_id) + 1
-    if hasattr(symbol, "id"):
-        return int(symbol.id) + 1
-    if hasattr(symbol, "name") and symbol.name is not None:
-        return (hash(symbol.name) % 1000) + 1
-    return 1
+    Returns (C, D) such that C*A = D*B, and for any E, F with E*A = F*B,
+    there exists unique U with U*C*A = U*D*B = E*A = F*B.
+    """
+    mABt = QQMatrix.interlace_columns(mA.transpose(), QQMatrix.scalar_mul(QQ(-1), mB))
+    pairs = nullspace(mABt, sorted(mABt.column_set()))
+    mC = QQMatrix()
+    mD = QQMatrix()
+    for i, soln in enumerate(pairs):
+        c, d = soln.deinterlace()
+        mC = mC.add_row(i, c)
+        mD = mD.add_row(i, d)
+    return mC, mD
 
 
-def linterm_of(*args):
-    """Extract a linear term (QQVector) from a syntax arithmetic expression.
+# ---------------------------------------------------------------------------
+# divide_right / divide_left  (porting OCaml)
+# ---------------------------------------------------------------------------
 
-    Supports both calling conventions:
-    - linterm_of(expr)
-    - linterm_of(srk, expr)   (srk is ignored; accepted for compatibility)
+def divide_right(a: QQMatrix, b: QQMatrix) -> Optional[QQMatrix]:
+    """Find C such that C*B = A (i.e., rowspace(B) ⊆ rowspace(A))."""
+    try:
+        b_tr = b.transpose()
+        div = QQMatrix()
+        for i, row in a.rowsi():
+            sol = solve_exn(b_tr, row)
+            div = div.add_row(i, sol)
+        return div
+    except NoSolution:
+        return None
+
+
+def divide_left(a: QQMatrix, b: QQMatrix) -> Optional[QQMatrix]:
+    """Find C such that B*C = A."""
+    result = divide_right(a.transpose(), b.transpose())
+    return result.transpose() if result is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Spectral decomposition  (porting OCaml)
+# ---------------------------------------------------------------------------
+
+def rational_spectral_decomposition(mA: QQMatrix, dims: List[int]) -> List[Tuple[QQ, QQVector]]:
+    """(eigenvalue, generalized eigenvector) pairs."""
+    mAt = mA.transpose()
+    identity = QQMatrix.identity(dims)
+    rsd: List[Tuple[QQ, QQVector]] = []
+    for lam, mult in mA.rational_eigenvalues(dims):
+        mE = (mAt + QQMatrix.scalar_mul(-lam, identity)).exp(mult)
+        for v in nullspace(mE, dims):
+            rsd.append((lam, v))
+    return rsd
+
+
+def periodic_rational_spectral_decomposition(
+    mA: QQMatrix, dims: List[int]
+) -> List[Tuple[int, QQ, QQVector]]:
+    """(period, eigenvalue, generalized eigenvector) triples."""
+    nb_dims = len(dims)
+    max_pow = nb_dims * nb_dims * nb_dims
+    prsd: List[Tuple[int, QQ, QQVector]] = []
+    mA_pow = mA
+    for i in range(1, max_pow + 1):
+        if len(prsd) == nb_dims:
+            break
+        existing_space = [v for _, _, v in prsd]
+        for lam, v in rational_spectral_decomposition(mA_pow, dims):
+            if not _mem_vector_space(existing_space, v):
+                prsd.append((i, lam, v))
+                existing_space.append(v)
+        mA_pow = mA * mA_pow
+    return prsd
+
+
+def jordan_chain(mA: QQMatrix, lam: QQ, v: QQVector) -> List[QQVector]:
+    """Compute left Jordan chain for eigenvalue *lam* starting from *v*."""
+    residual = mA.vector_left_mul(v) - v * lam
+    if residual.is_zero():
+        return [v]
+    return [v] + jordan_chain(mA, lam, residual)
+
+
+# ---------------------------------------------------------------------------
+# Affine term functions  (porting OCaml)
+# ---------------------------------------------------------------------------
+
+exception_Nonlinear = ValueError("Nonlinear term encountered in linterm_of")
+
+
+def linterm_of(*args) -> QQVector:
+    """Extract a linear term (QQVector) from a syntax expression.
+
+    Supports both ``linterm_of(expr)`` and ``linterm_of(srk, expr)``.
     """
     if len(args) == 1:
         expr = args[0]
     elif len(args) == 2:
         _, expr = args
     else:
-        raise TypeError(
-            f"linterm_of expects (expr) or (srk, expr), got {len(args)} args"
-        )
+        raise TypeError(f"linterm_of expects (expr) or (srk, expr), got {len(args)} args")
 
-    from fractions import Fraction
     from .syntax import Var, Const, Add, Mul
 
-    def _const_as_fraction(c: Const) -> Fraction | None:
+    def _const_as_fraction(c: Const) -> Optional[QQ]:
         name = getattr(c.symbol, "name", None)
         if not name:
             return None
-        # Integers and rationals written as strings.
         try:
-            return Fraction(name)
+            return QQ(name)
         except Exception:
             pass
-        # Real constants are encoded as "real_<float>".
         if name.startswith("real_"):
             try:
-                return Fraction(str(float(name[5:])))
+                return QQ(str(float(name[5:])))
             except Exception:
                 return None
         return None
 
-    def _scale(v: QQVector, k: Fraction) -> QQVector:
+    def _scale(v: QQVector, k: QQ) -> QQVector:
         if k == 0 or not v.entries:
             return QQVector()
-        return QQVector(
-            {d: Fraction(c) * k for d, c in v.entries.items() if Fraction(c) * k != 0}
-        )
+        return QQVector({d: c * k for d, c in v.entries.items() if c * k != 0})
 
-    def _add(vs: list[QQVector]) -> QQVector:
-        out: dict[int, Fraction] = {}
+    def _add(vs: list) -> QQVector:
+        out: Dict[int, QQ] = {}
         for v in vs:
             for d, c in v.entries.items():
-                out[d] = out.get(d, Fraction(0)) + Fraction(c)
+                out[d] = out.get(d, QQ(0)) + c
                 if out[d] == 0:
                     del out[d]
         return QQVector(out)
 
     def rec(e) -> QQVector:
         if isinstance(e, Var):
-            return QQVector({dim_of_sym(e): Fraction(1)})
+            return QQVector.of_term(QQ(1), dim_of_sym(e))
         if isinstance(e, Const):
             k = _const_as_fraction(e)
             if k is not None:
-                return QQVector({const_dim: k}) if k != 0 else QQVector()
-            # Treat uninterpreted constants as symbolic dimensions.
-            return QQVector({dim_of_sym(e.symbol): Fraction(1)})
+                return QQVector.of_term(k, const_dim) if k != 0 else QQVector()
+            return QQVector.of_term(QQ(1), dim_of_sym(e.symbol))
         if isinstance(e, Add):
             return _add([rec(a) for a in e.args])
         if isinstance(e, Mul):
-            scalar = Fraction(1)
+            scalar = QQ(1)
             non_scalar = []
             for a in e.args:
                 if isinstance(a, Const):
@@ -898,7 +1394,7 @@ def linterm_of(*args):
                         continue
                 non_scalar.append(a)
             if not non_scalar:
-                return QQVector({const_dim: scalar}) if scalar != 0 else QQVector()
+                return QQVector.of_term(scalar, const_dim) if scalar != 0 else QQVector()
             if len(non_scalar) == 1:
                 return _scale(rec(non_scalar[0]), scalar)
             raise ValueError("Nonlinear term encountered in linterm_of")
@@ -907,156 +1403,206 @@ def linterm_of(*args):
     return rec(expr)
 
 
-def divide_right(a: QQMatrix, b: QQMatrix) -> Optional[QQMatrix]:
-    """Solve for x in a * x = b.
+def of_linterm(srk, linterm: QQVector):
+    """Convert a QQVector to a syntax arithmetic term."""
+    from .syntax import mk_real, mk_const, mk_mul, mk_add, symbol_of_int
 
-    Returns the matrix x such that a * x = b, or None if no solution exists.
-    This solves a system of equations for each column of b.
-    """
-    try:
-        if not a.rows or not b.rows:
-            return QQMatrix()
-
-        # Check dimensions are compatible
-        a_cols = len(a.rows[0].entries) if a.rows else 0
-        b_cols = len(b.rows[0].entries) if b.rows else 0
-
-        # a * x = b means a has m rows and x has m columns, b has m rows and n columns
-        # So a should have shape (m, k), x should have shape (k, n), b should have shape (m, n)
-
-        result_rows = []
-        for col_idx in range(b_cols):
-            # Extract column col_idx from b
-            b_col = QQVector(
-                {
-                    row_idx: b.rows[row_idx].get(col_idx, QQ(0))
-                    for row_idx in range(len(b.rows))
-                }
-            )
-
-            # Solve a * x_col = b_col for x_col
-            try:
-                x_col = solve_linear_system(a, b_col)
-                result_rows.append(x_col)
-            except Exception:
-                # No solution for this column
-                return None
-
-        return QQMatrix(result_rows) if result_rows else QQMatrix()
-    except Exception:
-        return None
+    parts = []
+    for coeff, dim in linterm.enum():
+        sym = sym_of_dim(dim)
+        if sym is not None:
+            if QQ(coeff) == QQ(1):
+                parts.append(mk_const(srk, sym))
+            else:
+                parts.append(mk_mul(srk, [mk_real(srk, coeff), mk_const(srk, sym)]))
+        else:
+            parts.append(mk_real(srk, coeff))
+    if not parts:
+        return mk_real(srk, QQ(0))
+    return mk_add(srk, parts)
 
 
-def divide_left(a: QQMatrix, b: QQMatrix) -> Optional[QQMatrix]:
-    """Solve for x in x * a = b.
-
-    Returns the matrix x such that x * a = b, or None if no solution exists.
-    """
-    # x * a = b is equivalent to a^T * x^T = b^T
-    # So we solve divide_right(a^T, b^T) and transpose the result
-    try:
-        a_t = a.transpose()
-        b_t = b.transpose()
-        result_t = divide_right(a_t, b_t)
-        if result_t is None:
-            return None
-        return result_t.transpose()
-    except Exception:
-        return None
+def evaluate_linterm(interp, term: QQVector) -> QQ:
+    """Evaluate affine term using symbol interpretation."""
+    result = QQ(0)
+    for coeff, dim in term.enum():
+        sym = sym_of_dim(dim)
+        if sym is not None:
+            result += interp(sym) * coeff
+        else:
+            result += coeff
+    return result
 
 
-# Advanced functions - imported locally to avoid cyclic imports
+def evaluate_affine(m, term: QQVector) -> QQ:
+    """Evaluate affine term using dimension-based interpretation."""
+    result = QQ(0)
+    for coeff, dim in term.enum():
+        if dim == const_dim:
+            result += coeff
+        else:
+            result += m(dim) * coeff
+    return result
+
+
+def linterm_size(linterm: QQVector) -> int:
+    """Number of non-zero dimensions."""
+    return len(linterm.entries)
+
+
+def term_of_vec(srk, term_of_dim, vec: QQVector):
+    """Create a term by interpreting each dimension with *term_of_dim*."""
+    from .syntax import mk_real, mk_mul, mk_add
+
+    parts = []
+    for coeff, dim in vec.enum():
+        parts.append(mk_mul(srk, [mk_real(srk, coeff), term_of_dim(dim)]))
+    if not parts:
+        return mk_real(srk, QQ(0))
+    return mk_add(srk, parts)
+
+
+def pp_linterm(srk, formatter, linterm: QQVector):
+    """Pretty-print an affine term (stub)."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Utility function wrappers  (backward compatibility)
+# ---------------------------------------------------------------------------
+
+def zero_vector(dimensions: int) -> QQVector:
+    return QQVector()
+
+
+def unit_vector(dim: int, size: int) -> QQVector:
+    return QQVector.of_term(QQ(1), dim)
+
+
+def identity_matrix(size: int) -> QQMatrix:
+    return QQMatrix.identity(list(range(size)))
+
+
+def vector_from_list(values) -> QQVector:
+    entries = {i: QQ(v) for i, v in enumerate(values) if QQ(v) != 0}
+    return QQVector(entries)
+
+
+def matrix_from_lists(rows) -> QQMatrix:
+    return QQMatrix.of_rows([vector_from_list(row) for row in rows])
+
+
+def mk_vector(values) -> QQVector:
+    return vector_from_list(values)
+
+
+def mk_matrix(rows) -> QQMatrix:
+    return matrix_from_lists(rows)
+
+
+def solve_linear_system(matrix: QQMatrix, vector: QQVector) -> Optional[QQVector]:
+    return solve(matrix, vector)
+
+
+# ---------------------------------------------------------------------------
+# Advanced functions  (lazy imports from linear_advanced)
+# ---------------------------------------------------------------------------
+
 def to_numpy_matrix(matrix):
-    """Convert QQMatrix to numpy array."""
-    from .linear_advanced import to_numpy_matrix as _to_numpy_matrix
-
-    return _to_numpy_matrix(matrix)
+    from .linear_advanced import to_numpy_matrix as _f
+    return _f(matrix)
 
 
 def from_numpy_matrix(arr):
-    """Convert numpy array to QQMatrix."""
-    from .linear_advanced import from_numpy_matrix as _from_numpy_matrix
-
-    return _from_numpy_matrix(arr)
+    from .linear_advanced import from_numpy_matrix as _f
+    return _f(arr)
 
 
-def rational_eigenvalues(matrix):
-    """Compute rational eigenvalues of matrix."""
-    from .linear_advanced import rational_eigenvalues as _rational_eigenvalues
-
-    return _rational_eigenvalues(matrix)
+def rational_eigenvalues_fn(matrix):
+    from .linear_advanced import rational_eigenvalues as _f
+    return _f(matrix)
 
 
 def eigenvectors(matrix):
-    """Compute eigenvectors of matrix."""
-    from .linear_advanced import eigenvectors as _eigenvectors
-
-    return _eigenvectors(matrix)
+    from .linear_advanced import eigenvectors as _f
+    return _f(matrix)
 
 
 def matrix_power(matrix, n):
-    """Compute matrix power."""
-    from .linear_advanced import matrix_power as _matrix_power
-
-    return _matrix_power(matrix, n)
+    from .linear_advanced import matrix_power as _f
+    return _f(matrix, n)
 
 
 def determinant(matrix):
-    """Compute matrix determinant."""
-    from .linear_advanced import determinant as _determinant
-
-    return _determinant(matrix)
+    from .linear_advanced import determinant as _f
+    return _f(matrix)
 
 
 def matrix_inverse(matrix):
-    """Compute matrix inverse."""
-    from .linear_advanced import matrix_inverse as _matrix_inverse
-
-    return _matrix_inverse(matrix)
+    from .linear_advanced import matrix_inverse as _f
+    return _f(matrix)
 
 
 def qr_decomposition(matrix):
-    """QR decomposition of matrix."""
-    from .linear_advanced import qr_decomposition as _qr_decomposition
-
-    return _qr_decomposition(matrix)
+    from .linear_advanced import qr_decomposition as _f
+    return _f(matrix)
 
 
 def svd(matrix):
-    """Singular value decomposition of matrix."""
-    from .linear_advanced import svd as _svd
-
-    return _svd(matrix)
+    from .linear_advanced import svd as _f
+    return _f(matrix)
 
 
 def null_space(matrix):
-    """Compute null space of matrix."""
-    from .linear_advanced import null_space as _null_space
-
-    return _null_space(matrix)
+    from .linear_advanced import null_space as _f
+    return _f(matrix)
 
 
 def column_space(matrix):
-    """Compute column space of matrix."""
-    from .linear_advanced import column_space as _column_space
-
-    return _column_space(matrix)
+    from .linear_advanced import column_space as _f
+    return _f(matrix)
 
 
 def gram_schmidt(vectors):
-    """Gram-Schmidt orthogonalization."""
-    from .linear_advanced import gram_schmidt as _gram_schmidt
-
-    return _gram_schmidt(vectors)
+    from .linear_advanced import gram_schmidt as _f
+    return _f(vectors)
 
 
-# Export the Linear class and all functions
+# ---------------------------------------------------------------------------
+# __all__
+# ---------------------------------------------------------------------------
+
 __all__ = [
-    "Linear",
     "QQVector",
     "QQMatrix",
     "QQVectorSpace",
-    # Utility functions
+    "ZZVector",
+    # Conventions
+    "const_dim",
+    "dim_of_sym",
+    "sym_of_dim",
+    "const_linterm",
+    "const_of_linterm",
+    # Solvers
+    "solve",
+    "solve_exn",
+    "nullspace",
+    "intersect_rowspace",
+    "pushout",
+    "divide_right",
+    "divide_left",
+    # Spectral
+    "rational_spectral_decomposition",
+    "periodic_rational_spectral_decomposition",
+    "jordan_chain",
+    # Affine terms
+    "linterm_of",
+    "of_linterm",
+    "evaluate_linterm",
+    "evaluate_affine",
+    "linterm_size",
+    "term_of_vec",
+    # Utilities
     "zero_vector",
     "unit_vector",
     "identity_matrix",
@@ -1065,14 +1611,10 @@ __all__ = [
     "mk_vector",
     "mk_matrix",
     "solve_linear_system",
-    "linterm_of",
-    # Symbol dimension helpers
-    "const_dim",
-    "dim_of_sym",
-    # Advanced functions
+    # Advanced
     "to_numpy_matrix",
     "from_numpy_matrix",
-    "rational_eigenvalues",
+    "rational_eigenvalues_fn",
     "eigenvectors",
     "matrix_power",
     "determinant",
@@ -1085,37 +1627,25 @@ __all__ = [
 ]
 
 
-# Linear namespace for compatibility with OCaml module structure
+# ---------------------------------------------------------------------------
+# Linear namespace  (backward compatibility)
+# ---------------------------------------------------------------------------
+
 class Linear:
     """Namespace for linear algebra functions."""
 
     QQVector = QQVector
     QQMatrix = QQMatrix
     QQVectorSpace = QQVectorSpace
-
-    # Symbolic constants for dimensions
+    ZZVector = ZZVector
     const_dim = const_dim
 
     @staticmethod
     def dim_of_sym(symbol) -> int:
-        """Get dimension of a symbol (0 is reserved for constants)."""
         return dim_of_sym(symbol)
 
     @staticmethod
     def _get_utility_functions():
-        """Get utility functions with local import to avoid cyclic dependencies."""
-        from .linear_utils import (
-            zero_vector,
-            unit_vector,
-            identity_matrix,
-            vector_from_list,
-            matrix_from_lists,
-            mk_vector,
-            mk_matrix,
-            linterm_of,
-            solve_linear_system,
-        )
-
         return {
             "zero_vector": zero_vector,
             "unit_vector": unit_vector,
@@ -1130,27 +1660,11 @@ class Linear:
 
     @staticmethod
     def _get_advanced_functions():
-        """Get advanced functions with local import to avoid cyclic dependencies."""
         try:
-            from .linear_advanced import (
-                to_numpy_matrix,
-                from_numpy_matrix,
-                rational_eigenvalues,
-                eigenvectors,
-                matrix_power,
-                determinant,
-                matrix_inverse,
-                qr_decomposition,
-                svd,
-                null_space,
-                column_space,
-                gram_schmidt,
-            )
-
             return {
                 "to_numpy_matrix": to_numpy_matrix,
                 "from_numpy_matrix": from_numpy_matrix,
-                "rational_eigenvalues": rational_eigenvalues,
+                "rational_eigenvalues": rational_eigenvalues_fn,
                 "eigenvectors": eigenvectors,
                 "matrix_power": matrix_power,
                 "determinant": determinant,
@@ -1165,17 +1679,10 @@ class Linear:
             return {}
 
     def __getattr__(self, name):
-        """Dynamically load utility or advanced functions when accessed."""
-        # Try utility functions first
-        utility_funcs = self._get_utility_functions()
-        if name in utility_funcs:
-            return utility_funcs[name]
-
-        # Try advanced functions
-        advanced_funcs = self._get_advanced_functions()
-        if name in advanced_funcs:
-            return advanced_funcs[name]
-
-        raise AttributeError(
-            f"'{self.__class__.__name__}' object has no attribute '{name}'"
-        )
+        utility = self._get_utility_functions()
+        if name in utility:
+            return utility[name]
+        advanced = self._get_advanced_functions()
+        if name in advanced:
+            return advanced[name]
+        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")

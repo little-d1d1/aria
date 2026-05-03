@@ -319,6 +319,18 @@ class SrkZ3:
             array_expr = self._z3_of_expr(expr.array)
             index_expr = self._z3_of_expr(expr.index)
             return z3.Select(array_expr, index_expr)
+        elif isinstance(expr, Store):
+            # Array store: store(array, index, value)
+            array_expr = self._z3_of_expr(expr.array)
+            index_expr = self._z3_of_expr(expr.index)
+            value_expr = self._z3_of_expr(expr.value)
+            return z3.Store(array_expr, index_expr, value_expr)
+        elif isinstance(expr, Ite):
+            # If-then-else expression
+            cond_z3 = self.z3_of_formula(expr.condition)
+            then_z3 = self._z3_of_expr(expr.then_branch)
+            else_z3 = self._z3_of_expr(expr.else_branch)
+            return z3.If(cond_z3, then_z3, else_z3)
         elif isinstance(expr, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq)):
             # These are formula expressions - convert using z3_of_formula
             return self.z3_of_formula(expr)
@@ -344,12 +356,19 @@ class SrkZ3:
                 symbol_name = (
                     str(expr.symbol) if hasattr(expr.symbol, "__str__") else ""
                 )
+                args_z3 = [self._z3_of_expr(arg) for arg in expr.args]
                 if "add" in symbol_name.lower() or "+" in symbol_name:
-                    args_z3 = [self._z3_of_expr(arg) for arg in expr.args]
                     return z3.Arithmetic.mk_add(self.z3_ctx, args_z3)
                 elif "mul" in symbol_name.lower() or "*" in symbol_name:
-                    args_z3 = [self._z3_of_expr(arg) for arg in expr.args]
                     return z3.Arithmetic.mk_mul(self.z3_ctx, args_z3)
+                elif "sub" in symbol_name.lower() or "-" in symbol_name:
+                    return z3.Arithmetic.mk_sub(self.z3_ctx, args_z3)
+                elif "div" in symbol_name.lower() or "/" in symbol_name:
+                    if len(args_z3) == 2:
+                        return z3.Arithmetic.mk_div(self.z3_ctx, args_z3[0], args_z3[1])
+                elif "mod" in symbol_name.lower() or "%" in symbol_name:
+                    if len(args_z3) == 2:
+                        return z3.Arithmetic.mk_mod(self.z3_ctx, args_z3[0], args_z3[1])
                 elif "and" in symbol_name.lower():
                     args_z3 = [self.z3_of_formula(arg) for arg in expr.args]
                     return z3.Boolean.mk_and(self.z3_ctx, args_z3)
@@ -359,7 +378,6 @@ class SrkZ3:
                 else:
                     # Default to function application
                     decl = self.decl_of_symbol(expr.symbol)
-                    args_z3 = [self._z3_of_expr(arg) for arg in expr.args]
                     return z3.Expr.mk_app(self.z3_ctx, decl, args_z3)
         else:
             # Try to provide more helpful error messages

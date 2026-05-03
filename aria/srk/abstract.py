@@ -329,6 +329,19 @@ class AffineDomain:
         # For now, just combine them
         return AffineDomain(all_relations)
 
+    def meet(self, other: AffineDomain) -> AffineDomain:
+        """Meet two affine domains (union of relations)."""
+        # For affine relations, meet is union
+        # Find common relations
+        common_relations = []
+        for rel1 in self.relations:
+            for rel2 in other.relations:
+                if rel1 == rel2:
+                    common_relations.append(rel1)
+                    break
+
+        return AffineDomain(common_relations)
+
     def project(self, symbols: Set[Symbol]) -> AffineDomain:
         """Project onto a subset of symbols."""
         projected_relations = []

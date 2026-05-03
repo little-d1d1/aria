@@ -283,8 +283,49 @@ Examples:
     def cmd_affine_hull(self, constraints: List[str]) -> None:
         """Compute affine hull of constraints."""
         print(f"Computing affine hull of {len(constraints)} constraints")
-        # Simplified implementation
-        print("Affine hull computation not fully implemented")
+
+        # Parse constraints into a formula
+        formula_parts = []
+        symbols = set()
+        for constraint_str in constraints:
+            # Simple parsing for x >= c, x <= c, etc.
+            constraint_str = constraint_str.strip()
+            if ">=" in constraint_str:
+                parts = constraint_str.split(">=")
+                if len(parts) == 2:
+                    var = parts[0].strip()
+                    const = parts[1].strip()
+                    if var and const.replace('.', '').replace('-', '').isdigit():
+                        symbols.add(var)
+                        # x >= c becomes x - c >= 0
+                        formula_parts.append(f"({var} - {const}) >= 0")
+            elif "<=" in constraint_str:
+                parts = constraint_str.split("<=")
+                if len(parts) == 2:
+                    var = parts[0].strip()
+                    const = parts[1].strip()
+                    if var and const.replace('.', '').replace('-', '').isdigit():
+                        symbols.add(var)
+                        formula_parts.append(f"({var} - {const}) <= 0")
+
+        if not formula_parts:
+            print("No valid constraints parsed")
+            return
+
+        formula_str = " and ".join(formula_parts)
+        formula = self.parse_simple_formula(formula_str)
+        if formula is None:
+            print("ERROR: Could not parse constraints into formula")
+            return
+
+        symbol_list = [self.srk.mk_symbol(name, Type.REAL) for name in symbols]
+
+        try:
+            from .abstract import affine_hull
+            hull = affine_hull(self.srk, formula, symbol_list)
+            print(f"Affine hull: {hull}")
+        except Exception as e:
+            print(f"Error computing affine hull: {e}")
 
     def cmd_quantifier_elimination(self, formula_str: str) -> None:
         """Eliminate quantifiers from formula."""

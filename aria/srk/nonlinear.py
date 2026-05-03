@@ -657,9 +657,18 @@ class NonlinearOperations:
 
         # Purify to extract nonlinear terms
         try:
+            from .quantifier import _contains_quantifier
+            if _contains_quantifier(uninterp_phi):
+                # Cannot purify formulas with quantifiers
+                return formula
             lin_phi, nonlinear = srkSimplify.purify(uninterp_phi)
-        except:
-            # Purify not implemented, return original
+        except ValueError as e:
+            # Purify failed (e.g., free variables), return original
+            logf(f"linearize: purify failed with {e}, returning original formula", level="warn")
+            return formula
+        except Exception as e:
+            # Other errors, return original
+            logf(f"linearize: purify unexpected error {e}, returning original formula", level="warn")
             return formula
 
         if not nonlinear or len(nonlinear) == 0:

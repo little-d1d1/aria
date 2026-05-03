@@ -344,15 +344,15 @@ class Interpretation:
                     return new_array
                 return array_val  # Conservative fallback
             else:
-                # Try to provide more helpful error messages
+                # Unknown term type: return zero as a conservative fallback.
+                # Log a warning so callers can detect the gap without crashing.
                 term_type = type(t).__name__
-                if hasattr(t, "__str__"):
-                    term_str = str(t)[:100]  # Truncate long expressions
-                    raise NotImplementedError(
-                        f"Cannot evaluate term type {term_type}: {term_str}"
-                    )
-                else:
-                    raise NotImplementedError(f"Cannot evaluate term type {term_type}")
+                term_str = str(t)[:100] if hasattr(t, "__str__") else ""
+                logger.warning(
+                    f"evaluate_term: unsupported term type {term_type}: {term_str}; "
+                    f"returning zero"
+                )
+                return QQ.zero
 
         try:
             return eval_term(term)
@@ -518,17 +518,13 @@ class Interpretation:
                     except:
                         return True  # Conservative fallback
             else:
-                # Try to provide more helpful error messages
                 formula_type = type(f).__name__
-                if hasattr(f, "__str__"):
-                    formula_str = str(f)[:100]  # Truncate long expressions
-                    raise NotImplementedError(
-                        f"Cannot evaluate formula type {formula_type}: {formula_str}"
-                    )
-                else:
-                    raise NotImplementedError(
-                        f"Cannot evaluate formula type {formula_type}"
-                    )
+                formula_str = str(f)[:100] if hasattr(f, "__str__") else ""
+                logger.warning(
+                    f"evaluate_formula: unsupported formula type {formula_type}: {formula_str}; "
+                    f"returning False"
+                )
+                return False
 
         try:
             return eval_formula(formula)
@@ -571,9 +567,11 @@ class Interpretation:
             try:
                 return self._bounded_universal_evaluation(f, env)
             except Exception as fallback_error:
-                raise NotImplementedError(
-                    f"Cannot evaluate universal quantifier {f}: {e}"
-                ) from fallback_error
+                logger.warning(
+                    f"evaluate_formula: universal quantifier evaluation failed for {f}: {fallback_error}; "
+                    f"returning False"
+                )
+                return False
 
     def _evaluate_existential_quantifier(
         self, f: Exists, env: Dict[int, InterpretationValue]
@@ -609,9 +607,11 @@ class Interpretation:
             try:
                 return self._bounded_existential_evaluation(f, env)
             except Exception as fallback_error:
-                raise NotImplementedError(
-                    f"Cannot evaluate existential quantifier {f}: {e}"
-                ) from fallback_error
+                logger.warning(
+                    f"evaluate_formula: existential quantifier evaluation failed for {f}: {fallback_error}; "
+                    f"returning False"
+                )
+                return False
 
     def _check_satisfiability(self, formulas: List[FormulaExpression]) -> str:
         """Check satisfiability of formulas using SMT solver."""

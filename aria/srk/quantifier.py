@@ -41,6 +41,205 @@ def pivot(term: Any, symbol: Any) -> Tuple[Any, Any]:
 QuantifierPrefix = List[Tuple[str, Any]]  # [('Forall'|'Exists', symbol), ...]
 
 
+# ---------------------------------------------------------------------------
+# Model-access helpers (work with both Interpretation and SMTModel objects)
+# ---------------------------------------------------------------------------
+
+def _model_real(model: Any, symbol: Any) -> Fraction:
+    """Get the real value of a symbol from either SMTModel or Interpretation."""
+    if hasattr(model, "real"):
+        return Fraction(model.real(symbol))
+    val = model.get_value(symbol)
+    if val is None:
+        raise KeyError(f"No value for {symbol}")
+    return Fraction(val)
+
+
+def _model_bool(model: Any, symbol: Any) -> bool:
+    """Get the bool value of a symbol from either SMTModel or Interpretation."""
+    if hasattr(model, "bool"):
+        return model.bool(symbol)
+    val = model.get_value(symbol)
+    if isinstance(val, bool):
+        return val
+    return bool(val)
+
+
+# ---------------------------------------------------------------------------
+# Module-level linear-term evaluation (handles Python's const_dim = 0)
+# ---------------------------------------------------------------------------
+
+def _evaluate_linterm(srk: Any, model_fn: Callable[[Any], Fraction], term: Any) -> Fraction:
+    """Evaluate a linear term using a symbol -> value function.
+
+    Dimension 0 is the constant term (coefficient * 1).  Dimensions > 0
+    correspond to symbols whose id is (dim - 1).
+    """
+    from .linear import const_dim as _const_dim
+
+    total = Fraction(0)
+    for dim, coeff in term.entries.items():
+        coeff = Fraction(coeff)
+        if dim == _const_dim:
+            total += coeff
+        else:
+            sym_id = int(dim) - 1
+            sym = getattr(srk, "_symbols", {}).get(sym_id)
+            if sym is not None:
+                total += coeff * Fraction(model_fn(sym))
+            else:
+                raise ValueError(f"No symbol for dimension {dim}")
+    return total
+
+
+# ---------------------------------------------------------------------------
+# select_term dispatching by type
+# ---------------------------------------------------------------------------
+
+def _select_term(srk: Any, model: Any, x: Any, atoms: List[Any]) -> Any:
+    """Select a Skeleton move for quantified variable *x* based on its type."""
+    from .syntax import typ_symbol, Type
+
+    typ = typ_symbol(x)
+    if typ == Type.INT:
+        return Skeleton.MInt(select_int_term(srk, model, x, atoms))
+    elif typ == Type.REAL:
+        return Skeleton.MReal(select_real_term(srk, model, x, atoms))
+    elif typ == Type.BOOL:
+        return Skeleton.MBool(_model_bool(model, x))
+    else:
+        raise ValueError(f"Unsupported type {typ} for quantified variable {x}")
+
+
+def _select_implicant(srk: Any, model: Any, formula: Any) -> Optional[List[Any]]:
+    """Select an implicant, working with both SMTModel and Interpretation."""
+    from .interpretation import select_implicant as _interp_select, Interpretation
+    from .interpretation import InterpretationValue
+    from .syntax import And, Or, Not, Eq, Lt, Leq, TrueExpr, FalseExpr, Ite, Const, Add, Mul
+    from .smt import _numeric_symbol_value
+
+    # If already an Interpretation, use it directly
+    if isinstance(model, Interpretation):
+        implicant = _interp_select(model, formula)
+        if implicant is not None:
+            return specialize_floor_cube(srk, model, implicant)
+        return None
+
+    # For SMTModel: evaluate with fallback for numeric constants
+    def _eval_const(c: Const) -> Optional[Fraction]:
+        """Evaluate a Const that may encode a numeric literal."""
+        info = _numeric_symbol_value(c.symbol)
+        if info is not None:
+            val, is_int = info
+            return val
+        val = model.get_value(c.symbol)
+        if val is not None:
+            return Fraction(val)
+        return None
+
+    def _eval_term(t) -> Optional[Fraction]:
+        if isinstance(t, Const):
+            return _eval_const(t)
+        if isinstance(t, Add):
+            total = Fraction(0)
+            for a in t.args:
+                v = _eval_term(a)
+                if v is None:
+                    return None
+                total += v
+            return total
+        if isinstance(t, Mul):
+            prod = Fraction(1)
+            for a in t.args:
+                v = _eval_term(a)
+                if v is None:
+                    return None
+                prod *= v
+            return prod
+        # Fallback
+        try:
+            return Fraction(model.evaluate_expression(t))
+        except Exception:
+            return None
+
+    def _eval(f) -> bool:
+        try:
+            if isinstance(f, TrueExpr):
+                return True
+            if isinstance(f, FalseExpr):
+                return False
+            if isinstance(f, (Eq, Lt, Leq)):
+                lv = _eval_term(f.left)
+                rv = _eval_term(f.right)
+                if lv is None or rv is None:
+                    return bool(model.evaluate_expression(f))
+                if isinstance(f, Eq):
+                    return lv == rv
+                if isinstance(f, Lt):
+                    return lv < rv
+                if isinstance(f, Leq):
+                    return lv <= rv
+            if isinstance(f, Not):
+                return not _eval(f.arg)
+            if isinstance(f, And):
+                return all(_eval(a) for a in f.args)
+            if isinstance(f, Or):
+                return any(_eval(a) for a in f.args)
+            return bool(model.evaluate_expression(f))
+        except Exception:
+            return False
+
+    def _extract(f):
+        if isinstance(f, (Eq, Lt, Leq)):
+            return [f] if _eval(f) else []
+        if isinstance(f, And):
+            result = []
+            for arg in f.args:
+                result.extend(_extract(arg))
+            return result
+        if isinstance(f, Or):
+            for arg in f.args:
+                if _eval(arg):
+                    return _extract(arg)
+            return []
+        if isinstance(f, Not):
+            if isinstance(f.arg, (Eq, Lt, Leq)):
+                return [f] if _eval(f) else []
+            return _extract(f.arg)
+        if isinstance(f, (TrueExpr, FalseExpr)):
+            return [f] if _eval(f) else []
+        if isinstance(f, Ite):
+            return _extract(f.then_branch) if _eval(f.condition) else _extract(f.else_branch)
+        return [f] if _eval(f) else []
+
+    eval_result = _eval(formula)
+    if not eval_result:
+        # Model may be incomplete — return None to signal failure
+        return None
+
+    implicant = _extract(formula)
+
+    # If extraction produced nothing (e.g. due to incomplete model),
+    # fall back to the formula itself as a degenerate implicant.
+    if not implicant:
+        implicant = [formula]
+
+    # Try to specialize floor terms if we have an Interpretation-compatible model
+    try:
+        bindings = {}
+        for sym, val in getattr(model, "interpretations", {}).items():
+            if isinstance(val, bool):
+                bindings[sym] = InterpretationValue(val)
+            elif isinstance(val, (int, float, Fraction)):
+                bindings[sym] = InterpretationValue(Fraction(val))
+        if bindings:
+            interp = Interpretation(srk, bindings=bindings)
+            return specialize_floor_cube(srk, interp, implicant)
+    except Exception:
+        pass
+    return implicant if implicant else None
+
+
 class QuantifierType(Enum):
     """Quantifier types."""
 
@@ -243,7 +442,6 @@ def select_real_term(srk: Any, interp: Any, x: Any, atoms: List[Any]) -> Any:
         Linear term for x
     """
     from .linear import QQVector, linterm_of, evaluate_linterm
-    from .interpretation import real as get_real
 
     # Get the value of x in the model
     try:
@@ -581,6 +779,68 @@ def select_int_term(srk: Any, interp: Any, x: Any, atoms: List[Any]) -> IntVirtu
 
     except EqualIntTerm as e:
         return e.vt
+
+
+def specialize_floor_cube(srk: Any, model: Any, cube: List[Any]) -> List[Any]:
+    """Eliminate floor/mod terms from implicant atoms.
+
+    Given an interpretation *model* and a conjunctive cube such that
+    *model* |= cube, return a new cube in which floor and mod sub-terms
+    have been replaced by concrete values (plus added divisibility
+    constraints).
+    """
+    from .syntax import rewrite, destruct, mk_sub, mk_real, mk_eq, mk_mod, mk_floor
+    from .linear import linterm_of, of_linterm, QQVector, const_dim
+
+    div_constraints: List[Any] = []
+
+    def _add_div_constraint(divisor: int, term_expr: Any) -> None:
+        div_constraints.append(
+            mk_eq(
+                srk,
+                mk_mod(srk, term_expr, mk_real(srk, Fraction(divisor))),
+                mk_real(srk, Fraction(0)),
+            )
+        )
+
+    def _replace(expr: Any) -> Any:
+        match = destruct(expr)
+        if not match:
+            return expr
+
+        if match[0] == "Unop" and match[1] == "Floor":
+            t = match[2]
+            v = linterm_of(srk, t)
+            divisor = common_denominator(v)
+            qq_divisor = Fraction(divisor)
+            dividend = of_linterm(srk, QQVector.scalar_mul(qq_divisor, v))
+            remainder = Fraction(model.evaluate_term(dividend)) % qq_divisor
+            dividend_prime = mk_sub(srk, dividend, mk_real(srk, remainder))
+            replacement_vec = QQVector.add_term(
+                Fraction(-remainder) / qq_divisor, const_dim, v
+            )
+            replacement = of_linterm(srk, replacement_vec)
+            _add_div_constraint(divisor, dividend_prime)
+            return replacement
+
+        if match[0] == "Binop" and match[1] == "Mod":
+            t, m_expr = match[2], match[3]
+            try:
+                m_val = Fraction(m_expr) if not isinstance(m_expr, (int, float, Fraction)) else Fraction(m_expr)
+            except Exception:
+                try:
+                    m_val = Fraction(model.evaluate_term(m_expr))
+                except Exception:
+                    return expr
+            replacement = mk_real(srk, Fraction(model.evaluate_term(t)) % m_val)
+            m_zz = int(m_val)
+            _add_div_constraint(m_zz, mk_sub(srk, t, replacement))
+            return replacement
+
+        return expr
+
+    cube_prime = [rewrite(srk, _replace, atom) for atom in cube]
+    return div_constraints + cube_prime
 
 
 def mbp_virtual_term(srk: Any, interp: Any, x: Any, atoms: List[Any]) -> VirtualTerm:
@@ -1003,22 +1263,27 @@ def mbp(srk: Any, exists: Callable[[Any], bool], phi: Any, dnf: bool = False) ->
 
 
 def simsat(srk: Any, phi: Any) -> str:
-    """
-    Simultaneous satisfiability check using game-based approach.
+    """Satisfiability via strategy improvement (ported from OCaml)."""
+    from .syntax import symbols as _symbols
 
-    This is a simplified version of the full simsat algorithm.
+    all_syms = _symbols(phi)
+    # Filter out numeric literal constants (they are not quantified variables)
+    constants = {s for s in all_syms if not _is_numeric_literal(s)}
 
-    Args:
-        srk: Context
-        phi: Formula to check
+    qf_pre, psi = normalize(srk, phi)
+    # Prepend free constants as existential quantifiers
+    qf_pre = [("Exists", k) for k in constants] + qf_pre
 
-    Returns:
-        'Sat', 'Unsat', or 'Unknown'
-    """
-    if _contains_quantifier(phi):
-        qf_pre, psi = normalize(srk, phi)
-    else:
-        qf_pre, psi = [], phi
+    # Fast path: quantifier-free formulas — just check SAT directly
+    if not qf_pre:
+        from .smt import is_sat as _is_sat, SMTResult
+        r = _is_sat(srk, psi)
+        if r == SMTResult.SAT:
+            return "Sat"
+        if r == SMTResult.UNSAT:
+            return "Unsat"
+        return "Unknown"
+
     return simsat_core(srk, qf_pre, psi)
 
 
@@ -1055,17 +1320,28 @@ def qe_mbp(srk: Any, phi: Any) -> Any:
 
 
 def easy_sat(srk: Any, phi: Any) -> str:
-    """
-    Easy satisfiability check (single-round game).
+    """Easy satisfiability check (single-round game, ported from OCaml)."""
+    from .syntax import symbols as _symbols
 
-    Args:
-        srk: Context
-        phi: Formula to check
+    constants = {s for s in _symbols(phi) if not _is_numeric_literal(s)}
+    qf_pre, psi = normalize(srk, phi)
+    qf_pre = [("Exists", k) for k in constants] + qf_pre
 
-    Returns:
-        'Sat', 'Unsat', or 'Unknown'
-    """
-    return simsat(srk, phi)
+    select_term_fn = lambda model, x, atoms: _select_term(srk, model, x, atoms)
+
+    init = CSS.initialize_pair(select_term_fn, srk, qf_pre, psi)
+    if init == "Unsat":
+        return "Unsat"
+    if init == "Unknown":
+        return "Unknown"
+    _, (sat_ctx, _) = init
+    # Single round: check if SAT wins
+    res = CSS.get_counter_strategy(select_term_fn, sat_ctx)
+    if res == "Unsat":
+        return "Sat"
+    if res == "Unknown":
+        return "Unknown"
+    return "Unknown"
 
 
 # Helper functions for Presburger arithmetic
@@ -1112,44 +1388,114 @@ def simplify_atom(srk: Any, op: str, s: Any, t: Any) -> Tuple[str, ...]:
     """
     Simplify an arithmetic atom.
 
-    Args:
-        srk: Context
-        op: Operation ('Eq', 'Leq', 'Lt')
-        s: Left term
-        t: Right term
-
     Returns:
         ('CompareZero', op, term) or ('Divides', divisor, term) or ('NotDivides', divisor, term)
     """
-    from .linear import linterm_of
-    from .syntax import mk_sub, destruct
+    from .linear import linterm_of, QQVector
+    from .syntax import mk_sub, mk_add, mk_real, mk_neg, destruct
+    from fractions import Fraction
 
-    # Convert to form: s - t op 0
-    diff = mk_sub(srk, s, t)
+    def _zz_linterm(expr):
+        """Scale a linterm so all coefficients are integral, return (multiplier, term)."""
+        qq_lt = linterm_of(srk, expr)
+        multiplier = 1
+        for _, coeff in qq_lt.entries.items():
+            den = Fraction(coeff).denominator
+            from math import lcm as _lcm
+            multiplier = _lcm(multiplier, den)
+        return multiplier, QQVector.scalar_mul(Fraction(multiplier), qq_lt)
 
+    zero = mk_real(srk, Fraction(0))
+
+    # Normalise to s' op 0 where s' = simplify(s - t) for Lt on ints: s+1 <= 0
+    if op == "Lt":
+        s_norm = mk_add(srk, [mk_sub(srk, s, t), mk_real(srk, Fraction(1))])
+        op_norm = "Leq"
+    else:
+        s_norm = mk_sub(srk, s, t)
+        op_norm = op
+
+    # Try to simplify to a linear term
     try:
-        term = linterm_of(srk, diff)
+        from .srkSimplify import simplify_term
+        s_norm = simplify_term(srk, s_norm)
+    except Exception:
+        pass
 
-        # Check for modulo operations (divisibility constraints)
-        match = destruct(diff)
+    match = destruct(s_norm)
 
-        if match and match[0] == "Binop" and match[1] == "Mod":
-            # Divisibility constraint
-            dividend, modulus = match[2:]
+    if match and match[0] == "Binop" and match[1] == "Mod":
+        dividend, modulus = match[2:]
+        try:
+            mod_val = int(modulus)
+            mult, lt = _zz_linterm(dividend)
+            return ("Divides", mult * mod_val, lt)
+        except Exception:
+            pass
 
+    # Check for Unop(Neg, Binop(Mod, ...))  → NotDivides (or trivial for Leq)
+    if match and match[0] == "Unop" and match[1] == "Neg":
+        inner = match[2]
+        inner_match = destruct(inner)
+        if inner_match and inner_match[0] == "Binop" and inner_match[1] == "Mod":
+            if op_norm == "Leq":
+                return ("CompareZero", "Leq", QQVector())  # trivial: -mod <= 0
+            dividend, modulus = inner_match[2:]
             try:
                 mod_val = int(modulus)
-                term = linterm_of(srk, dividend)
-
-                if op == "Eq" or op == "Leq":
-                    return ("Divides", mod_val, term)
-                else:
-                    return ("NotDivides", mod_val, term)
-            except:
+                mult, lt = _zz_linterm(dividend)
+                return ("Divides", mult * mod_val, lt)
+            except Exception:
                 pass
 
-        return ("CompareZero", op, term)
+    # Check for Add[k; Binop(Mod, ...)] or Add[Binop(Mod, ...); k] with k < 0
+    if match and match[0] == "Add" and len(match[1]) == 2:
+        args = match[1]
+        for i, j in [(0, 1), (1, 0)]:
+            a_match = destruct(args[i])
+            if a_match and a_match[0] == "Real":
+                k = a_match[1]
+                b_match = destruct(args[j])
+                if (
+                    b_match
+                    and b_match[0] == "Binop"
+                    and b_match[1] == "Mod"
+                    and k < 0
+                    and op_norm == "Eq"
+                ):
+                    dividend, modulus = b_match[2:]
+                    try:
+                        mod_val = int(modulus)
+                        mult, lt = _zz_linterm(dividend)
+                        if mult == 1 and abs(k) < mod_val:
+                            lt = QQVector.add_term(k, const_dim, lt)
+                            return ("Divides", mod_val, lt)
+                    except Exception:
+                        pass
 
+    # Check for Add[Real(1); Unop(Neg, z)] → NotDivides if z is Mod
+    if match and match[0] == "Add" and len(match[1]) == 2:
+        args = match[1]
+        for i, j in [(0, 1), (1, 0)]:
+            a_match = destruct(args[i])
+            if a_match and a_match[0] == "Real" and a_match[1] == 1:
+                z_match = destruct(args[j])
+                if z_match and z_match[0] == "Unop" and z_match[1] == "Neg":
+                    inner = z_match[2]
+                    inner_match = destruct(inner)
+                    if inner_match and inner_match[0] == "Binop" and inner_match[1] == "Mod":
+                        dividend, modulus = inner_match[2:]
+                        try:
+                            mod_val = int(modulus)
+                            mult, lt = _zz_linterm(dividend)
+                            return ("NotDivides", mult * mod_val, lt)
+                        except Exception:
+                            pass
+
+    # Default: linear comparison
+    try:
+        term = linterm_of(srk, s_norm)
+        return ("CompareZero", op_norm, term)
     except Exception:
         return ("CompareZero", op, None)
 
@@ -1644,8 +1990,14 @@ __all__ = [
     "mbp_virtual_term",
     "virtual_substitution",
     "simsat",
+    "simsat_forward",
+    "simsat_core",
     "easy_sat",
     "qe_mbp",
+    "maximize",
+    "maximize_feasible",
+    "winning_strategy",
+    "check_strategy",
     "mk_divides",
     "simplify_atom",
     "is_presburger_atom",
@@ -1655,12 +2007,15 @@ __all__ = [
     "cover_virtual_substitution",
     "select_real_term",
     "select_int_term",
+    "specialize_floor_cube",
     "VirtualTerm",
     "IntVirtualTerm",
     "CoverVirtualTerm",
     "QuantifierType",
     "QuantifierEngine",
     "StrategyImprovementSolver",
+    "Skeleton",
+    "CSS",
 ]
 
 # -------------------------
@@ -1685,7 +2040,11 @@ def term_of_int_virtual_term(srk: Any, vt: IntVirtualTerm) -> Any:
 
 
 class Skeleton:
-    """Strategy skeleton for game-theoretic reasoning (simplified)."""
+    """Strategy skeleton for game-theoretic reasoning (ported from OCaml)."""
+
+    class RedundantPath(Exception):
+        """Raised when a path already exists in the skeleton."""
+        pass
 
     @dataclass(frozen=True)
     class MInt:
@@ -1703,7 +2062,7 @@ class Skeleton:
     class SForall:
         symbol: Any
         skolem: Any
-        subtree: Any  # Skeleton node
+        subtree: Any
 
     @dataclass
     class SExists:
@@ -1713,26 +2072,176 @@ class Skeleton:
     class SEmpty:
         pass
 
+    # ------------------------------------------------------------------
+    # Move helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def evaluate_move(srk: Any, model_fn: Callable[[Any], Fraction], move: Any) -> Fraction:
+        """Evaluate a move under a symbol→value function."""
+        if isinstance(move, Skeleton.MReal):
+            return _evaluate_linterm(srk, model_fn, move.term)
+        elif isinstance(move, Skeleton.MInt):
+            vt = move.vt
+            term_val = _evaluate_linterm(srk, model_fn, vt.term)
+            tv = int(term_val)
+            return Fraction((tv // vt.divisor) + vt.offset)
+        elif isinstance(move, Skeleton.MBool):
+            return Fraction(1) if move.value else Fraction(0)
+        raise ValueError(f"Unknown move type: {type(move)}")
+
+    @staticmethod
+    def const_of_move(move: Any) -> Optional[Fraction]:
+        """Extract a constant value from a move, or None."""
+        if isinstance(move, Skeleton.MReal):
+            entries = move.term.entries
+            if not entries:
+                return Fraction(0)
+            if len(entries) == 1 and const_dim in entries:
+                return Fraction(entries[const_dim])
+            return None
+        elif isinstance(move, Skeleton.MInt):
+            vt = move.vt
+            if vt.divisor == 1:
+                return Skeleton.const_of_move(Skeleton.MReal(vt.term))
+            return None
+        elif isinstance(move, Skeleton.MBool):
+            return Fraction(1) if move.value else Fraction(0)
+        return None
+
+    @staticmethod
+    def _moves_equal(a: Any, b: Any) -> bool:
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, Skeleton.MReal):
+            return a.term.entries == b.term.entries
+        if isinstance(a, Skeleton.MInt):
+            return (a.vt.term.entries == b.vt.term.entries
+                    and a.vt.divisor == b.vt.divisor
+                    and a.vt.offset == b.vt.offset)
+        if isinstance(a, Skeleton.MBool):
+            return a.value == b.value
+        return False
+
+    # ------------------------------------------------------------------
+    # Substitution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def substitute(srk: Any, x: Any, move: Any, phi: Any) -> Any:
+        from .syntax import of_linterm, mk_const, substitute_const, mk_true, mk_false
+
+        if isinstance(move, Skeleton.MReal):
+            replacement = of_linterm(srk, move.term)
+        elif isinstance(move, Skeleton.MInt):
+            replacement = term_of_int_virtual_term(srk, move.vt)
+        elif isinstance(move, Skeleton.MBool):
+            replacement = mk_true(srk) if move.value else mk_false(srk)
+        else:
+            return phi
+        return substitute_const(srk, lambda p: replacement if p == x else mk_const(srk, p), phi)
+
+    @staticmethod
+    def substitute_implicant(srk: Any, interp: Any, x: Any, move: Any, implicant: List[Any]) -> List[Any]:
+        """Substitute a move into implicant atoms, adding divisibility constraints."""
+        from .syntax import substitute_const, mk_const
+
+        def _is_true(phi):
+            from .syntax import destruct
+            m = destruct(phi)
+            return m is not None and m[0] == "Tru"
+
+        if isinstance(move, Skeleton.MInt):
+            vt = move.vt
+            model_fn = lambda sym: _model_real(interp, sym)
+            try:
+                term_val = _evaluate_linterm(srk, model_fn, vt.term)
+            except (KeyError, ValueError, TypeError):
+                # Model incomplete — skip divisibility constraint, just substitute
+                result = [Skeleton.substitute(srk, x, move, a) for a in implicant]
+                return [a for a in result if not _is_true(a)]
+            term_val_zz = int(term_val)
+            # fdiv_r: remainder with floor division
+            remainder = term_val_zz % vt.divisor
+            if remainder != 0 and term_val_zz < 0:
+                remainder -= vt.divisor
+            numerator = QQVector.add_term(Fraction(-remainder), const_dim, vt.term)
+            replacement_vec = QQVector.add_term(
+                Fraction(vt.offset), const_dim,
+                QQVector.scalar_mul(Fraction(1, vt.divisor), numerator),
+            )
+            replacement = of_linterm(srk, replacement_vec)
+            subst_fn = lambda p: replacement if p == x else mk_const(srk, p)
+            div_constraint = mk_divides(srk, vt.divisor, numerator)
+            result = [substitute_const(srk, subst_fn, a) for a in implicant]
+            result = [a for a in result if not _is_true(a)]
+            if not _is_true(div_constraint):
+                result.append(div_constraint)
+            return result
+        else:
+            result = [Skeleton.substitute(srk, x, move, a) for a in implicant]
+            return [a for a in result if not _is_true(a)]
+
+    # ------------------------------------------------------------------
+    # Structure queries
+    # ------------------------------------------------------------------
+
     @staticmethod
     def empty():
         return Skeleton.SEmpty()
 
     @staticmethod
-    def mk_path(srk: Any, path: List[Any]) -> Any:
-        """Create skeleton from path: entries are (`Forall symbol) or (`Exists (symbol, move))."""
-        from .syntax import mk_symbol, typ_symbol
+    def nb_paths(skeleton: Any) -> int:
+        if isinstance(skeleton, Skeleton.SEmpty):
+            return 1
+        if isinstance(skeleton, Skeleton.SForall):
+            return Skeleton.nb_paths(skeleton.subtree)
+        if isinstance(skeleton, Skeleton.SExists):
+            return sum(Skeleton.nb_paths(sub) for _, sub in skeleton.moves)
+        return 0
 
+    @staticmethod
+    def size(skeleton: Any) -> int:
+        if isinstance(skeleton, Skeleton.SEmpty):
+            return 0
+        if isinstance(skeleton, Skeleton.SForall):
+            return 1 + Skeleton.size(skeleton.subtree)
+        if isinstance(skeleton, Skeleton.SExists):
+            return 1 + sum(Skeleton.size(sub) for _, sub in skeleton.moves)
+        return 0
+
+    @staticmethod
+    def paths(skeleton: Any) -> List[List[Any]]:
+        if isinstance(skeleton, Skeleton.SEmpty):
+            return [[]]
+        if isinstance(skeleton, Skeleton.SForall):
+            return [[("Forall", skeleton.symbol)] + p for p in Skeleton.paths(skeleton.subtree)]
+        if isinstance(skeleton, Skeleton.SExists):
+            result = []
+            for move, subtree in skeleton.moves:
+                for sub_path in Skeleton.paths(subtree):
+                    result.append([("Exists", (skeleton.symbol, move))] + sub_path)
+            return result
+        return [[]]
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def mk_path(srk: Any, path: List[Any]) -> Any:
+        from .syntax import mk_symbol, typ_symbol
         node: Any = Skeleton.SEmpty()
         for entry in reversed(path):
-            if isinstance(entry, tuple) and len(entry) == 2 and entry[0] == "Forall":
+            if entry[0] == "Forall":
                 k = entry[1]
-                sk = mk_symbol(srk, name=str(k), typ=typ_symbol(srk, k))
+                sk = mk_symbol(srk, name=str(k) + "_sk", typ=typ_symbol(k))
                 node = Skeleton.SForall(k, sk, node)
-            elif isinstance(entry, tuple) and len(entry) == 2 and entry[0] == "Exists":
+            elif entry[0] == "Exists":
                 k, move = entry[1]
                 node = Skeleton.SExists(k, [(move, node)])
             else:
-                raise ValueError("Invalid path entry")
+                raise ValueError(f"Invalid path entry: {entry}")
         return node
 
     @staticmethod
@@ -1740,55 +2249,63 @@ class Skeleton:
         if isinstance(skeleton, Skeleton.SEmpty):
             return Skeleton.mk_path(srk, path)
         if not path:
-            return skeleton
-        head, *tail = path
+            raise Skeleton.RedundantPath()
+        head = path[0]
+        tail = path[1:]
         if isinstance(skeleton, Skeleton.SForall):
-            tag, k = head
-            assert tag == "Forall" and k == skeleton.symbol
+            assert head[0] == "Forall" and head[1] == skeleton.symbol
             skeleton.subtree = Skeleton.add_path(srk, tail, skeleton.subtree)
             return skeleton
         if isinstance(skeleton, Skeleton.SExists):
-            tag, (k, move) = head
-            assert tag == "Exists" and k == skeleton.symbol
+            assert head[0] == "Exists" and head[1][0] == skeleton.symbol
+            move = head[1][1]
             for i, (mv, sub) in enumerate(skeleton.moves):
-                if mv == move:
+                if Skeleton._moves_equal(mv, move):
                     skeleton.moves[i] = (mv, Skeleton.add_path(srk, tail, sub))
                     return skeleton
-            # new move branch
             skeleton.moves.append((move, Skeleton.mk_path(srk, tail)))
             return skeleton
-        return skeleton
+        raise ValueError(f"Unexpected skeleton type: {type(skeleton)}")
+
+    # ------------------------------------------------------------------
+    # Winning formulas
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def substitute(srk: Any, x: Any, move: Any, phi: Any) -> Any:
-        from .syntax import of_linterm, mk_const, substitute_const
+    def path_winning_formula(srk: Any, path: List[Any], skeleton: Any, phi: Any) -> Any:
+        from .syntax import mk_const, substitute_const
 
-        if isinstance(move, Skeleton.MReal):
-            replacement = of_linterm(srk, move.term)
-        elif isinstance(move, Skeleton.MInt):
-            replacement = term_of_int_virtual_term(srk, move.vt)
-        elif isinstance(move, Skeleton.MBool):
-            from .syntax import mk_true, mk_false
+        def _go(path, sk):
+            if not path and isinstance(sk, Skeleton.SEmpty):
+                return phi
+            head, tail = path[0], path[1:]
+            if head[0] == "Forall":
+                k = head[1]
+                assert isinstance(sk, Skeleton.SForall) and k == sk.symbol
+                sk_const = mk_const(srk, sk.skolem)
+                sub = _go(tail, sk.subtree)
+                return substitute_const(srk, lambda s: sk_const if s == k else mk_const(srk, s), sub)
+            if head[0] == "Exists":
+                k, move = head[1]
+                assert isinstance(sk, Skeleton.SExists) and k == sk.symbol
+                for mv, sub in sk.moves:
+                    if Skeleton._moves_equal(mv, move):
+                        return Skeleton.substitute(srk, k, move, _go(tail, sub))
+                raise ValueError("Move not found in skeleton")
+            raise ValueError(f"Invalid path entry: {head}")
 
-            replacement = mk_true() if move.value else mk_false()
-        else:
-            return phi
-        return substitute_const({x: replacement}, phi)
+        return _go(path, skeleton)
 
     @staticmethod
     def winning_formula(srk: Any, skeleton: Any, phi: Any) -> Any:
-        from .syntax import mk_const, mk_or
+        from .syntax import mk_const, mk_or, substitute_const
 
         if isinstance(skeleton, Skeleton.SEmpty):
             return phi
         if isinstance(skeleton, Skeleton.SForall):
-            # Replace quantified symbol with its skolem in the subtree
-            from .syntax import substitute_const
-
-            replaced = substitute_const(
-                {skeleton.symbol: mk_const(srk, skeleton.skolem)}, phi
-            )
-            return Skeleton.winning_formula(srk, skeleton.subtree, replaced)
+            sk_const = mk_const(srk, skeleton.skolem)
+            sub = Skeleton.winning_formula(srk, skeleton.subtree, phi)
+            return substitute_const(srk, lambda s: sk_const if s == skeleton.symbol else mk_const(srk, s), sub)
         if isinstance(skeleton, Skeleton.SExists):
             disjuncts = []
             for move, subtree in skeleton.moves:
@@ -1799,7 +2316,7 @@ class Skeleton:
 
 
 class CSS:
-    """Counter-strategy synthesis (simplified)."""
+    """Counter-strategy synthesis (ported from OCaml)."""
 
     @dataclass
     class Ctx:
@@ -1810,125 +2327,259 @@ class CSS:
         solver: Any
 
     @staticmethod
-    def make_ctx(srk: Any, formula: Any, skeleton: Any) -> "CSS.Ctx":
+    def make_ctx(srk: Any, formula: Any, not_formula: Any, skeleton: Any) -> "CSS.Ctx":
         from .smt import mk_solver, Solver
         from .syntax import mk_not
 
         solver = mk_solver(srk)
-        not_formula = mk_not(srk, formula)
-        # Block current winning formula
         win = Skeleton.winning_formula(srk, skeleton, formula)
         Solver.add(solver, [mk_not(srk, win)])
-        return CSS.Ctx(
-            srk=srk,
-            formula=formula,
-            not_formula=not_formula,
-            skeleton=skeleton,
-            solver=solver,
-        )
+        return CSS.Ctx(srk=srk, formula=formula, not_formula=not_formula,
+                        skeleton=skeleton, solver=solver)
+
+    @staticmethod
+    def reset(ctx: "CSS.Ctx") -> None:
+        from .smt import Solver
+        Solver.reset(ctx.solver)
+        ctx.skeleton = Skeleton.SEmpty()
 
     @staticmethod
     def add_path(ctx: "CSS.Ctx", path: List[Any]) -> None:
         from .smt import Solver
         from .syntax import mk_not
-
-        ctx.skeleton = Skeleton.add_path(ctx.srk, path, ctx.skeleton)
-        win = Skeleton.winning_formula(ctx.srk, ctx.skeleton, ctx.formula)
-        Solver.add(ctx.solver, [mk_not(ctx.srk, win)])
+        try:
+            ctx.skeleton = Skeleton.add_path(ctx.srk, path, ctx.skeleton)
+            win = Skeleton.path_winning_formula(ctx.srk, path, ctx.skeleton, ctx.formula)
+            Solver.add(ctx.solver, [mk_not(ctx.srk, win)])
+        except Skeleton.RedundantPath:
+            pass
 
     @staticmethod
-    def get_counter_strategy(ctx: "CSS.Ctx") -> Union[str, List[List[Any]]]:
+    def get_counter_strategy(select_term_fn: Callable, ctx: "CSS.Ctx",
+                              parameters: Any = None) -> Union[str, List[List[Any]]]:
+        """Check if the winning formula is valid; if not, synthesise counter-paths."""
         from .smt import Solver
-        from .interpretation import select_implicant
-        from .syntax import symbols, typ_symbol
-        from .linear import const_linterm
+        from .interpretation import Interpretation
+        from .syntax import mk_const
 
         model = Solver.get_model(ctx.solver)
-        if model is None or model == "Unsat":
+        if model is None:
             return "Unsat"
-        if model == "Unknown":
+        # SMTModel returns None when UNSAT; for unknown we check differently
+        if isinstance(model, str) and model == "Unknown":
             return "Unknown"
 
-        # Get implicant from the model
-        implicant = select_implicant(model, ctx.not_formula)
+        srk = ctx.srk
+
+        if parameters is None:
+            try:
+                parameters = Interpretation(srk)
+            except Exception:
+                parameters = None
+
+        def _counter_strategy(path_model: Any, skeleton: Any):
+            """Traverse skeleton, building counter-paths."""
+            if isinstance(skeleton, Skeleton.SEmpty):
+                # Leaf: select implicant of the negated formula
+                implicant = _select_implicant(srk, path_model, ctx.not_formula)
+                if implicant is None:
+                    return (None, [])
+                return (implicant, [[]])
+
+            if isinstance(skeleton, Skeleton.SForall):
+                # Add Skolem constant's value to path_model
+                try:
+                    sk_val = _model_real(model, skeleton.skolem)
+                    if isinstance(path_model, Interpretation):
+                        path_model = path_model.add_real(skeleton.symbol, sk_val)
+                except Exception:
+                    pass
+                # Recurse into subtree
+                counter_phi, counter_paths = _counter_strategy(path_model, skeleton.subtree)
+                if counter_phi is None:
+                    return (None, [])
+                # Select a move for the universally quantified variable
+                move = select_term_fn(path_model, skeleton.symbol, counter_phi)
+                # Substitute move into implicant
+                counter_phi = Skeleton.substitute_implicant(
+                    srk, path_model, skeleton.symbol, move, counter_phi
+                )
+                counter_paths = [[("Exists", (skeleton.symbol, move))] + p for p in counter_paths]
+                return (counter_phi, counter_paths)
+
+            if isinstance(skeleton, Skeleton.SExists):
+                all_counter_phis = []
+                all_paths = []
+                for move, subtree in skeleton.moves:
+                    # Extend path_model with this move's evaluation
+                    pm = path_model
+                    try:
+                        if isinstance(move, Skeleton.MBool):
+                            if isinstance(pm, Interpretation):
+                                pm = pm.add_bool(skeleton.symbol, move.value)
+                        else:
+                            mv = Skeleton.evaluate_move(srk, lambda sym: _model_real(pm, sym), move)
+                            if isinstance(pm, Interpretation):
+                                pm = pm.add_real(skeleton.symbol, mv)
+                    except Exception:
+                        pass
+                    counter_phi, counter_paths = _counter_strategy(pm, subtree)
+                    if counter_phi is None:
+                        continue
+                    counter_phi = Skeleton.substitute_implicant(
+                        srk, pm, skeleton.symbol, move, counter_phi
+                    )
+                    counter_paths = [[("Forall", skeleton.symbol)] + p for p in counter_paths]
+                    all_counter_phis.append(counter_phi)
+                    all_paths.extend(counter_paths)
+                if not all_counter_phis:
+                    return (None, [])
+                # Combine implicants (conjunction)
+                combined = all_counter_phis[0] if len(all_counter_phis) == 1 else all_counter_phis
+                return (combined, all_paths)
+
+            return (None, [])
+
+        _, counter_paths = _counter_strategy(parameters, ctx.skeleton)
+        if counter_paths:
+            return counter_paths
+        return "Unknown"
+
+    @staticmethod
+    def initialize_pair(select_term_fn: Callable, srk: Any,
+                         qf_pre: List[Tuple[str, Any]], phi: Any):
+        """Build initial SAT/UNSAT skeleton pair with warmup improvement."""
+        from .smt import is_sat as _is_sat, get_model as _get_model, SMTResult
+        from .smt import mk_solver, Solver
+        from .syntax import mk_not, mk_const
+        from .interpretation import Interpretation
+
+        # 1. Get a model of the matrix
+        sat_result = _is_sat(srk, phi)
+        if sat_result == SMTResult.UNSAT:
+            return "Unsat"
+        if sat_result == SMTResult.UNKNOWN:
+            return "Unknown"
+
+        phi_model = _get_model(phi, srk)
+        if phi_model is None:
+            return "Unknown"
+
+        # 2. Select implicant and build initial paths
+        implicant = _select_implicant(srk, phi_model, phi)
         if implicant is None:
             return "Unknown"
 
-        # Build counter-strategy by traversing the skeleton and selecting moves
-        def build_counter_path(skeleton, path_so_far):
-            if isinstance(skeleton, Skeleton.SEmpty):
-                return [path_so_far]
-            elif isinstance(skeleton, Skeleton.SForall):
-                # For universal nodes, we need to find a move that beats the current strategy
-                # This is a simplified version - in the full implementation, we'd use
-                # the model to determine what value to assign to the universal variable
-                try:
-                    # Use the model's value for this universal variable
-                    if typ_symbol(ctx.srk, skeleton.symbol) == "TyReal":
-                        val = model.real(skeleton.symbol)
-                        move = Skeleton.MReal(const_linterm(val))
-                    elif typ_symbol(ctx.srk, skeleton.symbol) == "TyInt":
-                        val = int(model.real(skeleton.symbol))
-                        move = Skeleton.MInt(IntVirtualTerm(const_linterm(val), 1, 0))
-                    elif typ_symbol(ctx.srk, skeleton.symbol) == "TyBool":
-                        val = model.bool(skeleton.symbol)
-                        move = Skeleton.MBool(val)
-                    else:
-                        return []
+        sat_path: List[Any] = []
+        unsat_path: List[Any] = []
+        atoms = list(implicant)
 
-                    return build_counter_path(
-                        skeleton.subtree, path_so_far + [("Forall", skeleton.symbol)]
-                    )
-                except Exception:
-                    return []
-            elif isinstance(skeleton, Skeleton.SExists):
-                # For existential nodes, we need to find a move that works
-                # against all possible responses from the universal player
-                counter_paths = []
-                for move, subtree in skeleton.moves:
-                    # Check if this move works in the current model
-                    try:
-                        if isinstance(move, Skeleton.MReal):
-                            # Verify the move is consistent with the model
-                            val = model.real(skeleton.symbol)
-                            if (
-                                abs(val - move.term.get(0, 0)) < 1e-10
-                            ):  # Rough equality check
-                                sub_paths = build_counter_path(
-                                    subtree,
-                                    path_so_far + [("Exists", (skeleton.symbol, move))],
-                                )
-                                counter_paths.extend(sub_paths)
-                        elif isinstance(move, Skeleton.MInt):
-                            val = int(model.real(skeleton.symbol))
-                            if val == move.vt.offset:  # Simplified check
-                                sub_paths = build_counter_path(
-                                    subtree,
-                                    path_so_far + [("Exists", (skeleton.symbol, move))],
-                                )
-                                counter_paths.extend(sub_paths)
-                        elif isinstance(move, Skeleton.MBool):
-                            val = model.bool(skeleton.symbol)
-                            if val == move.value:
-                                sub_paths = build_counter_path(
-                                    subtree,
-                                    path_so_far + [("Exists", (skeleton.symbol, move))],
-                                )
-                                counter_paths.extend(sub_paths)
-                    except Exception:
-                        continue
-
-                return counter_paths
+        for qt, x in reversed(qf_pre):
+            try:
+                move = select_term_fn(phi_model, x, atoms)
+            except Exception:
+                # Fallback: use a default zero move
+                from .syntax import typ_symbol, Type
+                typ = typ_symbol(x)
+                if typ == Type.INT:
+                    move = Skeleton.MInt(IntVirtualTerm(QQVector(), 1, 0))
+                elif typ == Type.BOOL:
+                    move = Skeleton.MBool(True)
+                else:
+                    move = Skeleton.MReal(QQVector())
+            if qt == "Exists":
+                sat_path.insert(0, ("Exists", (x, move)))
+                unsat_path.insert(0, ("Forall", x))
             else:
-                return []
+                sat_path.insert(0, ("Forall", x))
+                unsat_path.insert(0, ("Exists", (x, move)))
+            atoms = Skeleton.substitute_implicant(srk, phi_model, x, move, atoms)
 
-        # Start building counter-paths from the root
-        counter_paths = build_counter_path(ctx.skeleton, [])
+        # 3. Create contexts
+        not_phi = mk_not(srk, phi)
 
-        if counter_paths:
-            return counter_paths
-        else:
-            return "Unknown"
+        sat_skeleton = Skeleton.mk_path(srk, sat_path)
+        unsat_skeleton = Skeleton.mk_path(srk, unsat_path)
+
+        sat_win = Skeleton.winning_formula(srk, sat_skeleton, phi)
+        unsat_win = Skeleton.winning_formula(srk, unsat_skeleton, not_phi)
+
+        sat_solver = mk_solver(srk)
+        Solver.add(sat_solver, [mk_not(srk, sat_win)])
+
+        unsat_solver = mk_solver(srk)
+        Solver.add(unsat_solver, [mk_not(srk, unsat_win)])
+
+        sat_ctx = CSS.Ctx(srk=srk, formula=phi, not_formula=not_phi,
+                           skeleton=sat_skeleton, solver=sat_solver)
+        unsat_ctx = CSS.Ctx(srk=srk, formula=not_phi, not_formula=phi,
+                             skeleton=unsat_skeleton, solver=unsat_solver)
+
+        # 4. Warmup improvement loop
+        max_improve = 2
+        seen_skeletons: set = set()
+
+        for _round in range(max_improve):
+            res = CSS.get_counter_strategy(select_term_fn, sat_ctx)
+            if res == "Unsat":
+                return "Sat", (sat_ctx, unsat_ctx)
+            if res == "Unknown":
+                return "Unknown"
+            if isinstance(res, list) and len(res) == 1:
+                path = res[0]
+                sk_key = str(path)
+                if sk_key in seen_skeletons:
+                    break
+                seen_skeletons.add(sk_key)
+                # Reset unsat context and add the counter-path
+                CSS.reset(unsat_ctx)
+                CSS.add_path(unsat_ctx, path)
+                # Check if unsat wins
+                res2 = CSS.get_counter_strategy(select_term_fn, unsat_ctx)
+                if res2 == "Unsat":
+                    return "Unsat"
+                if res2 == "Unknown":
+                    return "Unknown"
+                if isinstance(res2, list):
+                    CSS.reset(sat_ctx)
+                    for p in res2:
+                        CSS.add_path(sat_ctx, p)
+            else:
+                break
+
+        return "Sat", (sat_ctx, unsat_ctx)
+
+    @staticmethod
+    def is_sat(select_term_fn: Callable, sat_ctx: "CSS.Ctx", unsat_ctx: "CSS.Ctx") -> str:
+        """Main strategy improvement game loop."""
+        old_paths = -1
+
+        def _check_sat():
+            nonlocal old_paths
+            paths = Skeleton.nb_paths(sat_ctx.skeleton)
+            assert paths > old_paths, f"No progress: {paths} <= {old_paths}"
+            old_paths = paths
+            res = CSS.get_counter_strategy(select_term_fn, sat_ctx)
+            if res == "Unsat":
+                return "Sat"
+            if res == "Unknown":
+                return "Unknown"
+            # Add counter-paths to unsat skeleton
+            for p in res:
+                CSS.add_path(unsat_ctx, p)
+            return _check_unsat()
+
+        def _check_unsat():
+            res = CSS.get_counter_strategy(select_term_fn, unsat_ctx)
+            if res == "Unsat":
+                return "Unsat"
+            if res == "Unknown":
+                return "Unknown"
+            for p in res:
+                CSS.add_path(sat_ctx, p)
+            return _check_sat()
+
+        return _check_sat()
 
 
 def _quantifier_symbol_name(symbol: Any) -> str:
@@ -2100,15 +2751,59 @@ def _z3_number_to_fraction(value: Any) -> Optional[Fraction]:
 
 
 def simsat_core(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> str:
-    """Game-theoretic satisfiability core for supported linear arithmetic."""
-    return _bounded_z3_simsat(srk, qf_pre, phi)
+    """Game-theoretic satisfiability core using strategy improvement.
+
+    Tries the full alternating strategy-improvement game first.
+    Falls back to Z3 direct check when the game-theoretic path fails
+    (e.g. incomplete SMT model).
+    """
+    select_term_fn = lambda model, x, atoms: _select_term(srk, model, x, atoms)
+
+    try:
+        init = CSS.initialize_pair(select_term_fn, srk, qf_pre, phi)
+    except Exception:
+        init = "Unknown"
+
+    if init == "Unsat":
+        return "Unsat"
+    if init == "Unknown":
+        # Fall back to Z3 for supported linear fragments
+        return _bounded_z3_simsat(srk, qf_pre, phi)
+    # init == ("Sat", (sat_ctx, unsat_ctx))
+    _, (sat_ctx, unsat_ctx) = init
+    CSS.reset(unsat_ctx)
+    try:
+        result = CSS.is_sat(select_term_fn, sat_ctx, unsat_ctx)
+    except Exception:
+        result = "Unknown"
+    if result == "Unknown":
+        return _bounded_z3_simsat(srk, qf_pre, phi)
+    return result
 
 
 def simsat_forward(srk: Any, phi: Any) -> str:
-    """Forward version of simsat (simplified)."""
-    from .smt import is_sat
+    """Forward version of simsat (simplified: delegates to simsat_core)."""
+    from .syntax import symbols as _symbols, mk_not
 
-    return is_sat(srk, phi)
+    constants = {s for s in _symbols(phi) if not _is_numeric_literal(s)}
+
+    qf_pre, psi = normalize(srk, phi)
+    qf_pre = [("Exists", k) for k in constants] + qf_pre
+
+    # If the prefix leads with existential, negate and swap
+    negate = False
+    if qf_pre and qf_pre[0][0] == "Exists":
+        psi = normalize(srk, mk_not(srk, phi))[1]
+        qf_pre = [("Forall" if qt == "Exists" else "Exists", x) for qt, x in qf_pre]
+        negate = True
+
+    result = simsat_core(srk, qf_pre, psi)
+    if negate:
+        if result == "Sat":
+            return "Unsat"
+        if result == "Unsat":
+            return "Sat"
+    return result
 
 
 def maximize_feasible(srk: Any, phi: Any, t: Any) -> Any:
@@ -2212,18 +2907,27 @@ def maximize(srk: Any, phi: Any, t: Any) -> Any:
 
 
 def extract_strategy(srk: Any, skeleton: Any, phi: Any) -> Any:
-    """Extract a strategy (not implemented, returns empty strategy)."""
-    return {"strategy": []}
+    """Extract a strategy from a skeleton. Returns the skeleton itself as the strategy."""
+    return skeleton
 
 
 def winning_strategy(srk: Any, qf_pre: List[Tuple[str, Any]], phi: Any) -> Any:
-    res = simsat_core(srk, qf_pre, phi)
-    if res == "Sat":
-        return ("Sat", extract_strategy(srk, Skeleton.empty(), phi))
-    if res == "Unsat":
-        from .syntax import mk_not
+    """Compute a winning SAT/UNSAT strategy for a formula in prenex form."""
+    select_term_fn = lambda model, x, atoms: _select_term(srk, model, x, atoms)
 
-        return ("Unsat", extract_strategy(srk, Skeleton.empty(), mk_not(srk, phi)))
+    init = CSS.initialize_pair(select_term_fn, srk, qf_pre, phi)
+    if init == "Unsat":
+        return "Unsat"
+    if init == "Unknown":
+        return "Unknown"
+    _, (sat_ctx, unsat_ctx) = init
+    CSS.reset(unsat_ctx)
+    result = CSS.is_sat(select_term_fn, sat_ctx, unsat_ctx)
+    if result == "Sat":
+        return ("Sat", extract_strategy(srk, sat_ctx.skeleton, phi))
+    if result == "Unsat":
+        from .syntax import mk_not
+        return ("Unsat", extract_strategy(srk, unsat_ctx.skeleton, mk_not(srk, phi)))
     return "Unknown"
 
 

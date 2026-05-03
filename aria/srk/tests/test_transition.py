@@ -67,14 +67,27 @@ class TestTransition(unittest.TestCase):
             mk_and(self.ctx, [first.guard, mk_lt(one, mk_const(self.n))]),
         )
 
-    def test_nondeterministic_choice_drops_conflicting_assignments(self):
-        """Choice should not merge conflicting updates into a deterministic one."""
+    def test_nondeterministic_choice_creates_skolem_choice(self):
+        """Choice creates a Skolem choice variable for conflicting assignments.
+
+        Matching the OCaml implementation, ``add`` introduces a fresh choice
+        symbol ``phi_x`` and builds an OR-guard with equalities so that the
+        combined transform uses ``ite(phi_x, left_val, right_val)``.
+        """
         left = Transition.assign(self.ctx, self.x, mk_real(self.ctx, QQ.zero()))
         right = Transition.assign(self.ctx, self.x, mk_real(self.ctx, QQ.one()))
 
         choice = left.add(right)
 
-        self.assertNotIn(self.x, choice.transform)
+        # The variable should still be in the transform (not dropped).
+        self.assertIn(self.x, choice.transform)
+        # The guard should be a disjunction (uses Unicode or ASCII).
+        guard_str = str(choice.guard)
+        self.assertTrue(
+            "Or" in guard_str or "or" in guard_str.lower()
+            or "∨" in guard_str or "||" in guard_str,
+            f"Expected disjunction in guard, got: {guard_str}",
+        )
 
 
 class TestTransitionSystem(unittest.TestCase):

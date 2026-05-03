@@ -29,7 +29,7 @@ from aria.srk.syntax import (
 )
 from aria.srk.syntax import mk_symbol, mk_const, mk_real, mk_add, mk_mul, mk_neg, mk_div
 from aria.srk.syntax import mk_eq, mk_leq, mk_lt, mk_geq, mk_and, mk_or, mk_not, mk_ite
-from aria.srk.syntax import mk_forall, mk_exists
+from aria.srk.syntax import mk_forall, mk_exists, mk_pow as _syntax_mk_pow
 from aria.srk.qQ import QQ
 
 # Global context for parsing
@@ -53,18 +53,33 @@ def mk_gt(left: ArithExpression, right: ArithExpression) -> FormulaExpression:
 
 
 def mk_pow(base: ArithExpression, exponent: ArithExpression) -> ArithExpression:
-    """Create a power expression (base^exponent)."""
-    # For now, implement as multiplication for simple cases
-    # A full implementation would need proper power handling
-    if isinstance(exponent, Const) and hasattr(exponent, "value"):
-        if exponent.value == 2:
-            return mk_mul([base, base])
-        elif exponent.value == 1:
-            return base
-        elif exponent.value == 0:
-            return mk_real(1.0)
-    # For complex cases, use multiplication as approximation
-    return mk_mul([base, base])  # Simplified implementation
+    """Create a power expression (base^exponent).
+
+    Delegates to syntax.mk_pow which creates an uninterpreted App node,
+    faithfully representing arbitrary symbolic exponentiation.  Constant
+    folding for the trivial cases (exp == 0, 1, 2) is kept as an
+    optimisation but the general case is no longer silently approximated.
+    """
+    from aria.srk.syntax import Const, Type
+    from fractions import Fraction
+
+    # Constant-fold the trivial cases for efficiency.
+    if isinstance(exponent, Const):
+        name = getattr(exponent.symbol, "name", None)
+        if name is not None:
+            try:
+                exp_val = Fraction(name)
+                if exp_val == 0:
+                    return mk_real(Fraction(1))
+                if exp_val == 1:
+                    return base
+                if exp_val == 2:
+                    return mk_mul([base, base])
+            except (ValueError, ZeroDivisionError):
+                pass
+
+    # General case: uninterpreted pow(base, exponent) App node.
+    return _syntax_mk_pow(base, exponent)
 
 
 # Precedence and associativity (from lowest to highest)

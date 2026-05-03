@@ -937,44 +937,140 @@ class Polynomial:
         return Polynomial({Monomial((0,) * self.num_variables()): gcd_val})
 
     def resultant(self, other: "Polynomial") -> Fraction:
-        """Compute the resultant of two polynomials using SymPy if available.
+        """Compute the resultant of two univariate polynomials.
+
+        Uses SymPy when available; falls back to the Sylvester-matrix
+        determinant computed with exact rational arithmetic.
 
         Args:
-            other: Another polynomial.
+            other: Another polynomial (must be univariate).
 
         Returns:
             The resultant as a Fraction.
-
-        Raises:
-            ImportError: If SymPy is not available.
         """
-        if not HAS_SYMPY:
-            raise ImportError("SymPy is not available")
+        if HAS_SYMPY:
+            try:
+                sympy_self = self.to_sympy()
+                sympy_other = other.to_sympy()
+                return Fraction(resultant(sympy_self, sympy_other))
+            except Exception:
+                pass  # fall through to pure-Python path
 
-        try:
-            sympy_self = self.to_sympy()
-            sympy_other = other.to_sympy()
-            return Fraction(resultant(sympy_self, sympy_other))
-        except Exception:
-            raise NotImplementedError("Resultant computation failed")
+        # Pure-Python fallback: Sylvester matrix determinant.
+        # Works for univariate polynomials only.
+        coeffs_f = self._univariate_coeffs()
+        coeffs_g = other._univariate_coeffs()
+        if coeffs_f is None or coeffs_g is None:
+            raise ValueError(
+                "resultant fallback only supports univariate polynomials"
+            )
+        return self._sylvester_resultant(coeffs_f, coeffs_g)
+
+    def _univariate_coeffs(self) -> Optional[List[Fraction]]:
+        """Return dense coefficient list [a0, a1, ..., an] for a univariate poly.
+
+        Returns None if the polynomial is not univariate.
+        """
+        if not self.terms:
+            return [Fraction(0)]
+        # All monomials must have exactly one variable.
+        for mono in self.terms:
+            if len(mono.exponents) > 1:
+                return None
+        deg = max(
+            (mono.exponents[0] if mono.exponents else 0) for mono in self.terms
+        )
+        coeffs = [Fraction(0)] * (deg + 1)
+        for mono, coeff in self.terms.items():
+            exp = mono.exponents[0] if mono.exponents else 0
+            coeffs[exp] = Fraction(coeff)
+        return coeffs
+
+    @staticmethod
+    def _sylvester_resultant(f: List[Fraction], g: List[Fraction]) -> Fraction:
+        """Compute resultant via the Sylvester matrix determinant.
+
+        f and g are dense coefficient lists [a0, a1, ..., an] (ascending degree).
+        """
+        # Strip leading zeros.
+        while len(f) > 1 and f[-1] == 0:
+            f = f[:-1]
+        while len(g) > 1 and g[-1] == 0:
+            g = g[:-1]
+        m = len(f) - 1  # deg(f)
+        n = len(g) - 1  # deg(g)
+        if m == 0 and n == 0:
+            return Fraction(1)
+        size = m + n
+        # Build Sylvester matrix (size x size).
+        mat = [[Fraction(0)] * size for _ in range(size)]
+        # n rows for f (shifted 0..n-1)
+        for i in range(n):
+            for j, c in enumerate(reversed(f)):
+                mat[i][i + j] = c
+        # m rows for g (shifted 0..m-1)
+        for i in range(m):
+            for j, c in enumerate(reversed(g)):
+                mat[n + i][i + j] = c
+        return Polynomial._det_rational(mat)
+
+    @staticmethod
+    def _det_rational(mat: List[List[Fraction]]) -> Fraction:
+        """Compute determinant of a rational matrix via Gaussian elimination."""
+        n = len(mat)
+        mat = [row[:] for row in mat]  # copy
+        det = Fraction(1)
+        for col in range(n):
+            # Find pivot.
+            pivot_row = None
+            for row in range(col, n):
+                if mat[row][col] != 0:
+                    pivot_row = row
+                    break
+            if pivot_row is None:
+                return Fraction(0)
+            if pivot_row != col:
+                mat[col], mat[pivot_row] = mat[pivot_row], mat[col]
+                det = -det
+            pivot = mat[col][col]
+            det *= pivot
+            for row in range(col + 1, n):
+                factor = mat[row][col] / pivot
+                for c in range(col, n):
+                    mat[row][c] -= factor * mat[col][c]
+        return det
 
     def discriminant(self) -> Fraction:
-        """Compute the discriminant of the polynomial using SymPy if available.
+        """Compute the discriminant of a univariate polynomial.
+
+        Uses SymPy when available; falls back to the resultant-based formula:
+        disc(f) = (-1)^(n*(n-1)/2) / lc(f) * res(f, f').
 
         Returns:
             The discriminant as a Fraction.
-
-        Raises:
-            ImportError: If SymPy is not available.
         """
-        if not HAS_SYMPY:
-            raise ImportError("SymPy is not available")
+        if HAS_SYMPY:
+            try:
+                sympy_poly = self.to_sympy()
+                return Fraction(discriminant(sympy_poly))
+            except Exception:
+                pass  # fall through to pure-Python path
 
-        try:
-            sympy_poly = self.to_sympy()
-            return Fraction(discriminant(sympy_poly))
-        except Exception:
-            raise NotImplementedError("Discriminant computation failed")
+        # Pure-Python fallback.
+        coeffs = self._univariate_coeffs()
+        if coeffs is None:
+            raise ValueError(
+                "discriminant fallback only supports univariate polynomials"
+            )
+        n = len(coeffs) - 1  # degree
+        if n <= 0:
+            return Fraction(1)
+        # Derivative coefficients.
+        deriv = [Fraction(i) * coeffs[i] for i in range(1, n + 1)]
+        res = self._sylvester_resultant(coeffs, deriv)
+        lc = coeffs[-1]
+        sign = Fraction((-1) ** (n * (n - 1) // 2))
+        return sign / lc * res
 
     def num_variables(self) -> int:
         """Get the number of variables in the polynomial."""

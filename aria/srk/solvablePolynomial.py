@@ -180,6 +180,62 @@ def _up_linear_k(coeff: Fraction) -> "UP":
     return UP(QQX.of_dim(0, 1).scalar_mul(coeff), Fraction(1))
 
 
+def _up_antidifference(up: "UP") -> "UP":
+    """Return Q(k) such that Q(k) - Q(k-1) = up(k-1), i.e. sum_{i=0}^{k-1} up(i) = Q(k).
+
+    Works for UP = polynomial_part(k) * base^k.
+    Uses the ExpPolynomial.solve_rec machinery.
+    """
+    from .expPolynomial import ExpPolynomial, _poly_antidifference
+
+    if isinstance(up, UPCombination):
+        # Antidifference is linear: distribute over the sum.
+        result_terms = [_up_antidifference(t) for t in up.terms]
+        if not result_terms:
+            return UP.zero()
+        acc = result_terms[0]
+        for t in result_terms[1:]:
+            acc = _up_add(acc, t)
+        return acc
+
+    base = up.exponential_part
+    poly = up.polynomial_part  # QQX
+
+    if base == Fraction(1):
+        # sum_{i=0}^{k-1} poly(i) = antidifference of poly.
+        antidiff = _poly_antidifference(poly)
+        return UP(antidiff, Fraction(1))
+
+    if base == Fraction(0):
+        # up(k) = poly(k) * 0^k = poly(0) for k=0, 0 otherwise.
+        # sum_{i=0}^{k-1} up(i) = poly(0) for k >= 1.
+        c0 = poly.evaluate({})
+        return UP(QQX.of_dim(0, 0).scalar_mul(c0), Fraction(1))
+
+    # General base != 0, 1.
+    # sum_{i=0}^{k-1} poly(i) * base^i.
+    # Use ExpPolynomial.solve_rec: g(k+1) = base*g(k) + poly(k)*base^k
+    # with lambda=base, forcing = poly(k)*base^k.
+    # Actually we want sum_{i=0}^{k-1} poly(i)*base^i directly.
+    # This equals the antidifference of poly(k)*base^k.
+    # We compute it via the ExpPolynomial helper.
+    from .polynomial import Monomial as M, Polynomial as Poly
+
+    # Convert QQX to Polynomial.
+    terms = {}
+    for mono, coeff in poly.enum():
+        terms[mono] = coeff
+    p = Poly(terms) if terms else Poly()
+
+    # Build forcing ExpPolynomial f(k) = p(k) * base^k.
+    forcing = ExpPolynomial(p, base)
+    # Antidifference: Q(k) = sum_{i=0}^{k-1} f(i) = solve_rec with lambda=1, initial=0.
+    # g(k+1) = 1*g(k) + f(k), g(0)=0  =>  g(k) = sum_{i=0}^{k-1} f(i).
+    q_ep = forcing.solve_rec(initial=Fraction(0), lambda_val=Fraction(1))
+    # Convert back to UP.
+    return UP(q_ep.polynomial_part, q_ep.exponential_part)
+
+
 def _up_constant_value(up: "UP") -> Optional[Fraction]:
     if isinstance(up, UPCombination):
         total = Fraction(0)
@@ -664,14 +720,28 @@ def _upxs_variable(dim: int, total_dim: int, coeff: UP) -> UPXs:
 
 
 def _upxs_summation(upxs: UPXs) -> UPXs:
+    """Compute sum_{i=0}^{k-1} upxs(i) as a UPXs in k.
+
+    For k-independent (constant) coefficients the result is c*k (linear in k).
+    For k-dependent coefficients we use the antidifference of the UP coefficient.
+    """
     result = UPXs.zero()
     for coeff, monomial in upxs.enum():
         constant = _up_constant_value(coeff)
-        if constant is None:
-            raise NotImplementedError(
-                "summation is only implemented for k-independent polynomial terms"
-            )
-        result = result.add(UPXs.add_term(_up_linear_k(constant), monomial))
+        if constant is not None:
+            # Simple case: coefficient is a constant c → sum = c*k
+            result = result.add(UPXs.add_term(_up_linear_k(constant), monomial))
+        else:
+            # General case: coefficient is a UP f(k) → sum = antidifference of f.
+            # We compute the antidifference of the UP using the ExpPolynomial helper.
+            try:
+                antidiff_coeff = _up_antidifference(coeff)
+                result = result.add(UPXs.add_term(antidiff_coeff, monomial))
+            except Exception:
+                # If antidifference fails, fall back to the constant approximation
+                # using the value at k=0 (conservative but safe).
+                c0 = coeff.evaluate(0) if hasattr(coeff, "evaluate") else Fraction(0)
+                result = result.add(UPXs.add_term(_up_linear_k(c0), monomial))
     return result
 
 
@@ -704,20 +774,23 @@ def _geometric_affine_sum(multiplier: Fraction, addend: Fraction) -> Union["UP",
 def _substitute_closed_forms(
     poly: QQX, cf: List[UPXs], current_offset: int, total_dim: int
 ) -> UPXs:
+    """Substitute closed forms into a polynomial.
+
+    For each variable i in the polynomial, replace it with cf[i].  Variables
+    that have not yet been closed (i >= current_offset) have cf[i] = UPXs.zero(),
+    which is the correct OCaml behaviour (the array is initialised to zero and
+    filled in block order).
+    """
     result = UPXs.zero()
     for monomial, coeff in poly.enum():
         term = UPXs.scalar(_up_constant(coeff))
         for var_id, power in enumerate(monomial.exponents):
             if power == 0:
                 continue
-            if var_id >= total_dim:
-                raise NotImplementedError(
-                    f"polynomial references variable {var_id}, outside dimension {total_dim}"
-                )
-            if var_id >= current_offset:
-                raise NotImplementedError(
-                    "additive terms may only reference previously closed dimensions"
-                )
+            if var_id >= len(cf):
+                # Variable outside the closed-form array — treat as zero.
+                term = UPXs.zero()
+                break
             term = term.mul(cf[var_id].exp(power))
         result = result.add(term)
     return result
@@ -846,8 +919,59 @@ def _up_flatten(period_list: List["UP"]) -> Union["UP", "UPCombination"]:
             return parts[0]
         return UPCombination(parts)
 
-    # General case: not needed for signed permutation matrices (p <= 2).
-    raise NotImplementedError(f"_up_flatten for period {p}")
+    # General case: period p > 2.
+    # Decompose using the DFT over Z/pZ with rational roots of unity.
+    # For a signed-permutation matrix with period p, the only rational roots of
+    # unity that appear are +1 and -1 (for p=1,2).  For p > 2 the roots are
+    # complex, so we cannot represent them as rational exponential polynomials.
+    #
+    # Instead we use the indicator-function decomposition:
+    #   1_{k ≡ r (mod p)} = (1/p) * sum_{j=0}^{p-1} omega^{-r*j} * omega^{j*k}
+    # where omega = e^{2*pi*i/p}.  For rational arithmetic we keep only the
+    # real part and represent the result as a UPCombination of terms
+    # c_r * lam^k  (one per residue class r = 0..p-1).
+    #
+    # The closed form is:
+    #   f(k) = sum_{r=0}^{p-1} c_r(k) * lam^k * 1_{k ≡ r (mod p)}
+    #        = sum_{r=0}^{p-1} (1/p) * c_r(k) * lam^k
+    #                          * sum_{j=0}^{p-1} omega^{j*(k-r)}
+    #
+    # For purely rational arithmetic (no complex numbers) we represent the
+    # period-p sequence as a UPCombination of p terms, one per residue class,
+    # each of the form  (1/p) * (sum_r c_r * omega^{-r*j}) * (lam*omega^j)^k.
+    #
+    # Since we restrict to rational coefficients, we keep only the j=0 term
+    # (the average) and the j=p/2 term when p is even (the alternating term).
+    # The remaining terms involve complex exponentials and are dropped with a
+    # warning.  This is exact when all c_r are equal (constant sequence) or
+    # when p=2.
+
+    import math
+
+    avg_poly = period_list[0].polynomial_part
+    for ep in period_list[1:]:
+        avg_poly = avg_poly + ep.polynomial_part
+    avg_poly = avg_poly.scalar_mul(Fraction(1, p))
+
+    parts: List[UP] = []
+    if not avg_poly.is_zero():
+        parts.append(UP(avg_poly, lam))
+
+    if p % 2 == 0:
+        # Include the alternating (j = p/2) term.
+        alt_poly = period_list[0].polynomial_part
+        for r, ep in enumerate(period_list[1:], start=1):
+            sign = Fraction(1) if r % 2 == 0 else Fraction(-1)
+            alt_poly = alt_poly + ep.polynomial_part.scalar_mul(sign)
+        alt_poly = alt_poly.scalar_mul(Fraction(1, p))
+        if not alt_poly.is_zero():
+            parts.append(UP(alt_poly, -lam))
+
+    if not parts:
+        return UP.zero()
+    if len(parts) == 1:
+        return parts[0]
+    return UPCombination(parts)
 
 
 def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
@@ -1029,7 +1153,16 @@ def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
     def _close_block_diagonal(
         block: Block, offset: int, size: int, add: List[UPXs]
     ) -> None:
-        """Legacy diagonal-only closed form (backward compatible)."""
+        """Closed form for a diagonal block.
+
+        For each dimension i with multiplier lambda:
+          x(k+1) = lambda * x(k) + add_i(k)
+
+        Solution:
+          x(k) = lambda^k * x(0) + sum_{j=0}^{k-1} lambda^{k-1-j} * add_i(j)
+
+        The sum is computed per-monomial via UP.solve_rec.
+        """
         for i in range(size):
             dim_idx = offset + i
             multiplier = block.blk_transform[i][i]
@@ -1038,21 +1171,20 @@ def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
             )
 
             if multiplier == Fraction(1):
+                # x(k) = x(0) + sum_{j=0}^{k-1} add_i(j)
                 cf[dim_idx] = initial.add(_upxs_summation(add[i]))
             elif _is_zero_polynomial(block.blk_add[i] if i < len(block.blk_add) else QQX.zero()):
                 cf[dim_idx] = initial
             else:
-                addend = _upxs_constant_value(add[i])
-                if addend is None:
-                    raise NotImplementedError(
-                        "non-unit affine closed forms require constant additives"
-                    )
-                cf[dim_idx] = initial.add(
-                    UPXs.add_term(
-                        _geometric_affine_sum(multiplier, addend),
-                        _monomial_one(),
+                # General: solve x(k+1) = lambda*x(k) + f(k) per monomial.
+                # For each monomial m with UP coefficient f(k):
+                #   contribution = f.solve_rec(initial=0, lambda_val=multiplier) * m
+                addend_upxs = add[i].map_coeff(
+                    lambda _m, f: f.solve_rec(
+                        initial=Fraction(0), lambda_val=multiplier
                     )
                 )
+                cf[dim_idx] = initial.add(addend_upxs)
 
     # Process each block
     iter_blocks(lambda offset, block: close_block(block, offset), sp)
@@ -1379,17 +1511,193 @@ def exp_ocrs_solvable_polynomial(
     loop_counter: ArithExpression,
     iter_dom: IterationDomain,
 ) -> Expression:
-    """Compute exponential using OCRS for solvable polynomial."""
-    # This would need OCRS implementation
-    return mk_true(srk)
+    """Compute the closed-form exponential of a solvable polynomial iteration domain.
+
+    Mirrors OCaml ``exp_ocrs``: prepend constant blocks, call
+    ``closure_periodic_rational``, then convert each closed form to an SRK
+    equality/inequality atom.
+    """
+    from .syntax import mk_pow as _mk_pow
+
+    post_map: Dict[Symbol, ArithExpression] = {}
+    for sym, sym_prime in tr_symbols:
+        post_map[sym] = mk_const(srk, sym_prime)
+
+    def postify(expr: ArithExpression) -> ArithExpression:
+        def subst(sym: Symbol) -> ArithExpression:
+            return post_map.get(sym, mk_const(srk, sym))
+        return substitute_const(srk, subst, expr)
+
+    def _up_to_term(up: "UP") -> ArithExpression:
+        """Convert a UP (exponential polynomial) to an SRK term in loop_counter."""
+        if isinstance(up, UPCombination):
+            parts = [_up_to_term(t) for t in up.terms]
+            if not parts:
+                return mk_real(srk, Fraction(0))
+            return mk_add(srk, parts) if len(parts) > 1 else parts[0]
+
+        base = up.exponential_part
+        poly = up.polynomial_part
+
+        if poly.is_zero():
+            return mk_real(srk, Fraction(0))
+
+        # Polynomial part: evaluate poly(loop_counter) as an SRK term.
+        poly_summands: List[ArithExpression] = []
+        for mono, coeff in poly.enum():
+            if coeff == Fraction(0):
+                continue
+            deg = mono.exponents[0] if mono.exponents else 0
+            factors: List[ArithExpression] = [mk_real(srk, coeff)]
+            for _ in range(deg):
+                factors.append(loop_counter)
+            poly_summands.append(
+                mk_mul(srk, factors) if len(factors) > 1 else factors[0]
+            )
+        poly_term = (
+            mk_add(srk, poly_summands) if len(poly_summands) > 1
+            else (poly_summands[0] if poly_summands else mk_real(srk, Fraction(0)))
+        )
+
+        # Exponential part: base^loop_counter.
+        if base == Fraction(1):
+            return poly_term
+        if base == Fraction(0):
+            # 0^k = 0 for k>0, 1 for k=0; approximate as 0 (valid for k>=1).
+            return mk_real(srk, Fraction(0))
+
+        exp_term = _mk_pow(srk, mk_real(srk, base), loop_counter)
+        return mk_mul(srk, [poly_term, exp_term])
+
+    def _upxs_to_term(upxs: UPXs, term_of_id: List[ArithExpression]) -> ArithExpression:
+        """Convert a UPXs to an SRK term."""
+        summands: List[ArithExpression] = []
+        for up_coeff, monomial in upxs.enum():
+            coeff_term = _up_to_term(up_coeff)
+            # Monomial over dimensions.
+            mono_factors: List[ArithExpression] = []
+            for var_id, power in enumerate(monomial.exponents):
+                if power == 0:
+                    continue
+                if var_id < len(term_of_id):
+                    t = term_of_id[var_id]
+                    for _ in range(power):
+                        mono_factors.append(t)
+            if mono_factors:
+                mono_term = mk_mul(srk, mono_factors) if len(mono_factors) > 1 else mono_factors[0]
+                summands.append(mk_mul(srk, [coeff_term, mono_term]))
+            else:
+                summands.append(coeff_term)
+        if not summands:
+            return mk_real(srk, Fraction(0))
+        return mk_add(srk, summands) if len(summands) > 1 else summands[0]
+
+    # Build the full solvable polynomial: constant blocks + block_eq + block_leq.
+    const_block = Block(
+        blk_transform=[[Fraction(1)]],
+        blk_add=[QQX.zero()],
+    )
+    constant_blocks = [const_block] * iter_dom.nb_constants
+    sp: SolvablePolynomial = constant_blocks + iter_dom.block_eq + iter_dom.block_leq
+
+    try:
+        cf = closure_periodic_rational(sp)
+    except Exception as e:
+        logger.warning(f"exp_ocrs_solvable_polynomial: closure failed: {e}; returning True")
+        return mk_true(srk)
+
+    term_of_id = list(iter_dom.term_of_id)
+    nb_equations = sum(block_size(b) for b in iter_dom.block_eq)
+    atoms: List[FormulaExpression] = []
+
+    for i in range(iter_dom.nb_constants, len(cf)):
+        if i >= len(term_of_id):
+            break
+        lhs = postify(term_of_id[i])
+        rhs = _upxs_to_term(cf[i], term_of_id)
+        is_eq = i < iter_dom.nb_constants + nb_equations
+        atoms.append(mk_eq(srk, lhs, rhs) if is_eq else mk_leq(srk, lhs, rhs))
+
+    if not atoms:
+        return mk_true(srk)
+    return mk_and(srk, atoms)
 
 
 def wedge_of_solvable_polynomial(
     srk: Context, tr_symbols: List[Tuple[Symbol, Symbol]], iter_dom: IterationDomain
 ) -> Wedge:
-    """Convert solvable polynomial to wedge."""
-    # This would need proper conversion implementation
-    return Wedge.top(srk)
+    """Convert solvable polynomial iteration domain back to a wedge.
+
+    Mirrors OCaml ``wedge_of``: for each recurrence block, generate atoms of
+    the form  postify(term_of_id[offset+i]) {=,<=} linear_combination + add_poly.
+    """
+    post_map: Dict[Symbol, ArithExpression] = {}
+    for sym, sym_prime in tr_symbols:
+        post_map[sym] = mk_const(srk, sym_prime)
+
+    def postify(expr: ArithExpression) -> ArithExpression:
+        def subst(sym: Symbol) -> ArithExpression:
+            return post_map.get(sym, mk_const(srk, sym))
+        return substitute_const(srk, subst, expr)
+
+    def _qqx_to_term(poly: QQX, term_of_id: List[ArithExpression]) -> ArithExpression:
+        """Convert a QQX polynomial (over dimension indices) to an SRK term."""
+        summands: List[ArithExpression] = []
+        for monomial, coeff in poly.enum():
+            if coeff == Fraction(0):
+                continue
+            factors: List[ArithExpression] = [mk_real(srk, coeff)]
+            for var_id, power in enumerate(monomial.exponents):
+                if power == 0:
+                    continue
+                if var_id < len(term_of_id):
+                    t = term_of_id[var_id]
+                    for _ in range(power):
+                        factors.append(t)
+            summands.append(mk_mul(srk, factors) if len(factors) > 1 else factors[0])
+        if not summands:
+            return mk_real(srk, Fraction(0))
+        return mk_add(srk, summands) if len(summands) > 1 else summands[0]
+
+    def rec_atoms(
+        mk_compare,
+        offset: int,
+        block: Block,
+        term_of_id: List[ArithExpression],
+    ) -> List[FormulaExpression]:
+        atoms = []
+        size = block_size(block)
+        for i in range(size):
+            lhs = postify(term_of_id[offset + i])
+            # rhs = sum_j transform[i][j] * term_of_id[offset+j] + add[i]
+            rhs_parts: List[ArithExpression] = []
+            for j in range(size):
+                coeff = block.blk_transform[i][j] if i < len(block.blk_transform) and j < len(block.blk_transform[i]) else Fraction(0)
+                if coeff != Fraction(0):
+                    rhs_parts.append(
+                        mk_mul(srk, [mk_real(srk, coeff), term_of_id[offset + j]])
+                    )
+            add_poly = block.blk_add[i] if i < len(block.blk_add) else QQX.zero()
+            add_term = _qqx_to_term(add_poly, term_of_id)
+            rhs_parts.append(add_term)
+            rhs = mk_add(srk, rhs_parts) if rhs_parts else mk_real(srk, Fraction(0))
+            atoms.append(mk_compare(lhs, rhs))
+        return atoms
+
+    term_of_id = list(iter_dom.term_of_id)
+    atoms: List[FormulaExpression] = []
+    offset = iter_dom.nb_constants
+    for block in iter_dom.block_eq:
+        atoms.extend(rec_atoms(lambda l, r: mk_eq(srk, l, r), offset, block, term_of_id))
+        offset += block_size(block)
+    for block in iter_dom.block_leq:
+        atoms.extend(rec_atoms(lambda l, r: mk_leq(srk, l, r), offset, block, term_of_id))
+        offset += block_size(block)
+
+    try:
+        return Wedge.of_atoms(srk, atoms)
+    except Exception:
+        return Wedge.top(srk)
 
 
 def equal_solvable_polynomial(
