@@ -697,11 +697,6 @@ def _path_realizability_constraints(
         constraints.append(syntax.mk_leq(srk, pot_terms[dst], big_m))
 
     return syntax.mk_and(srk, constraints)
-                    ),
-                )
-            )
-
-    return syntax.mk_and(srk, constraints)
 
 
 def _counter_nonnegative_constraints(

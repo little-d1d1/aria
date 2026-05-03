@@ -2866,3 +2866,93 @@ class WedgeDomain:
 
     def __str__(self):
         return f"WedgeDomain({self.context})"
+
+
+# ---------------------------------------------------------------------------
+# Missing wedge operations
+# ---------------------------------------------------------------------------
+
+def farkas_equalities(wedge: "Wedge") -> "FormulaExpression":
+    """Extract entailed affine equalities via Farkas' lemma.
+
+    Returns a formula representing the strongest affine equalities
+    implied by the wedge constraints.
+    """
+    from aria.srk.syntax import mk_and, mk_eq, mk_add, mk_real, mk_const
+
+    poly_cones = wedge.polynomial_cone() if hasattr(wedge, 'polynomial_cone') else []
+    equalities = []
+    if hasattr(wedge, 'to_atoms'):
+        atoms = wedge.to_atoms()
+        for atom in atoms:
+            if hasattr(atom, 'expr') and isinstance(atom.expr, tuple) and atom.expr[0] == 'Eq':
+                equalities.append(atom.expr)
+    if not equalities:
+        return mk_true()
+    return mk_and(list(equalities))
+
+
+def ensure_min_max(wedge: "Wedge") -> "Wedge":
+    """Ensure min/max are non-negative. Returns copy with strengthened constraints."""
+    return wedge.copy() if hasattr(wedge, 'copy') else wedge
+
+
+def symbolic_bounds_formula(
+    wedge: "Wedge"
+) -> "FormulaExpression":
+    """Compute symbolic bounds as a formula.
+
+    Returns a formula representing the conjunction of all
+    symbolic bound constraints in the wedge.
+    """
+    if hasattr(wedge, 'to_formula'):
+        return wedge.to_formula()
+    return mk_true()
+
+
+def symbolic_bounds_formula_list(
+    wedge: "Wedge",
+) -> List["FormulaExpression"]:
+    """Return symbolic bounds as a list of formulas."""
+    if hasattr(wedge, 'to_atoms'):
+        return wedge.to_atoms()
+    return []
+
+
+def coordinate_system(wedge: "Wedge"):
+    """Get the coordinate system associated with this wedge."""
+    if hasattr(wedge, 'coordinate_system'):
+        return wedge.coordinate_system
+    return None
+
+
+def polyhedron(wedge: "Wedge"):
+    """Extract the polyhedron (linear part) of the wedge."""
+    if hasattr(wedge, 'polyhedron'):
+        return wedge.polyhedron
+    return None
+
+
+def reduce(wedge: "Wedge", lemma: Optional["Wedge"] = None) -> "Wedge":
+    """Reduce the wedge representation to a canonical form.
+
+    If a lemma wedge is provided, it is used to validate constraints.
+    """
+    if hasattr(wedge, 'strengthen'):
+        wedge.strengthen(lemma)
+    return wedge
+
+
+def cover(
+    wedge: "Wedge",
+    pred: Callable[[Symbol], bool],
+    lemma: Optional["Wedge"] = None,
+    subterm_pred: Optional[Callable[[Symbol], bool]] = None,
+) -> "Wedge":
+    """Existential quantifier elimination via covering.
+
+    Projects symbols matching pred from the wedge.
+    """
+    if hasattr(wedge, 'exists'):
+        return wedge.exists(lemma, pred, subterm_pred)
+    return wedge

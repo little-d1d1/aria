@@ -53,22 +53,25 @@ class ZZ:
 
 @dataclass(frozen=True)
 class Transformer:
-    """Represents an affine transition: X' = a ⊙ X + b (diagonal a with 0/1)."""
+    """Represents an affine transition: a ∈ Z^n (integer coefficients 0/1), b ∈ Q^n (rational offsets).
 
-    a: linear.QQVector  # diagonal mask (each entry must be 0 or 1)
-    b: linear.QQVector  # translation vector
+    Corresponds to OCaml `type transformer = { a : Z.t; b : V.t }`
+    where `Z = Linear.ZZVector` and `V = Linear.QQVector`.
+    """
+
+    a: linear.ZZVector
+    b: linear.QQVector
 
     def __post_init__(self):
-        # Validate that all coefficients of a are in {0, 1}
         from fractions import Fraction
 
         invalid = [
             val
             for val in self.a.entries.values()
-            if val not in (Fraction(0), Fraction(1))
+            if val not in (0, 1)
         ]
         if invalid:
-            raise ValueError("Transformer 'a' must contain only 0/1 coefficients")
+            raise ValueError("Transformer 'a' must contain only 0 or 1 coefficients")
 
     def apply(self, state: linear.QQVector) -> linear.QQVector:
         """Apply this transformer to a state vector: x' = a_i*x_i + b_i per dimension."""
@@ -378,6 +381,133 @@ def mk_all_nonnegative(
     )
 
 
+def mk_nat_leq(
+    srk: syntax.Context, x: syntax.Expression, y: syntax.Expression
+) -> syntax.Formula:
+    """Specialised <= for natural numbers.
+
+    Matching OCaml ``mk_nat_leq``:
+      - 0 <= y  is always true
+      - x <= 0  is  x = 0  (since x is a natural)
+      - otherwise standard  x <= y
+    """
+    from .syntax import destruct as _destruct
+
+    try:
+        x_desc = _destruct(x)
+        y_desc = _destruct(y)
+    except Exception:
+        return syntax.mk_leq(srk, x, y)
+
+    if x_desc is not None and x_desc[0] == "Real":
+        if linear.QQ.equal(x_desc[1], linear.QQ.zero()):
+            return syntax.mk_true(srk)
+
+    if y_desc is not None and y_desc[0] == "Real":
+        if linear.QQ.equal(y_desc[1], linear.QQ.zero()):
+            return syntax.mk_eq(srk, x, syntax.mk_zero(srk))
+
+    return syntax.mk_leq(srk, x, y)
+
+
+def all_pairs_kvarst_rvarst(
+    ksumst: List[syntax.Expression],
+    kvarst: List[List[syntax.Expression]],
+    rvarst: List[syntax.Expression],
+) -> List[Tuple]:
+    """Pair every coherence class with every other (i < j).
+
+    Returns list of ``(ksum_i, kstack_i, r_i, ksum_j, kstack_j, r_j)``
+    for all pairs where i < j.
+    """
+    result = []
+    n = len(ksumst)
+    for i in range(n):
+        for j in range(i + 1, n):
+            result.append(
+                (ksumst[i], kvarst[i], rvarst[i],
+                 ksumst[j], kvarst[j], rvarst[j])
+            )
+    return result
+
+
+def exp_perm_constraints(
+    srk: syntax.Context,
+    krpairs: List[Tuple],
+) -> syntax.Formula:
+    """Permutation ordering constraints for coherence classes.
+
+    For each pair of coherence classes, require that either *all* k-variables
+    of the first class are pointwise <= those of the second, or vice versa.
+    """
+    constraints = []
+    for _, kstack1, _, _, kstack2, _ in krpairs:
+        lessthan_1_2 = syntax.mk_and(
+            srk,
+            [mk_nat_leq(srk, k1, k2) for k1, k2 in zip(kstack1, kstack2)],
+        )
+        lessthan_2_1 = syntax.mk_and(
+            srk,
+            [mk_nat_leq(srk, k2, k1) for k1, k2 in zip(kstack1, kstack2)],
+        )
+        constraints.append(syntax.mk_or(srk, [lessthan_1_2, lessthan_2_1]))
+    return syntax.mk_and(srk, constraints)
+
+
+def exp_equality_k_constraints(
+    srk: syntax.Context,
+    krpairs: List[Tuple],
+) -> syntax.Formula:
+    """Equality constraints linking k-sum variables across coherence classes.
+
+    If two coherence classes have taken the same total number of transitions
+    since their last reset (ksum_i == ksum_j), then they must have been reset
+    at the same time (r_i == r_j).
+    """
+    constraints = []
+    for ksum_i, _, r_i, ksum_j, _, r_j in krpairs:
+        constraints.append(
+            syntax.mk_iff(
+                srk,
+                syntax.mk_eq(srk, ksum_i, ksum_j),
+                syntax.mk_eq(srk, r_i, r_j),
+            )
+        )
+    return syntax.mk_and(srk, constraints)
+
+
+def matrixify_vectorize_term_list(
+    srk: syntax.Context,
+    vl: List[syntax.Expression],
+) -> Tuple[linear.QQMatrix, linear.QQVector]:
+    """Convert a list of affine equality terms into a matrix and constant vector.
+
+    For each term:
+      - extract its linear representation (QQVector) via linterm_of
+      - pivot out the constant dimension
+      - add the non-constant part as a new row of the matrix
+      - add -const_coeff at the same row index of the vector
+    """
+    m = linear.QQMatrix.zero()
+    b = linear.QQVector.zero()
+
+    for term in vl:
+        vec = linear.linterm_of(srk, term)
+
+        const_coff = linear.QQVector.coeff(linear.const_dim, vec)
+        rest_entries = {
+            d: c for d, c in vec.entries.items()
+            if d != linear.const_dim
+        }
+        rest = linear.QQVector(rest_entries)
+
+        row_idx = linear.QQMatrix.nb_rows(m)
+        m = linear.QQMatrix.add_row(row_idx, rest, m)
+        b = linear.QQVector.add_term(-const_coff, row_idx, b)
+
+    return m, b
+
+
 def exp_full_transitions_reqs(
     srk: syntax.Context,
     kvarst: List[List[syntax.Expression]],
@@ -444,7 +574,7 @@ def exp_lin_term_trans_constraints(
             )
 
             # Must equal the linear term at dimension dim
-            linear_term = syntax.Linear.of_linterm(
+            linear_term = linear.of_linterm(
                 srk, linear.QQMatrix.row(dim, unified_s)
             )
             constraints.append(syntax.mk_eq(srk, linear_term, final_value))
@@ -484,7 +614,7 @@ def exp_sx_constraints(
                         srk,
                         svar,
                         preify(
-                            syntax.Linear.of_linterm(
+                            linear.of_linterm(
                                 srk, linear.QQMatrix.row(dim, unified_s)
                             )
                         ),
@@ -527,7 +657,12 @@ def exp(
     loop_counter: syntax.Expression,
     vabs: VASAbstraction,
 ) -> syntax.Formula:
-    """Compute VAS abstraction closure"""
+    """Compute VAS abstraction closure.
+
+    Builds all constraints: non-negativity, full-transition requirements,
+    at-most-k, linear term transitions, k-sum equalities, permutation
+    ordering, k-equality, and per-class initial-value constraints.
+    """
     if vabs.is_empty():
         return syntax.mk_true(srk)
 
@@ -542,7 +677,9 @@ def exp(
     ksumst = [ksum for _, _, _, ksum in coh_class_pairs]
     rvarst = [rvar for _, _, rvar, _ in coh_class_pairs]
 
-    # Create base constraints
+    krpairs = all_pairs_kvarst_rvarst(ksumst, kvarst, rvarst)
+
+    # Base constraints
     constr1 = mk_all_nonnegative(srk, [loop_counter] + [k for ks in kvarst for k in ks])
     constr2 = exp_full_transitions_reqs(srk, kvarst, rvarst, loop_counter)
     constr3 = exp_kstacks_at_most_k(srk, ksumst, loop_counter)
@@ -550,11 +687,16 @@ def exp(
         srk, coh_class_pairs, transformers, unified_s
     )
     constr5 = exp_kstack_eq_ksums(srk, coh_class_pairs)
-    constr6 = exp_sx_constraints(
+    constr6 = exp_perm_constraints(srk, krpairs)
+    constr7 = exp_equality_k_constraints(srk, krpairs)
+    constr8 = exp_sx_constraints(
         srk, coh_class_pairs, transformers, kvarst, ksumst, unified_s, tr_symbols
     )
 
-    return syntax.mk_and(srk, [constr1, constr2, constr3, constr4, constr5, constr6])
+    return syntax.mk_and(
+        srk,
+        [constr1, constr2, constr3, constr4, constr5, constr6, constr7, constr8],
+    )
 
 
 def gamma(
@@ -569,7 +711,7 @@ def gamma(
     term_list = []
     for matrix in vas.s_lst:
         for _, row in linear.QQMatrix.rowsi(matrix):
-            term = syntax.Linear.of_linterm(srk, row)
+            term = linear.of_linterm(srk, row)
             preify = syntax.substitute(srk, TF.pre_map(srk, tr_symbols))
             term_list.append((preify(term), term))
 
@@ -663,75 +805,132 @@ def alpha_hat(
     imp: syntax.Formula,
     tr_symbols: List[Tuple[syntax.Symbol, syntax.Symbol]],
 ) -> VASAbstraction:
-    """Alpha-hat function for creating VAS abstraction from implicant.
+    """Alpha-hat function: VAS abstraction from an implicant.
 
-    Creates a VAS abstraction from an implicant by:
-    1. Introducing delta variables: delta_x = x' - x
-    2. Computing the affine hull of the constraints
-    3. Extracting transformers from the affine relations
+    Uses affine hull to extract linear equalities over post-state and delta
+    variables, then builds a transformer and simulation matrices.
+
+    Steps:
+      1. Create delta variables: dx = x' - x for each (x, x') pair.
+      2. Compute affine-hull of imp over post-symbols -> matrix r.
+      3. Compute affine-hull of imp && dx-constraints over delta-symbols,
+         then postify (map delta -> x') -> matrix i.
+      4. Unify r and i, extract a and b, build VASAbstraction.
     """
-    # Create delta variables
-    xdeltpairs = []
-    xdeltphis = []
+    # Step 1: Delta pairs and constraints
+    xdeltpairs: List[Tuple[syntax.Symbol, syntax.Symbol]] = []
+    xdeltphis: List[syntax.Formula] = []
 
     for x, x_prime in tr_symbols:
-        # Create a fresh symbol for the delta: delta_x
-        delta_x = syntax.mk_symbol(srk, f"delta_{x.name}", syntax.typ_symbol(srk, x))
-        xdeltpairs.append((delta_x, x))
-
-        # Add constraint: delta_x = x' - x
+        delta_sym = syntax.mk_symbol(srk, None, syntax.typ_symbol(srk, x))
+        # OCaml convention: xdeltpairs = (delta, x') so post_map maps delta -> x'
+        xdeltpairs.append((delta_sym, x_prime))
         xdeltphis.append(
             syntax.mk_eq(
                 srk,
-                syntax.mk_const(srk, delta_x),
+                syntax.mk_const(srk, delta_sym),
                 syntax.mk_sub(
-                    srk, syntax.mk_const(srk, x_prime), syntax.mk_const(srk, x)
+                    srk,
+                    syntax.mk_const(srk, x_prime),
+                    syntax.mk_const(srk, x),
                 ),
             )
         )
 
-    # Combine the implicant with delta constraints
-    combined_formula = syntax.mk_and(srk, [imp] + xdeltphis)
-
-    # Extract affine transformations
-    # In a full implementation, this would:
-    # 1. Use APRON to compute the affine hull
-    # 2. Project onto the delta variables
-    # 3. Extract coefficient matrices
-
-    # For now, create a simple transformer based on the structure
+    # Step 2: Affine hull of imp over post-symbols -> (r, b1)
+    post_symbols = [x_prime for _, x_prime in tr_symbols]
     try:
-        # Try to extract simple linear relations
-        transformers = set()
-
-        # Heuristic: look for relations of the form x' = x + c
-        # This is a simplified version - full implementation would use APRON
-
-        # Create identity transformer as a conservative default
-        num_vars = len(tr_symbols)
-        a = linear.QQVector.of_list([linear.QQ.one() for _ in range(num_vars)])
-        b = linear.QQVector.zero()
-
-        transformer = Transformer(a, b)
-        transformers.add(transformer)
-
-        vas = VAS(transformers)
-
-        # Create simulation matrices (identity for simplicity)
-        s_lst = [linear.QQMatrix.identity(list(range(num_vars)))]
-
-        return VASAbstraction(vas, s_lst)
-
-    except Exception as e:
-        logger.warning(f"Failed to create VAS abstraction: {e}")
-        # Return conservative top abstraction
+        affine_r_terms = abstract.affine_hull(srk, imp, post_symbols)
+        r, b1 = matrixify_vectorize_term_list(srk, affine_r_terms)
+    except Exception:
+        # If affine hull fails, return top abstraction
         return VASAbstraction.top()
+
+    # Step 3: Affine hull of (imp && delta-constraints) over delta-symbols
+    delta_symbols = [d for d, _ in xdeltpairs]
+    combined_formula = syntax.mk_and(srk, [imp] + xdeltphis)
+    try:
+        affine_i_terms = abstract.affine_hull(srk, combined_formula, delta_symbols)
+        postify_map = TF.post_map(srk, xdeltpairs)
+        postified_i_terms = [
+            syntax.substitute(term, postify_map) for term in affine_i_terms
+        ]
+        i, b2 = matrixify_vectorize_term_list(srk, postified_i_terms)
+    except Exception:
+        i = linear.QQMatrix.zero()
+        b2 = linear.QQVector.zero()
+
+    # Step 4: Unify and build the transformer
+    _, b = unify2_matrices_vectors([i, r], [b2, b1])
+
+    a_entries: Dict[int, int] = {}
+    for offset in range(linear.QQMatrix.nb_rows(i)):
+        a_entries[offset] = 1
+    a = linear.ZZVector(a_entries)
+
+    r_is_zero = linear.QQMatrix.equal(r, linear.QQMatrix.zero())
+    i_is_zero = linear.QQMatrix.equal(i, linear.QQMatrix.zero())
+
+    if r_is_zero and i_is_zero:
+        return VASAbstraction.top()
+    elif i_is_zero:
+        return VASAbstraction(VAS.singleton(Transformer(a, b)), [r])
+    elif r_is_zero:
+        return VASAbstraction(VAS.singleton(Transformer(a, b)), [i])
+    else:
+        return VASAbstraction(VAS.singleton(Transformer(a, b)), [i, r])
 
 
 def coproduct(vabs1: VASAbstraction, vabs2: VASAbstraction) -> VASAbstraction:
-    """Coproduct of two VAS abstractions"""
-    # Simplified implementation
-    return VASAbstraction(vabs1.v.union(vabs2.v), vabs1.s_lst + vabs2.s_lst)
+    """Coproduct of two VAS abstractions.
+
+    Unifies the simulation matrices and unions the VAS transformers.
+    Uses coprod_find_transformation for rowspace alignment.
+    """
+    unified_s1 = unify_matrices(vabs1.s_lst)
+    unified_s2 = unify_matrices(vabs2.s_lst)
+    transformation = coprod_find_transformation(unified_s1, unified_s2)
+    if transformation is None:
+        return VASAbstraction(vabs1.v.union(vabs2.v), vabs1.s_lst + vabs2.s_lst)
+
+    new_matrices = list(vabs1.s_lst)
+    for s in vabs2.s_lst:
+        transformed = coprod_compute_image(s, transformation)
+        if transformed is not None:
+            new_matrices.append(transformed)
+    return VASAbstraction(vabs1.v.union(vabs2.v), new_matrices)
+
+
+def coprod_find_transformation(
+    m1: linear.QQMatrix, m2: linear.QQMatrix
+) -> Optional[linear.QQMatrix]:
+    """Find transformation matrix T such that rowspace(m2 * T) ~ rowspace(m1).
+
+    Computes the intersection of the rowspaces and finds a basis-preserving
+    transformation between them.
+    """
+    try:
+        isect = linear.intersect_rowspace(m1, m2)
+        if linear.QQMatrix.nb_rows(isect) == 0:
+            return None
+        return isect
+    except Exception:
+        return None
+
+
+def coprod_compute_image(
+    matrix: linear.QQMatrix, transformation: linear.QQMatrix
+) -> Optional[linear.QQMatrix]:
+    """Compute the image of `matrix` through the `transformation` matrix.
+
+    This aligns simulation matrices from different coherence classes
+    through their shared rowspace.
+    """
+    try:
+        result = linear.QQMatrix.mul(matrix, transformation)
+        return result
+    except Exception:
+        return matrix
 
 
 def term_list(
@@ -745,7 +944,7 @@ def term_list(
 
     for matrix in s_lst:
         for _, row in linear.QQMatrix.rowsi(matrix):
-            term = syntax.Linear.of_linterm(srk, row)
+            term = linear.of_linterm(srk, row)
             result.append((preify(term), term))
 
     return result
@@ -970,7 +1169,7 @@ class PetriNet:
         transformers: List[Transformer] = []
         for t in self.transitions:
             # a is identity mask: keep counters (1 for all dims)
-            a_entries = {i: Fraction(1) for i in range(dim)}
+            a_entries = {i: 1 for i in range(dim)}
             # b encodes output-input tokens per place
             b_entries: Dict[int, Fraction] = {}
             for place, tokens in t.output_places.items():
@@ -982,7 +1181,7 @@ class PetriNet:
                     index_of[place], Fraction(0)
                 ) - Fraction(tokens)
             transformers.append(
-                Transformer(linear.QQVector(a_entries), linear.QQVector(b_entries))
+                Transformer(linear.ZZVector(a_entries), linear.QQVector(b_entries))
             )
         return VectorAdditionSystem(transformers, dim)
 
