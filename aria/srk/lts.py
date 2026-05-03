@@ -284,7 +284,7 @@ class PartialLinearMap:
         composed_map = self.map_matrix * other.map_matrix
 
         # Composed guard: self.guard * other.map + other.guard
-        guard_part1 = QQMatrix.rowsi(QQMatrix(self.guard) * other.map_matrix)
+        guard_part1 = (QQMatrix(self.guard) * other.map_matrix).rowsi()
         guard_part1_vecs = [vec for (_, vec) in guard_part1]
 
         composed_guard_space = QQVectorSpace.sum(
@@ -394,8 +394,8 @@ class LTSAnalysis:
                         # Pre-state or symbolic constant: goes in B
                         b_vec = QQVector.add_term(coeff, dim, b_vec)
 
-                mA = QQMatrix.add_row(row_idx, a_vec, mA)
-                mB = QQMatrix.add_row(row_idx, b_vec, mB)
+                mA = mA.add_row(row_idx, a_vec)
+                mB = mB.add_row(row_idx, b_vec)
                 row_idx += 1
 
             # Add identity constraints for symbolic constants
@@ -404,8 +404,8 @@ class LTSAnalysis:
             ]:
                 a_vec = QQVector.of_term(QQ.one(), const_sym)
                 b_vec = QQVector.of_term(QQ.one(), const_sym)
-                mA = QQMatrix.add_row(row_idx, a_vec, mA)
-                mB = QQMatrix.add_row(row_idx, b_vec, mB)
+                mA = mA.add_row(row_idx, a_vec)
+                mB = mB.add_row(row_idx, b_vec)
                 row_idx += 1
 
             return LinearTransitionSystem(mA, mB)
@@ -447,16 +447,14 @@ def max_rowspace_projection(mA: QQMatrix, mB: QQMatrix) -> List[QQVector]:
     )
 
     result = []
-    mat_rows = QQMatrix.nb_rows(mat)
+    mat_rows = mat.nb_rows()
 
     # Try to find vectors v such that there exists u with uA = vB
-    for r, _ in QQMatrix.rowsi(mB):
+    for r, _ in mB.rowsi():
         col = 2 * r + 1  # Column for v_r
 
         # Add constraint that v_r = 1
-        mat_with_constraint = QQMatrix.add_row(
-            mat_rows, QQVector.of_term(QQ.one(), col), mat
-        )
+        mat_with_constraint = mat.add_row(mat_rows, QQVector.of_term(QQ.one(), col))
 
         # Try to solve
         solution = linear_solve(
@@ -492,17 +490,17 @@ def determinize(lts: LinearTransitionSystem) -> Tuple[PartialLinearMap, QQMatrix
 
         # Account for zero rows of B
         mT_prime = mS
-        next_row = QQMatrix.nb_rows(mB)
+        next_row = mB.nb_rows()
 
-        for i in QQMatrix.row_set(mA):
-            row_b = QQMatrix.row(i, mB)
+        for i in mA.row_set():
+            row_b = mB.row(i)
             if QQVector.is_zero(row_b):
                 row_vec = QQVector.of_term(QQ.one(), i)
-                mT_prime = QQMatrix.add_row(next_row, row_vec, mT_prime)
+                mT_prime = mT_prime.add_row(next_row, row_vec)
                 next_row += 1
 
         # Check if we're done
-        if QQMatrix.nb_rows(mB) == QQMatrix.nb_rows(mS):
+        if mB.nb_rows() == mS.nb_rows():
             return (mA, mB)
         else:
             # Continue refining
@@ -513,7 +511,7 @@ def determinize(lts: LinearTransitionSystem) -> Tuple[PartialLinearMap, QQMatrix
     # Check if the system is already deterministic (unchanged by fix)
     if QQMatrix.equal(mA, lts.A) and QQMatrix.equal(mB, lts.B):
         # System is already deterministic, return identity similarity matrix
-        num_rows = QQMatrix.nb_rows(mA)
+        num_rows = mA.nb_rows()
         identity_vectors = [QQVector.of_term(QQ.one(), i) for i in range(num_rows)]
         mS = QQMatrix(identity_vectors)
         # For deterministic systems, the deterministic LTS map is the original A
@@ -537,7 +535,7 @@ def determinize(lts: LinearTransitionSystem) -> Tuple[PartialLinearMap, QQMatrix
             mT = mDB
 
     # Compute guard: basis for { g : Ax' = Bx |= gSx = 0 }
-    dims = sorted(list(set(QQMatrix.row_set(mA)) | set(QQMatrix.row_set(mB))))
+    dims = sorted(list(set(mA.row_set()) | set(mB.row_set())))
     mN = QQMatrix(nullspace(mA.transpose(), dims))
 
     mNB = mN * mB
@@ -559,14 +557,14 @@ def dlts_inverse_image(sim: QQMatrix, dlts: PartialLinearMap) -> LinearTransitio
     mA = sim
     dynamics = dlts.map() * sim
 
-    dim = QQMatrix.nb_rows(sim)
+    dim = sim.nb_rows()
     mB = dynamics
 
     # Add guard constraints as additional rows
     for i, dom_constraint in enumerate(dlts.guard_space()):
         # Transform constraint by similarity
         transformed = QQVector.vector_left_mul(dom_constraint, sim)
-        mB = QQMatrix.add_row(i + dim, transformed, mB)
+        mB = mB.add_row(i + dim, transformed)
 
     return LinearTransitionSystem(mA, mB)
 
@@ -595,7 +593,7 @@ def dlts_abstract_spectral(
         mT = PartialLinearMap.make(det_dlts.map(), dom).map()
 
         # Compute spectral decomposition
-        dims = sorted(list(QQMatrix.row_set(mS)))
+        dims = sorted(list(mS.row_set()))
         sd = spectral_decomp(mT, dims)
 
         mP = QQMatrix(sd)
@@ -603,7 +601,7 @@ def dlts_abstract_spectral(
         mPTS = (mP * det_dlts.map()) * mS
         mPDS = (mP * QQMatrix(det_dlts.guard_space())) * mS
 
-        if len(sd) == QQMatrix.nb_rows(mS):
+        if len(sd) == mS.nb_rows():
             # Spectral decomposition is complete
             map_result = divide_right(mPTS, mPS)
             if map_result is None:
@@ -618,9 +616,9 @@ def dlts_abstract_spectral(
         else:
             # Continue refining
             mB_new = mPTS
-            size = QQMatrix.nb_rows(mPS)
-            for i, row in QQMatrix.rowsi(mPDS):
-                mB_new = QQMatrix.add_row(i + size, row, mB_new)
+            size = mPS.nb_rows()
+            for i, row in mPDS.rowsi():
+                mB_new = mB_new.add_row(i + size, row)
 
             return fix(mPS, mB_new)
 
@@ -630,7 +628,7 @@ def dlts_abstract_spectral(
     mB = dlts.map()
 
     for i, row in enumerate(dlts.guard_space()):
-        mB = QQMatrix.add_row(i + dim, row, mB)
+        mB = mB.add_row(i + dim, row)
 
     return fix(mA, mB)
 

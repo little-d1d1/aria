@@ -469,9 +469,32 @@ class PolyhedronGuard:
         from .polyhedron import widen as poly_widen
 
         widened_poly = poly_widen(elem1.polyhedron, elem2.polyhedron)
-        # Use the union of transition symbols
         all_symbols = list(set(elem1.tr_symbols + elem2.tr_symbols))
         return PolyhedronGuardElement(srk, all_symbols, widened_poly)
+
+    def exp(self, srk: Context, elem: PolyhedronGuardElement, tr_symbols: List[Tuple[Symbol, Symbol]], loop_count: Any) -> FormulaExpression:
+        """Compute concretization of a polyhedron guard domain element."""
+        from .polyhedron import to_formula as poly_to_formula
+
+        return poly_to_formula(elem.polyhedron)
+
+    def equal(self, elem1: PolyhedronGuardElement, elem2: PolyhedronGuardElement) -> bool:
+        """Check equality of two polyhedron guard elements."""
+        return elem1.polyhedron == elem2.polyhedron
+
+    def precondition(self, elem: PolyhedronGuardElement) -> FormulaExpression:
+        """Get the pre-state condition of the guard (pre-map of polyhedron)."""
+        from .transitionFormula import pre_map
+
+        poly_formula = self.exp(elem.srk, elem, elem.tr_symbols, None)
+        pre_map_fn = pre_map(elem.srk, list(zip([s for s, _ in elem.tr_symbols], [s for s, _ in elem.tr_symbols])))
+        return pre_map_fn(poly_formula)
+
+    def postcondition(self, elem: PolyhedronGuardElement) -> FormulaExpression:
+        """Get the post-state condition of the guard."""
+        from .polyhedron import to_formula as poly_to_formula
+
+        return poly_to_formula(elem.polyhedron)
 
 
 class LinearGuardElement:

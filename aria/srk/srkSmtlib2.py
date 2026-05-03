@@ -239,6 +239,48 @@ class SMTLib2Parser:
                     j += 1
                 i = j - 1
 
+            # Handle hex/binary/decimal numerics
+            elif char == "#" and current == "" and i + 1 < len(text):
+                if text[i + 1].lower() == "x":
+                    j = i + 2
+                    while j < len(text) and text[j] in "0123456789abcdefABCDEF":
+                        j += 1
+                    if j > i + 2:
+                        raw = text[i + 2 : j]
+                        try:
+                            val = int(raw, 16)
+                            tokens.append(str(val))
+                            i = j - 1
+                            continue
+                        except ValueError:
+                            pass
+                elif text[i + 1].lower() == "b":
+                    j = i + 2
+                    while j < len(text) and text[j] in "01":
+                        j += 1
+                    if j > i + 2:
+                        raw = text[i + 2 : j]
+                        try:
+                            val = int(raw, 2)
+                            tokens.append(str(val))
+                            i = j - 1
+                            continue
+                        except ValueError:
+                            pass
+                current += char
+
+            # Handle decimal numbers (including negative and fractional)
+            elif (char.isdigit() or char == ".") and current == "" and char != ".":
+                j = i
+                while j < len(text) and (text[j].isdigit() or text[j] == "."):
+                    j += 1
+                if j > i:
+                    num_str = text[i:j]
+                    tokens.append(num_str)
+                    i = j - 1
+                    continue
+                current += char
+
             # Handle keywords and symbols
             else:
                 current += char
@@ -253,6 +295,8 @@ class SMTLib2Parser:
         for token in tokens:
             if token in SMTLIB2_KEYWORDS:
                 processed_tokens.append(token.upper())
+            elif token.startswith(":"):
+                processed_tokens.append(token)
             else:
                 processed_tokens.append(token)
 
@@ -445,25 +489,67 @@ class SMTLib2Parser:
     def _parse_term(self, term_expr: Any) -> Term:
         """Parse a term expression."""
         if isinstance(term_expr, str):
-            # Simple symbol
             identifier = Identifier(term_expr, [])
             return Term(QualId(identifier, None), [])
         elif isinstance(term_expr, SExpr) and isinstance(term_expr.content, list):
-            # Function application or complex term
             if len(term_expr.content) >= 1:
                 head = term_expr.content[0]
-                if isinstance(head, str):
+                # Handle (as identifier sort) qualifier
+                if isinstance(head, str) and head.upper() == "AS" and len(term_expr.content) >= 3:
+                    name = term_expr.content[1]
+                    sort_expr = term_expr.content[2]
+                    if isinstance(name, str):
+                        sort = self._parse_sort(sort_expr)
+                        identifier = Identifier(name, [])
+                        return Term(QualId(identifier, sort), [])
+                # Handle LET terms: (let ((v1 t1) ...) body)
+                elif isinstance(head, str) and head.upper() == "LET" and len(term_expr.content) >= 3:
+                    bindings_raw = term_expr.content[1]
+                    bindings = []
+                    if isinstance(bindings_raw, SExpr) and isinstance(bindings_raw.content, list):
+                        for binding in bindings_raw.content:
+                            if isinstance(binding, SExpr) and isinstance(binding.content, list):
+                                if len(binding.content) >= 2:
+                                    var_name = binding.content[0]
+                                    if isinstance(var_name, str):
+                                        var_term = self._parse_term(binding.content[1])
+                                        bindings.append((var_name, var_term))
+                    body_expr = self._parse_term(term_expr.content[2])
+                    body = body_expr if isinstance(body_expr, Term) else Term(QualId(Identifier("true", []), None), [])
+                    return LetTerm(tuple(bindings), body)
+                # Handle FORALL terms: (forall ((v1 T1) ...) body)
+                elif isinstance(head, str) and head.upper() == "FORALL" and len(term_expr.content) >= 3:
+                    vars_raw = term_expr.content[1]
+                    bound_vars = []
+                    if isinstance(vars_raw, SExpr) and isinstance(vars_raw.content, list):
+                        for var_decl in vars_raw.content:
+                            if isinstance(var_decl, SExpr) and isinstance(var_decl.content, list):
+                                if len(var_decl.content) >= 2:
+                                    bound_vars.append((str(var_decl.content[0]), str(var_decl.content[1])))
+                    body = self._parse_term(term_expr.content[2])
+                    body_term = body if isinstance(body, Term) else Term(QualId(Identifier("true", []), None), [])
+                    return QuantifiedTerm("forall", tuple(bound_vars), body_term)
+                # Handle EXISTS terms: (exists ((v1 T1) ...) body)
+                elif isinstance(head, str) and head.upper() == "EXISTS" and len(term_expr.content) >= 3:
+                    vars_raw = term_expr.content[1]
+                    bound_vars = []
+                    if isinstance(vars_raw, SExpr) and isinstance(vars_raw.content, list):
+                        for var_decl in vars_raw.content:
+                            if isinstance(var_decl, SExpr) and isinstance(var_decl.content, list):
+                                if len(var_decl.content) >= 2:
+                                    bound_vars.append((str(var_decl.content[0]), str(var_decl.content[1])))
+                    body = self._parse_term(term_expr.content[2])
+                    body_term = body if isinstance(body, Term) else Term(QualId(Identifier("true", []), None), [])
+                    return QuantifiedTerm("exists", tuple(bound_vars), body_term)
+                elif isinstance(head, str):
                     args = []
                     for arg in term_expr.content[1:]:
                         args.append(self._parse_term(arg))
-
                     identifier = Identifier(head, [])
                     return Term(QualId(identifier, None), args)
             elif isinstance(term_expr.content, Constant):
-                # Constant term
                 identifier = Identifier(str(term_expr.content), [])
                 return Term(QualId(identifier, None), [])
-
         # Fallback
         identifier = Identifier("Unknown", [])
         return Term(QualId(identifier, None), [])

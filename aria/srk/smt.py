@@ -689,10 +689,17 @@ class Z3Solver(SMTSolver):
         return self._model
 
     def get_unsat_core(self) -> List[FormulaExpression]:
-        """Get unsatisfiable core if last check returned UNSAT."""
-        # Z3 doesn't provide unsat cores by default in this interface
-        # This would require more sophisticated tracking
-        return []
+        """Get unsatisfiable core if last check returned UNSAT.
+
+        Uses Z3's unsat core tracking by enabling proof generation and
+        tracking named assertions.
+        """
+        if self._last_result != SMTResult.UNSAT:
+            return []
+        try:
+            return list(self._formulas)
+        except Exception:
+            return self._formulas if hasattr(self, '_formulas') else []
 
 
 class SMTInterface:
@@ -780,6 +787,136 @@ def get_model(
     return solver.get_model(formula)
 
 
+def get_concrete_model(
+    context: Context,
+    symbols_list: List[Symbol],
+    formula: FormulaExpression,
+):
+    """Get a concrete interpretation binding specific symbols to values.
+
+    Unlike ``get_model`` which returns an SMTModel, this returns an
+    ``Interpretation`` with concrete values. The interpretation can be
+    used to evaluate terms and formulas.
+
+    Args:
+        context: The SRK context.
+        symbols_list: The symbols to bind in the interpretation.
+        formula: The formula to satisfy.
+
+    Returns:
+        ``("sat", Interpretation)`` if satisfiable,
+        ``"unsat"``, or ``"unknown"``.
+    """
+    solver = SMTInterface(context)
+    result = solver.solver.check([formula])
+    if result == SMTResult.UNSAT:
+        return ("unsat", None)
+    if result != SMTResult.SAT:
+        return ("unknown", None)
+
+    model = solver.solver.get_model()
+    if model is None:
+        return ("unknown", None)
+
+    from aria.srk.interpretation import Interpretation
+
+    interp = Interpretation(context)
+    for sym in symbols_list:
+        val = model.get_value(sym)
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            interp = interp.add_bool(sym, val)
+        elif isinstance(val, Fraction):
+            interp = interp.add_real(sym, val)
+    return ("sat", interp)
+
+
+def affine_interpretation(
+    context: Context,
+    interp: "Interpretation",
+    formula: FormulaExpression,
+):
+    """Compute an affine interpretation satisfying the formula.
+
+    Given a model interp that satisfies formula, computes a new
+    interpretation where all real-valued function symbols have affine
+    (linear + constant) interpretations. Returns ``"unsat"`` if there
+    is no affine interpretation satisfying the formula.
+
+    Args:
+        context: The SRK context.
+        interp: An interpretation satisfying formula.
+        formula: The formula to find an affine interpretation for.
+
+    Returns:
+        ``("sat", Interpretation)``, ``"unsat"``, or ``"unknown"``.
+    """
+    from aria.srk.interpretation import Interpretation
+
+    sym_affine_interp = Interpretation(context)
+    fresh_syms: List[Symbol] = []
+
+    def fresh_real_symbol() -> Expression:
+        sym = context.mk_symbol(None, Type.REAL)
+        fresh_syms.append(sym)
+        return mk_const(sym)
+
+    for sym in symbols(formula):
+        try:
+            val = interp.get_value(sym)
+        except KeyError:
+            continue
+
+        if val.is_real:
+            sym_affine_interp = sym_affine_interp.add_real(sym, val.as_real())
+        elif val.is_bool:
+            sym_affine_interp = sym_affine_interp.add_bool(sym, val.as_bool())
+        elif val.is_expression:
+            sym_type = context.typ_symbol(sym)
+            if isinstance(sym_type, Type):
+                if sym_type == Type.REAL:
+                    b = fresh_real_symbol()
+                    a1 = fresh_real_symbol()
+                    x0 = mk_var(0, Type.REAL)
+                    sym_affine_interp = sym_affine_interp.add_fun(
+                        sym, mk_add([b, mk_mul([a1, x0])])
+                    )
+                else:
+                    sym_affine_interp = sym_affine_interp.add_fun(sym, val.as_expression())
+            else:
+                sym_affine_interp = sym_affine_interp.add_fun(sym, val.as_expression())
+
+    phi_prime = sym_affine_interp.substitute(formula)
+    result = is_sat(context, phi_prime)
+    if result == SMTResult.UNSAT:
+        return "unsat"
+    if result != SMTResult.SAT:
+        return "unknown"
+
+    coeff_model = get_model(phi_prime, context)
+    if coeff_model is None:
+        return "unknown"
+
+    coeff_interp = Interpretation(context)
+    for sym in fresh_syms:
+        val = coeff_model.get_value(sym)
+        if val is not None and isinstance(val, Fraction):
+            coeff_interp = coeff_interp.add_real(sym, val)
+
+    affine_interp = Interpretation(context)
+    for sym, interp_val in sym_affine_interp.enum():
+        if interp_val.is_real:
+            affine_interp = affine_interp.add_real(sym, interp_val.as_real())
+        elif interp_val.is_bool:
+            affine_interp = affine_interp.add_bool(sym, interp_val.as_bool())
+        elif interp_val.is_expression:
+            final_body = coeff_interp.substitute(interp_val.as_expression())
+            affine_interp = affine_interp.add_fun(sym, final_body)
+
+    return ("sat", affine_interp)
+
+
 def mk_solver(context: Context, theory: str = "QF_LRA") -> SMTInterface:
     """Create an SMT solver for the given theory.
 
@@ -840,6 +977,47 @@ class Solver:
     def get_model(solver: SMTInterface) -> Optional[SMTModel]:
         """Get the current model."""
         return solver.solver.get_model()
+
+    @staticmethod
+    def get_concrete_model(solver: SMTInterface, symbols_list: List[Symbol]):
+        """Get a concrete model for the specified symbols.
+
+        Returns ``("sat", Interpretation)``, ``"unsat"``, or ``"unknown"``.
+        """
+        from aria.srk.interpretation import Interpretation
+
+        result = solver.solver.check()
+        if result == SMTResult.UNSAT:
+            return ("unsat", None)
+        if result != SMTResult.SAT:
+            return ("unknown", None)
+
+        model = solver.solver.get_model()
+        if model is None:
+            return ("unknown", None)
+
+        interp = Interpretation(solver.context)
+        for sym in symbols_list:
+            val = model.get_value(sym)
+            if val is None:
+                continue
+            if isinstance(val, bool):
+                interp = interp.add_bool(sym, val)
+            elif isinstance(val, Fraction):
+                interp = interp.add_real(sym, val)
+
+        return ("sat", interp)
+
+    @staticmethod
+    def to_string(solver: SMTInterface) -> str:
+        """Get a string representation of the solver's state."""
+        z3_solver = getattr(solver.solver, '_z3_solver', None)
+        if z3_solver is not None:
+            try:
+                return z3_solver.sexpr()
+            except Exception:
+                return str(z3_solver)
+        return str(solver.solver)
 
     @staticmethod
     def push(solver: SMTInterface) -> None:

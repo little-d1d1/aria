@@ -1498,13 +1498,13 @@ def simplify_integer_atom(
             ):
                 dividend, modulus = s_prime_destr[2], s_prime_destr[3]
                 if op == "Leq":
-                    return "CompareZero(`Leq, QQVector.zero)"
+                    return ("CompareZero", "Leq", QQVector.zero)
                 else:
                     modulus_val = destruct_int(modulus)
                     multiplier, lt = zz_linterm(dividend)
-                    return f"Divides({ZZ.mul(multiplier, modulus_val)}, {lt})"
+                    return ("Divides", ZZ.mul(multiplier, modulus_val), lt)
             else:
-                return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                return ("CompareZero", op, zz_linterm(s_norm)[1])
         elif destruct_result[0] == "Add" and len(destruct_result) > 1:
             xs = destruct_result[1]
             if len(xs) == 2:
@@ -1523,18 +1523,18 @@ def simplify_integer_atom(
                         modulus_val = destruct_int(modulus)
                         if multiplier == 1 and k < Fraction(modulus_val):
                             lt = QQVector.add_term(k, 0, lt)
-                            return f"Divides({modulus_val}, {lt})"
+                            return ("Divides", modulus_val, lt)
                         else:
-                            return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                            return ("CompareZero", op, zz_linterm(s_norm)[1])
                     elif QQ.equal(k, Fraction(1)) and op == "Leq":
                         multiplier, lt = zz_linterm(dividend)
                         modulus_val = destruct_int(modulus)
                         if multiplier == 1:
-                            return f"NotDivides({modulus_val}, {lt})"
+                            return ("NotDivides", modulus_val, lt)
                         else:
-                            return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                            return ("CompareZero", op, zz_linterm(s_norm)[1])
                     else:
-                        return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                        return ("CompareZero", op, zz_linterm(s_norm)[1])
                 elif (
                     y_destr[0] == "Real"
                     and x_destr[0] == "Binop"
@@ -1547,18 +1547,18 @@ def simplify_integer_atom(
                         modulus_val = destruct_int(modulus)
                         if multiplier == 1 and k < Fraction(modulus_val):
                             lt = QQVector.add_term(k, 0, lt)
-                            return f"Divides({modulus_val}, {lt})"
+                            return ("Divides", modulus_val, lt)
                         else:
-                            return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                            return ("CompareZero", op, zz_linterm(s_norm)[1])
                     elif QQ.equal(k, Fraction(1)) and op == "Leq":
                         multiplier, lt = zz_linterm(dividend)
                         modulus_val = destruct_int(modulus)
                         if multiplier == 1:
-                            return f"NotDivides({modulus_val}, {lt})"
+                            return ("NotDivides", modulus_val, lt)
                         else:
-                            return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                            return ("CompareZero", op, zz_linterm(s_norm)[1])
                     else:
-                        return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                        return ("CompareZero", op, zz_linterm(s_norm)[1])
                 elif (
                     x_destr[0] == "Real"
                     and y_destr[0] == "Unop"
@@ -1582,19 +1582,17 @@ def simplify_integer_atom(
                             dividend, modulus = z_destr[2], z_destr[3]
                             modulus_val = destruct_int(modulus)
                             multiplier, lt = zz_linterm(dividend)
-                            return (
-                                f"NotDivides({ZZ.mul(multiplier, modulus_val)}, {lt})"
-                            )
+                            return ("NotDivides", ZZ.mul(multiplier, modulus_val), lt)
                         else:
-                            return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                            return ("CompareZero", op, zz_linterm(s_norm)[1])
                     else:
-                        return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                        return ("CompareZero", op, zz_linterm(s_norm)[1])
                 else:
-                    return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                    return ("CompareZero", op, zz_linterm(s_norm)[1])
             else:
-                return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+                return ("CompareZero", op, zz_linterm(s_norm)[1])
         else:
-            return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+            return ("CompareZero", op, zz_linterm(s_norm)[1])
     elif op == "Lt":
         destruct_result = destruct(srk, s_norm)
         if (
@@ -1605,7 +1603,7 @@ def simplify_integer_atom(
             dividend, modulus = destruct_result[2], destruct_result[3]
             modulus_val = destruct_int(modulus)
             multiplier, lt = zz_linterm(dividend)
-            return f"NotDivides({ZZ.mul(multiplier, modulus_val)}, {lt})"
+            return ("NotDivides", ZZ.mul(multiplier, modulus_val), lt)
         elif (
             destruct_result[0] == "Unop"
             and len(destruct_result) > 1
@@ -1621,13 +1619,13 @@ def simplify_integer_atom(
                 dividend, modulus = s_prime_destr[2], s_prime_destr[3]
                 modulus_val = destruct_int(modulus)
                 multiplier, lt = zz_linterm(dividend)
-                return f"NotDivides({ZZ.mul(multiplier, modulus_val)}, {lt})"
+                return ("NotDivides", ZZ.mul(multiplier, modulus_val), lt)
             else:
                 return f"CompareZero(`Lt, {zz_linterm(s_norm)[1]})"
         else:
             return f"CompareZero(`Lt, {zz_linterm(s_norm)[1]})"
     else:
-        return f"CompareZero({op}, {zz_linterm(s_norm)[1]})"
+        return ("CompareZero", op, zz_linterm(s_norm)[1])
 
 
 # Note: The functions below are already implemented in the syntax module
