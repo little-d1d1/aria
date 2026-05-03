@@ -382,9 +382,13 @@ def symbols(tf: TransitionFormula) -> Set[Symbol]:
 def substitute_map(
     context: Context, subst: Dict[Symbol, ArithExpression], formula: FormulaExpression
 ) -> FormulaExpression:
-    """Substitute symbols in formula according to mapping."""
-    # This is a simplified substitution - in practice would use full substitution
-    return formula
+    """Substitute symbols in formula according to mapping.
+
+    Replaces each constant symbol in the domain of subst with the
+    corresponding expression. Capture avoidance is handled by the
+    syntax.substitute function.
+    """
+    return syntax.substitute(formula, subst)
 
 
 def analyze_termination_exp_poly(

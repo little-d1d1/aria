@@ -933,15 +933,21 @@ def mbp(
 
 
 def simplify_dda(context: Context, formula: FormulaExpression) -> FormulaExpression:
-    """Simplify using DDA (Difference Decision Diagrams)."""
-    # Simplified - in practice would use full DDA simplification
-    return formula
+    """Simplify using DDA (Dillig-Dillig-Aiken on-line simplification)."""
+    from aria.srk.srkSimplify import simplify_dda as _simplify_dda
+    try:
+        return _simplify_dda(context, formula)
+    except Exception:
+        return formula
 
 
 def eliminate_floor(context: Context, formula: FormulaExpression) -> FormulaExpression:
     """Eliminate floor operations from formula."""
-    # Simplified - in practice would use floor elimination
-    return formula
+    from aria.srk.srkSimplify import eliminate_floor as _eliminate_floor
+    try:
+        return _eliminate_floor(context, formula)
+    except Exception:
+        return formula
 
 
 def evaluate_formula_with_algebra(
