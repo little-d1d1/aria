@@ -39,50 +39,151 @@ class Coeff:
 
 
 class Abstract0:
-    def __init__(self, manager, int_dim: int, real_dim: int):
+    def __init__(self, manager, int_dim: int, real_dim: int, srk=None):
         self.manager = manager
         self.int_dim = int_dim
         self.real_dim = real_dim
+        self._constraints: List[Lincons0] = []
+        self._is_bottom: bool = False
+        self._srk = srk  # Optional SRK context for Z3-based checks
 
     @staticmethod
-    def top(manager, int_dim: int, real_dim: int):
-        return Abstract0(manager, int_dim, real_dim)
+    def top(manager, int_dim: int, real_dim: int, srk=None):
+        obj = Abstract0(manager, int_dim, real_dim, srk)
+        obj._constraints = []
+        obj._is_bottom = False
+        return obj
 
     @staticmethod
-    def bottom(manager, int_dim: int, real_dim: int):
-        return Abstract0(manager, int_dim, real_dim)
+    def bottom(manager, int_dim: int, real_dim: int, srk=None):
+        obj = Abstract0(manager, int_dim, real_dim, srk)
+        obj._constraints = []
+        obj._is_bottom = True
+        return obj
+
+    @staticmethod
+    def of_lincons_array(manager, int_dim, real_dim, lincons_array, srk=None):
+        obj = Abstract0(manager, int_dim, real_dim, srk)
+        obj._constraints = list(lincons_array)
+        obj._is_bottom = False
+        return obj
 
     @staticmethod
     def is_top(manager, abstract):
-        return True  # Placeholder
+        return not abstract._is_bottom and len(abstract._constraints) == 0
 
     @staticmethod
     def is_bottom(manager, abstract):
-        return False  # Placeholder
+        if abstract._is_bottom:
+            return True
+        if not abstract._constraints:
+            return False
+        # Use Z3 to check satisfiability if srk context is available
+        if abstract._srk is not None:
+            srk = abstract._srk
+            n_dims = abstract.int_dim + abstract.real_dim
+            dim_vars = []
+            for i in range(n_dims):
+                sym = syntax.mk_symbol(srk, f"_apron_d{i}", syntax.Type.REAL)
+                dim_vars.append(syntax.mk_const(srk, sym))
+            formulas = []
+            for lc in abstract._constraints:
+                terms = []
+                for coeff, dim in lc.linexpr0.coeffs:
+                    if dim is not None and dim < len(dim_vars):
+                        coeff_term = syntax.mk_real(srk, coeff)
+                        terms.append(syntax.mk_mul(srk, [coeff_term, dim_vars[dim]]))
+                cst = lc.linexpr0.get_cst()
+                if cst is not None:
+                    terms.append(syntax.mk_real(srk, cst))
+                if len(terms) > 1:
+                    lin_term = syntax.mk_add(srk, terms)
+                elif len(terms) == 1:
+                    lin_term = terms[0]
+                else:
+                    lin_term = syntax.mk_real(srk, linear.QQ.zero())
+                zero = syntax.mk_real(srk, linear.QQ.zero())
+                if lc.typ == Lincons0.EQ:
+                    formulas.append(syntax.mk_eq(srk, lin_term, zero))
+                elif lc.typ == Lincons0.SUPEQ:
+                    formulas.append(syntax.mk_leq(srk, zero, lin_term))
+                elif lc.typ == Lincons0.SUP:
+                    formulas.append(syntax.mk_lt(srk, zero, lin_term))
+            if formulas:
+                formula = syntax.mk_and(srk, formulas)
+                result = Smt.is_sat(srk, formula)
+                return result == Smt.Unsat
+        return False
 
     @staticmethod
     def is_eq(manager, abstract1, abstract2):
-        return True  # Placeholder
+        if abstract1._is_bottom and abstract2._is_bottom:
+            return True
+        if abstract1._is_bottom != abstract2._is_bottom:
+            return False
+        # Compare constraint sets (order-independent)
+        c1 = [(lc.typ, tuple(lc.linexpr0.coeffs), lc.linexpr0.get_cst())
+               for lc in abstract1._constraints]
+        c2 = [(lc.typ, tuple(lc.linexpr0.coeffs), lc.linexpr0.get_cst())
+               for lc in abstract2._constraints]
+        return set(c1) == set(c2)
 
     @staticmethod
     def add_dimensions(manager, abstract, dim: "Dim", project: bool):
-        return abstract  # Placeholder
+        # Create a new Abstract0 with updated dimensions
+        new_int = abstract.int_dim + dim.intdim
+        new_real = abstract.real_dim + dim.realdim
+        result = Abstract0(manager, new_int, new_real, abstract._srk)
+        result._constraints = list(abstract._constraints)
+        result._is_bottom = abstract._is_bottom
+        return result
 
     @staticmethod
     def remove_dimensions(manager, abstract, dim: "Dim"):
-        return abstract  # Placeholder
+        result = Abstract0(manager, abstract.int_dim, abstract.real_dim, abstract._srk)
+        result._constraints = list(abstract._constraints)
+        result._is_bottom = abstract._is_bottom
+        return result
 
     @staticmethod
     def meet_lincons_array(manager, abstract, lincons_array):
-        return abstract  # Placeholder
+        result = Abstract0(manager, abstract.int_dim, abstract.real_dim, abstract._srk)
+        result._constraints = list(abstract._constraints) + list(lincons_array)
+        result._is_bottom = abstract._is_bottom
+        return result
 
     @staticmethod
     def join(manager, abstract1, abstract2):
-        return abstract1  # Placeholder
+        # If either is bottom, return the other
+        if abstract1._is_bottom:
+            result = Abstract0(manager, abstract2.int_dim, abstract2.real_dim,
+                               abstract2._srk)
+            result._constraints = list(abstract2._constraints)
+            result._is_bottom = abstract2._is_bottom
+            return result
+        if abstract2._is_bottom:
+            result = Abstract0(manager, abstract1.int_dim, abstract1.real_dim,
+                               abstract1._srk)
+            result._constraints = list(abstract1._constraints)
+            result._is_bottom = abstract1._is_bottom
+            return result
+        # Join: keep only constraints present in both (intersection of constraint sets)
+        c1 = {(lc.typ, tuple(lc.linexpr0.coeffs), lc.linexpr0.get_cst())
+               for lc in abstract1._constraints}
+        c2 = {(lc.typ, tuple(lc.linexpr0.coeffs), lc.linexpr0.get_cst())
+               for lc in abstract2._constraints}
+        common = c1 & c2
+        srk = abstract1._srk or abstract2._srk
+        result = Abstract0(manager, abstract1.int_dim, abstract1.real_dim, srk)
+        result._constraints = [lc for lc in abstract1._constraints
+                               if (lc.typ, tuple(lc.linexpr0.coeffs),
+                                   lc.linexpr0.get_cst()) in common]
+        result._is_bottom = False
+        return result
 
     @staticmethod
     def to_lincons_array(manager, abstract):
-        return []  # Placeholder
+        return list(abstract._constraints)
 
 
 class Linexpr0:
@@ -311,10 +412,13 @@ def equal(wedge1: Wedge, wedge2: Wedge) -> bool:
 
 
 def to_atoms(wedge: Wedge) -> List[syntax.Formula]:
-    """Convert wedge to list of atomic formulas"""
-    # This would need proper APRON lincons conversion
-    # For now, return placeholder
-    return []
+    """Convert wedge to list of atomic formulas.
+
+    Retrieves all linear constraints stored in the abstract domain and
+    converts each one to an SRK formula via :func:`atom_of_lincons`.
+    """
+    lincons_array = Abstract0.to_lincons_array(get_manager(), wedge.abstract)
+    return [atom_of_lincons(wedge, lc) for lc in lincons_array]
 
 
 def to_formula(wedge: Wedge) -> syntax.Formula:
@@ -439,10 +543,96 @@ def meet_atoms(wedge: Wedge, atoms: List[syntax.Formula]) -> None:
 
 
 def bound_vec(wedge: Wedge, vec: linear.QQVector) -> "Interval":
-    """Compute bounds for vector expression"""
-    # This would need proper interval arithmetic
-    # For now, return placeholder
-    return Interval.top()
+    """Compute bounds for vector expression from stored constraints.
+
+    Iterates over all constraints in the Abstract0 and finds those whose
+    non-constant part is a scalar multiple of *vec*.  From each matching
+    constraint we extract a lower or upper bound on *vec* and return the
+    tightest interval.
+    """
+    from fractions import Fraction
+    _Interval = Interval  # local alias; will be the real class after Edit B
+
+    if Abstract0.is_bottom(get_manager(), wedge.abstract):
+        return _Interval.bottom()
+
+    constraints = Abstract0.to_lincons_array(get_manager(), wedge.abstract)
+    if not constraints:
+        return _Interval.top()
+
+    lower: Optional[Fraction] = None
+    upper: Optional[Fraction] = None
+
+    # Decompose vec into (constant_part, non_constant_part)
+    vec_cst, vec_rest = linear.QQVector.pivot(CS.const_id, vec) if CS.const_id in vec.entries else (linear.QQ.zero(), vec)
+
+    for lc in constraints:
+        # Build a dict of (dim -> coeff) for the constraint, excluding constant
+        lc_coeffs: Dict[int, Any] = {}
+        lc_cst = linear.QQ.zero()
+        for coeff, dim in lc.linexpr0.coeffs:
+            if dim is not None:
+                lc_coeffs[dim] = coeff
+            else:
+                lc_cst = coeff
+        cst_val = lc.linexpr0.get_cst()
+        if cst_val is not None:
+            lc_cst = cst_val
+
+        # Check if lc_coeffs is a scalar multiple of vec_rest
+        # We need: lc_coeffs = k * vec_rest for some k
+        vec_rest_entries = {d: c for d, c in vec_rest.entries.items() if c != 0}
+        lc_nonzero = {d: c for d, c in lc_coeffs.items() if c != 0}
+
+        if not vec_rest_entries and not lc_nonzero:
+            # Both are constant-only; skip (constraint is purely about constants)
+            continue
+        if not vec_rest_entries or not lc_nonzero:
+            continue
+
+        # Check dimension set match
+        if set(vec_rest_entries.keys()) != set(lc_nonzero.keys()):
+            continue
+
+        # Compute k = lc_coeffs[d] / vec_rest[d] for any dimension d
+        ref_dim = next(iter(vec_rest_entries.keys()))
+        vec_ref = vec_rest_entries[ref_dim]
+        if vec_ref == 0:
+            continue
+        k = lc_nonzero[ref_dim] / vec_ref
+
+        # Verify k works for all dimensions
+        match = True
+        for d in vec_rest_entries:
+            expected = k * vec_rest_entries[d]
+            actual = lc_nonzero[d]
+            if expected != actual:
+                match = False
+                break
+        if not match:
+            continue
+
+        # Now: k * vec + lc_cst [typ] 0
+        # For SUPEQ: k * vec + lc_cst >= 0  =>  k * vec >= -lc_cst
+        # For SUP:   k * vec + lc_cst > 0   =>  k * vec > -lc_cst (approximate as >=)
+        # For EQ:    k * vec + lc_cst = 0    =>  vec = -lc_cst / k
+        if k == 0:
+            continue
+        neg_cst_over_k = -lc_cst / k
+
+        if lc.typ == Lincons0.EQ:
+            # Equality gives both upper and lower
+            lower = neg_cst_over_k if lower is None else max(lower, neg_cst_over_k)
+            upper = neg_cst_over_k if upper is None else min(upper, neg_cst_over_k)
+        elif lc.typ in (Lincons0.SUPEQ, Lincons0.SUP):
+            if k > 0:
+                # k * vec >= -lc_cst  =>  vec >= -lc_cst / k  (lower bound)
+                lower = neg_cst_over_k if lower is None else max(lower, neg_cst_over_k)
+            else:
+                # k * vec >= -lc_cst with k < 0  =>  vec <= -lc_cst / k  (upper bound)
+                upper = neg_cst_over_k if upper is None else min(upper, neg_cst_over_k)
+
+    return _Interval.make(lower, upper)
 
 
 def bound_coordinate(wedge: Wedge, coordinate: int) -> "Interval":
@@ -457,68 +647,218 @@ def bound_monomial(wedge: Wedge, monomial) -> "Interval":
     return Interval.const(linear.QQ.one())
 
 
-# Interval arithmetic (simplified)
+def symbolic_bounds(
+    wedge: Wedge, symbol
+) -> Tuple[List[syntax.Formula], List[syntax.Formula]]:
+    """Compute symbolic lower and upper bounds for *symbol*.
+
+    Returns ``(lower_bounds, upper_bounds)`` where each list contains SRK
+    terms representing the bound expressions.  For a constraint
+    ``a*sym + rest + c >= 0`` with ``a != 0``:
+
+    - ``a > 0``  =>  ``sym >= -(rest + c) / a``  (lower bound)
+    - ``a < 0``  =>  ``sym <= -(rest + c) / a``  (upper bound)
+    """
+    srk = wedge.srk
+    cs = wedge.cs
+
+    # Find the coordinate ID for the symbol
+    sym_term = syntax.mk_const(srk, symbol)
+    sym_vec = cs.vec_of_term(sym_term, admit=False)
+
+    # The symbol should map to a single-dimension vector {coord_id: 1}
+    non_const = {d: c for d, c in sym_vec.entries.items() if d != CS.const_id}
+    if not non_const:
+        return ([], [])
+
+    sym_dim = next(iter(non_const.keys()))
+    sym_coeff = non_const[sym_dim]
+
+    lower_bounds = []
+    upper_bounds = []
+
+    constraints = Abstract0.to_lincons_array(get_manager(), wedge.abstract)
+    for lc in constraints:
+        # Build coefficient dict from linexpr
+        lc_coeffs: Dict[int, Any] = {}
+        lc_cst = linear.QQ.zero()
+        for coeff, dim in lc.linexpr0.coeffs:
+            if dim is not None:
+                lc_coeffs[dim] = coeff
+            else:
+                lc_cst = coeff
+        cst_val = lc.linexpr0.get_cst()
+        if cst_val is not None:
+            lc_cst = cst_val
+
+        if sym_dim not in lc_coeffs:
+            continue
+
+        a = lc_coeffs[sym_dim]
+        if a == 0:
+            continue
+
+        # Build "rest" vector: all coefficients except sym_dim
+        rest_entries = {d: c for d, c in lc_coeffs.items() if d != sym_dim}
+        rest_entries[CS.const_id] = lc_cst
+        rest_vec = linear.QQVector(rest_entries)
+
+        # Bound term = -rest / a   (as a formula)
+        # We express it as a term: -(rest_term) / a
+        rest_term = cs._vector_to_term(rest_vec)
+        neg_rest = syntax.mk_neg(srk, rest_term)
+        a_term = syntax.mk_real(srk, abs(a))
+        bound_term = syntax.mk_div(srk, neg_rest, a_term) if a != linear.QQ.one() else neg_rest
+
+        if lc.typ in (Lincons0.EQ, Lincons0.SUPEQ, Lincons0.SUP):
+            if a > 0:
+                # sym >= bound
+                lower_bounds.append(bound_term)
+            else:
+                # sym <= bound
+                upper_bounds.append(bound_term)
+
+    return (lower_bounds, upper_bounds)
+
+
+# Interval arithmetic — delegates to the real Interval implementation.
+from aria.srk.interval import Interval as _Interval
+
+
 class Interval:
+    """Facade over :class:`aria.srk.interval.Interval`.
+
+    Static-method API used throughout wedge.py; every returned / accepted
+    interval value is a real ``_Interval`` instance.
+    """
+
     @staticmethod
     def top():
-        return "TopInterval"
+        return _Interval.top()
+
+    @staticmethod
+    def bottom():
+        return _Interval.bottom()
 
     @staticmethod
     def const(qq: linear.QQ):
-        return f"Const({qq})"
+        return _Interval.const(linear.QQ(qq))
+
+    @staticmethod
+    def make(lower, upper):
+        return _Interval.make(
+            linear.QQ(lower) if lower is not None else None,
+            linear.QQ(upper) if upper is not None else None,
+        )
 
     @staticmethod
     def of_apron(apron_interval):
-        return f"ApronInterval({apron_interval})"
+        """Convert an APRON interval to a real Interval."""
+        # APRON intervals typically have (lower, upper) attributes
+        try:
+            lo = apron_interval.lower if apron_interval.lower is not None else None
+            hi = apron_interval.upper if apron_interval.upper is not None else None
+            return _Interval.make(
+                linear.QQ(lo) if lo is not None else None,
+                linear.QQ(hi) if hi is not None else None,
+            )
+        except Exception:
+            return _Interval.top()
 
     @staticmethod
     def elem(qq: linear.QQ, interval) -> bool:
-        # Check if qq is in interval
-        return True  # Placeholder
+        """Check whether *qq* belongs to *interval*."""
+        if isinstance(interval, _Interval):
+            return interval.contains(linear.QQ(qq))
+        return False
 
     @staticmethod
     def is_nonnegative(interval) -> bool:
-        return True  # Placeholder
+        if isinstance(interval, _Interval):
+            if interval.is_bottom():
+                return False
+            return interval.lower is not None and interval.lower >= 0
+        return False
 
     @staticmethod
     def is_nonpositive(interval) -> bool:
-        return True  # Placeholder
+        if isinstance(interval, _Interval):
+            if interval.is_bottom():
+                return False
+            return interval.upper is not None and interval.upper <= 0
+        return False
 
     @staticmethod
     def is_positive(interval) -> bool:
-        return True  # Placeholder
+        if isinstance(interval, _Interval):
+            if interval.is_bottom():
+                return False
+            return interval.lower is not None and interval.lower > 0
+        return False
 
     @staticmethod
     def is_negative(interval) -> bool:
-        return True  # Placeholder
+        if isinstance(interval, _Interval):
+            if interval.is_bottom():
+                return False
+            return interval.upper is not None and interval.upper < 0
+        return False
 
     @staticmethod
     def lower(interval) -> Optional[linear.QQ]:
-        return None  # Placeholder
+        if isinstance(interval, _Interval):
+            return interval.lower
+        return None
 
     @staticmethod
     def upper(interval) -> Optional[linear.QQ]:
-        return None  # Placeholder
+        if isinstance(interval, _Interval):
+            return interval.upper
+        return None
 
     @staticmethod
     def mul(ivl1, ivl2):
-        return "MulInterval"  # Placeholder
+        if isinstance(ivl1, _Interval) and isinstance(ivl2, _Interval):
+            return ivl1 * ivl2
+        return _Interval.top()
 
     @staticmethod
     def add(ivl1, ivl2):
-        return "AddInterval"  # Placeholder
+        if isinstance(ivl1, _Interval) and isinstance(ivl2, _Interval):
+            return ivl1 + ivl2
+        return _Interval.top()
 
     @staticmethod
     def exp_const(ivl, power: int):
-        return f"ExpInterval({ivl}, {power})"  # Placeholder
+        """Raise *ivl* to an integer *power*."""
+        if isinstance(ivl, _Interval):
+            if ivl.is_bottom():
+                return _Interval.bottom()
+            if ivl.is_point():
+                try:
+                    val = ivl.lower ** power
+                    return _Interval.const(linear.QQ(val))
+                except Exception:
+                    return _Interval.top()
+            # Conservative: use point-interval power for positive intervals
+            if Interval.is_nonnegative(ivl) and power == 2:
+                lo = linear.QQ(0) if ivl.lower is None else (ivl.lower ** 2 if ivl.lower >= 0 else linear.QQ(0))
+                hi = None if ivl.upper is None else ivl.upper ** 2
+                return _Interval.make(lo, hi)
+        return _Interval.top()
 
     @staticmethod
     def div(ivl1, ivl2):
-        return "DivInterval"  # Placeholder
+        if isinstance(ivl1, _Interval) and isinstance(ivl2, _Interval):
+            if ivl1.is_bottom() or ivl2.is_bottom():
+                return _Interval.bottom()
+            return ivl1 / ivl2
+        return _Interval.top()
 
     @staticmethod
     def log(base_ivl, exp_ivl):
-        return "LogInterval"  # Placeholder
+        """Approximate logarithm interval (conservative: returns top)."""
+        return _Interval.top()
 
 
 def mk_sign_axioms(srk: syntax.Context) -> syntax.Formula:
@@ -565,7 +905,12 @@ def bound_polynomial(wedge: Wedge, polynomial: P.Polynomial) -> "Interval":
 
 
 def affine_hull(wedge: Wedge) -> List[linear.QQVector]:
-    """Compute affine hull of wedge"""
+    """Compute affine hull of wedge.
+
+    Extracts all equality (EQ) constraints from the abstract domain and
+    converts each linear expression into a :class:`linear.QQVector`.
+    The returned vectors *v* satisfy ``v = 0`` in the affine hull.
+    """
     if is_bottom(wedge):
         return [
             linear.QQVector.add_term(
@@ -573,9 +918,13 @@ def affine_hull(wedge: Wedge) -> List[linear.QQVector]:
             )
         ]
 
-    # This would extract equality constraints from APRON
-    # For now, return placeholder
-    return []
+    lincons_array = Abstract0.to_lincons_array(get_manager(), wedge.abstract)
+    result = []
+    for lc in lincons_array:
+        if lc.typ == Lincons0.EQ:
+            vec = vec_of_linexpr(wedge.env, lc.linexpr0)
+            result.append(vec)
+    return result
 
 
 def polynomial_constraints(
@@ -594,27 +943,142 @@ def polynomial_cone(lemma: Callable, wedge: Wedge) -> List[P.Polynomial]:
 
 
 def vanishing_ideal(wedge: Wedge) -> List[P.Polynomial]:
-    """Compute vanishing ideal of wedge"""
+    """Compute vanishing ideal of wedge.
+
+    Returns the list of polynomials that vanish on the wedge.  Each
+    equality vector from :func:`affine_hull` is converted to a polynomial
+    via the coordinate system's :meth:`polynomial_of_vec`.
+    """
     if is_bottom(wedge):
         return [P.one()]
 
-    # This would extract equality polynomials from APRON
-    # For now, return placeholder
-    return []
+    eq_vectors = affine_hull(wedge)
+    result = []
+    for vec in eq_vectors:
+        poly = wedge.cs.polynomial_of_vec(vec)
+        if not poly.is_zero():
+            result.append(poly)
+    return result
 
 
 def coordinate_ideal(lemma: Callable, wedge: Wedge) -> List[P.Polynomial]:
-    """Compute coordinate ideal of wedge"""
-    # This would compute the ideal generated by coordinate definitions
-    # For now, return placeholder
-    return []
+    """Compute coordinate ideal of wedge.
+
+    Starts with the :func:`vanishing_ideal` and adds defining polynomials
+    for every *compound* coordinate (Mul, App, Inv, Mod, Floor).
+    For a coordinate ``c`` whose defining expression is ``e``, the
+    polynomial ``c - e`` is added to the ideal.
+    """
+    cs = wedge.cs
+    result = list(vanishing_ideal(wedge))
+
+    for coord_id in range(cs.dim):
+        cs_term = cs.destruct_coordinate(coord_id)
+        # Compound terms are those whose definition involves other coordinates
+        if cs_term.term_type in (
+            CS.CSTermType.MUL,
+            CS.CSTermType.INV,
+            CS.CSTermType.MOD,
+            CS.CSTermType.FLOOR,
+            CS.CSTermType.APP,
+        ):
+            coord_poly = cs.polynomial_of_coordinate(coord_id)
+            # defining poly: coord_id - expr(coord_id)
+            coord_var = P.Polynomial.of_dim(coord_id, cs.dim)
+            defining = coord_var - coord_poly
+            if not defining.is_zero():
+                result.append(defining)
+
+    return result
 
 
-def equational_saturation(lemma: Callable, wedge: Wedge) -> str:
-    """Compute equational saturation of wedge"""
-    # This would perform equational saturation using Grobner bases
-    # For now, return placeholder
-    return "RewritePlaceholder"
+def equational_saturation(lemma: Callable, wedge: Wedge) -> P.RewriteSystem:
+    """Compute equational saturation of wedge.
+
+    Builds a Gröbner-basis rewrite system from the :func:`coordinate_ideal`
+    and iterates until no new equalities are discovered:
+
+    1. For each coordinate *i*, reduce ``polynomial_of_coordinate(i)`` with
+       the current basis.
+    2. If reduction yields a *linear* polynomial ``p`` with ``p = 0``, add
+       it as an EQ constraint to the wedge (via :func:`meet_atoms`).
+    3. Recompute the affine hull; if new vanishing polynomials appear, add
+       them to the ideal and recompute the Gröbner basis.
+    4. Repeat until saturated.
+
+    Returns the final :class:`P.RewriteSystem`.
+    """
+    cs = wedge.cs
+    srk = wedge.srk
+
+    # --- helper: convert a linear polynomial to a QQVector ---
+    def _vec_of_linear_poly(poly: P.Polynomial) -> Optional[linear.QQVector]:
+        if poly.degree() > 1:
+            return None
+        vec = linear.QQVector.zero()
+        for monom, coeff in poly.terms.items():
+            # Monomial entries map dim -> exponent
+            total_exp = sum(monom.exponents) if hasattr(monom, 'exponents') else 0
+            if total_exp == 0:
+                # constant term
+                vec = linear.QQVector.add_term(coeff, CS.const_id, vec)
+            elif total_exp == 1:
+                # single variable with exponent 1
+                for d, e in enumerate(monom.exponents):
+                    if e == 1:
+                        vec = linear.QQVector.add_term(coeff, d, vec)
+                        break
+        return vec
+
+    # --- helper: add an equality polynomial as a wedge constraint ---
+    def _add_equality(poly: P.Polynomial):
+        vec = _vec_of_linear_poly(poly)
+        if vec is not None:
+            linexpr = linexpr_of_vec(cs, wedge.env, vec)
+            lc = Lincons0.make(linexpr, Lincons0.EQ)
+            wedge.abstract = Abstract0.meet_lincons_array(
+                get_manager(), wedge.abstract, [lc]
+            )
+
+    # 1. Build initial ideal
+    gens = coordinate_ideal(lemma, wedge)
+    if not gens:
+        return P.RewriteSystem([])
+
+    ideal = P.Ideal(gens)
+    prev_vanishing = set(id(p) for p in vanishing_ideal(wedge))
+    max_iters = 20
+
+    for _ in range(max_iters):
+        basis = ideal.groebner_basis()
+
+        # 2. For each coordinate, reduce its polynomial; add new equalities
+        changed = False
+        for coord_id in range(cs.dim):
+            coord_poly = cs.polynomial_of_coordinate(coord_id)
+            reduced = basis.reduce(coord_poly)
+            if reduced.is_zero():
+                continue
+            # If reduced polynomial is linear and non-trivial, add as equality
+            if reduced.degree() <= 1:
+                vec = _vec_of_linear_poly(reduced)
+                if vec is not None and not vec.is_zero():
+                    _add_equality(reduced)
+                    changed = True
+
+        # 3. Recompute affine hull and check for new vanishing polynomials
+        new_vanishing = vanishing_ideal(wedge)
+        new_polys = [p for p in new_vanishing if id(p) not in prev_vanishing]
+        if new_polys:
+            for p in new_polys:
+                prev_vanishing.add(id(p))
+            ideal = P.Ideal(ideal.generators + new_polys)
+            changed = True
+
+        if not changed:
+            break
+
+    return ideal.groebner_basis()
 
 
 def generalized_fourier_motzkin(lemma: Callable, order, wedge: Wedge) -> None:

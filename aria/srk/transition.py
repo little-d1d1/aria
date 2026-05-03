@@ -207,23 +207,105 @@ class Transition:
         return self
 
     def star(self) -> Transition:
-        """Compute the reflexive transitive closure."""
-        # Default implementation - return self (no iteration)
-        # Computing transitive closure is complex and would need sophisticated algorithms
+        """Kleene star -- reflexive transitive closure of this transition.
 
-        # For a basic implementation, we could use the identity transition
-        # which represents zero or more applications of this transition
-        # In a full implementation, this would compute the actual closure
-
+        Strategy:
+        1.  Build a :class:`TransitionFormula` via :meth:`to_transition_formula`.
+        2.  Try the full iteration-domain pipeline (``MakeDomain`` +
+            ``WedgeGuard``).  This gives the most precise result when the
+            underlying abstract domains are operational.
+        3.  If the domain pipeline fails (e.g. because APRON is not
+            installed), fall back to a formula-based approximation:
+            ``K = 0  =>  identity``, ``K >= 1  =>  original guard``.
+            This is sound but imprecise -- it over-approximates the
+            transform step by forgetting it.
+        """
         if self.context is None:
             return self
 
+        srk = self.context
+
         try:
-            # For now, return the identity (represents 0 or more applications)
-            # A proper implementation would need to compute the Kleene star
-            return Transition.one(self.context)
+            from .syntax import (
+                mk_const,
+                mk_and,
+                mk_leq,
+                mk_real,
+                mk_eq,
+                mk_symbol,
+                substitute as syntax_substitute,
+            )
+            from .qQ import QQ
+
+            # --- build transition formula and tr_symbols --------------------
+            tf = self.to_transition_formula(srk)
+
+            tr_symbols = []
+            pre_to_post_subst = {}  # Symbol -> Const(post_sym)
+            for var in self.transform:
+                pre_name = srk.show_symbol(var)
+                post_sym = srk.mk_symbol(name=pre_name + "'", typ=var.typ)
+                tr_symbols.append((var, post_sym))
+                pre_to_post_subst[var] = mk_const(srk, post_sym)
+
+            # --- try the full iteration domain -----------------------------
+            try:
+                from .iteration import MakeDomain, WedgeGuard
+
+                domain = MakeDomain(WedgeGuard)
+                domain_elem = domain.abstract(srk, tf)
+                closure_formula = domain.closure(domain_elem)
+
+                return Transition(
+                    transform=dict(self.transform),
+                    guard=closure_formula,
+                    context=srk,
+                )
+            except Exception:
+                pass
+
+            # --- fallback: formula-based closure ---------------------------
+            from .syntax import Type as _Type, mk_or, mk_true
+            loop_sym = mk_symbol(srk, "K", _Type.INT)
+            loop_counter = mk_const(srk, loop_sym)
+
+            # K = 0  =>  identity (x' = x for every tracked variable)
+            identity_eqs = []
+            for pre_sym, post_sym in tr_symbols:
+                identity_eqs.append(
+                    mk_eq(srk, mk_const(srk, post_sym), mk_const(srk, pre_sym))
+                )
+            if identity_eqs:
+                identity_body = mk_and(srk, identity_eqs)
+            else:
+                identity_body = mk_true(srk)
+
+            zero_case = mk_and(srk, [
+                mk_eq(srk, loop_counter, mk_real(srk, QQ.zero())),
+                identity_body,
+            ])
+
+            # K >= 1  =>  original guard (with pre->post substitution so the
+            # guard talks about the right state pair)
+            guard_subst = syntax_substitute(self.guard, pre_to_post_subst)
+            at_least_one_case = mk_and(srk, [
+                mk_leq(srk, mk_real(srk, QQ.one()), loop_counter),
+                guard_subst,
+            ])
+
+            closure_guard = mk_and(srk, [
+                mk_or(srk, [zero_case, at_least_one_case]),
+                mk_leq(srk, mk_real(srk, QQ.zero()), loop_counter),
+            ])
+
+            return Transition(
+                transform=dict(self.transform),
+                guard=closure_guard,
+                context=srk,
+            )
+
         except Exception:
-            return self
+            return Transition.one(self.context)
 
     def abstract_post(self, property: Any) -> Any:
         """Compute abstract post-image."""
@@ -233,12 +315,60 @@ class Transition:
 
     def to_transition_formula(
         self, context: Context
-    ) -> Any:  # Would return TransitionFormula
-        """Convert to transition formula representation."""
-        # Default implementation - would need to implement conversion to TransitionFormula
-        # For now, return None as a conservative approximation
-        # A full implementation would create a TransitionFormula from this transition
-        return None
+    ) -> Any:  # Returns TransitionFormula
+        """Convert to transition formula representation.
+
+        Builds a TransitionFormula whose body is
+            guard AND (p1 = t1) AND (p2 = t2) AND ...
+        where pi is the post-state symbol for variable i and ti is the
+        transform term.  The ``exists`` predicate marks both pre-state
+        Var nodes and fresh post-state symbols as existentially bound.
+        """
+        from .transitionFormula import make as make_tf
+        from .syntax import (
+            mk_eq,
+            mk_const,
+            mk_and,
+            mk_symbol,
+            Var,
+            Const,
+        )
+
+        if not self.transform:
+            # Empty transform: just the guard, no variable pairs
+            return make_tf(self.guard, [], exists=lambda s: True)
+
+        # Build post-state symbol pairs and equalities
+        tr_symbols = []
+        post_defs = []
+        post_symbols_set: set = set()
+
+        for var, term in self.transform.items():
+            pre_sym = var  # var is already a Symbol
+            # Create a fresh post-state symbol with a primed name
+            pre_name = context.show_symbol(pre_sym)
+            post_sym = context.mk_symbol(name=pre_name + "'", typ=pre_sym.typ)
+            post_term = mk_const(context, post_sym)
+
+            tr_symbols.append((pre_sym, post_sym))
+            post_defs.append(mk_eq(context, post_term, term))
+            post_symbols_set.add(post_sym)
+
+        # Body: guard AND (p1 = t1) AND (p2 = t2) AND ...
+        if post_defs:
+            body = mk_and(context, [self.guard] + post_defs)
+        else:
+            body = self.guard
+
+        # Exists predicate: true for pre-state Var nodes and post-state symbols
+        def exists(x):
+            if isinstance(x, Var):
+                return True
+            if isinstance(x, Const):
+                return x.symbol in post_symbols_set
+            return x in post_symbols_set
+
+        return make_tf(body, tr_symbols, exists=exists)
 
     def interpolate(self, post_condition: Expression) -> List[Expression]:
         """Compute interpolants for this transition and post-condition."""

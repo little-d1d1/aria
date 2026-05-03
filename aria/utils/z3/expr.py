@@ -409,7 +409,7 @@ def is_lit(exp) -> bool:
     return is_pos_lit(exp) or is_neg_lit(exp)
 
 
-def create_function_body_str(funcname: str, varlist: List, body: z3.ExprRef) -> [str]:
+def create_function_body_str(funcname: str, varlist: List, body: z3.ExprRef) -> List[str]:
     """
     Creates a string representation of a function body which can be used to
     define a new function in SMT-LIB2 format.

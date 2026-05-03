@@ -13,10 +13,73 @@ from enum import Enum
 
 from aria.srk.syntax import Context, Symbol, Expression, Type
 from aria.srk.interval import Interval
+from aria.srk.weightedGraph import (
+    WeightedGraph,
+    Algebra,
+    OmegaAlgebra,
+    Vertex as WGVertex,
+    _find_sccs_in_vertices,
+    _find_reachable,
+)
 
 
 T = TypeVar("T")
 S = TypeVar("S")  # State type
+
+
+def _find_cycle_weight_in_scc(wg: WeightedGraph[T], scc: Set[int]) -> T:
+    """Find the weight of a cycle in a strongly connected component.
+
+    Correctly handles cycles that return to the start vertex by
+    checking for the start vertex before the visited-set guard.
+    """
+    algebra = wg.algebra
+    zero = algebra.zero
+    one = algebra.one
+
+    if not scc:
+        return zero
+
+    # Single vertex with self-loop
+    if len(scc) == 1:
+        v = next(iter(scc))
+        if wg.mem_edge(v, v):
+            return wg.edge_weight(v, v)
+        return zero
+
+    # Multi-vertex SCC: find a cycle via DFS from an arbitrary start
+    start = next(iter(scc))
+    visited: Set[int] = set()
+
+    def dfs(current: int, weight: T) -> Optional[T]:
+        for successor in wg.successors(current):
+            if successor not in scc:
+                continue
+            edge_w = wg.edge_weight(current, successor)
+            new_weight = algebra.mul(weight, edge_w)
+            # Check for cycle completion BEFORE visited guard
+            if successor == start:
+                return new_weight
+            if successor not in visited:
+                visited.add(successor)
+                result = dfs(successor, new_weight)
+                if result is not None:
+                    return result
+                visited.remove(successor)
+        return None
+
+    for first_succ in wg.successors(start):
+        if first_succ in scc:
+            edge_w = wg.edge_weight(start, first_succ)
+            # Direct self-loop handled above; check for 2+-node cycle
+            if first_succ == start:
+                return edge_w
+            visited = {first_succ}
+            cycle_w = dfs(first_succ, edge_w)
+            if cycle_w is not None:
+                return cycle_w
+
+    return zero
 
 
 class LabelType(Enum):
@@ -115,34 +178,174 @@ class TransitionSystem(Generic[T]):
 
 
 class Query(Generic[T]):
-    """A query structure for computing path weights in transition systems."""
+    """A query structure for computing path weights in transition systems.
+
+    Uses Tarjan's node-elimination algorithm (Tarjan 1981) to compute
+    path weights over a semiring, and SCC-based omega path weights for
+    infinite-path analysis.
+
+    Attributes:
+        graph: The weighted graph whose edge weights form a Kleene algebra.
+        source: The source vertex from which paths are measured.
+        abstract_weight: An optional pre-computed abstract weight (used as
+            a fallback when the graph is empty).
+    """
 
     def __init__(
-        self, transition_system: TransitionSystem[T], source: int, abstract_weight: Any
-    ):  # Would need proper abstract weight type
+        self,
+        transition_system: TransitionSystem[T],
+        source: int,
+        abstract_weight: Any,
+        graph: Optional[WeightedGraph[T]] = None,
+    ):
         self.transition_system = transition_system
         self.source = source
         self.abstract_weight = abstract_weight
+        self.graph = graph  # Must be set before calling path_weight / omega_path_weight
 
     def path_weight(self, target: int) -> T:
-        """Compute the path weight from source to target."""
-        # Default implementation - return the abstract weight
-        # A full implementation would compute the actual path weight
-        return self.abstract_weight
+        """Compute the path weight from *source* to *target*.
+
+        The weight is the semiring sum over all (possibly infinite) paths
+        of the semiring product of the edge weights along each path,
+        computed via Gauss-Jordan / Tarjan-style node elimination on the
+        adjacency matrix.
+
+        If *source == target* the result includes the empty-path identity
+        (``algebra.one``), i.e. ``one + (weight of all non-trivial paths)``.
+
+        Returns ``self.abstract_weight`` when no graph is attached.
+        """
+        wg = self.graph
+        if wg is None:
+            return self.abstract_weight
+
+        algebra = wg.algebra
+        src = self.source
+        zero = algebra.zero
+        one = algebra.one
+
+        # Collect all vertices that participate in the subgraph reachable
+        # from *src* (including *src* itself).
+        vertices = list(_find_reachable(wg, src))
+        # Ensure src and target are in the vertex set
+        if src not in vertices:
+            vertices.append(src)
+        if target not in vertices:
+            # target is unreachable from src
+            return zero
+
+        n = len(vertices)
+        idx = {v: i for i, v in enumerate(vertices)}
+
+        # Build adjacency matrix (dense, n x n).
+        # w[i][j] is the semiring weight of the direct edge i -> j
+        # (or zero if no direct edge).
+        w: List[List[Any]] = [[zero for _ in range(n)] for _ in range(n)]
+        for i in range(n):
+            w[i][i] = one  # identity for the diagonal
+        for u, weight, v in wg.edges():
+            if u in idx and v in idx:
+                ui, vi = idx[u], idx[v]
+                w[ui][vi] = algebra.add(w[ui][vi], weight)
+
+        # Node elimination (Gauss-Jordan over the Kleene algebra).
+        # For each intermediate node k:
+        #   1. skk = star(w[k][k])   -- closure of all self-loops at k
+        #   2. For all (i, j) with i != k, j != k:
+        #        w[i][j] += w[i][k] * skk * w[k][j]
+        #
+        # After processing all nodes, w[i][j] is the transitive closure
+        # (sum over all paths from i to j).  We do NOT zero out row/column
+        # k: the final matrix IS the closure result.
+        #
+        # All reads in the inner loop use the PRE-elimination values of
+        # w[i][k] and w[k][j], so we snapshot them before updating.
+        for k in range(n):
+            skk = algebra.star(w[k][k])
+            col_k = [w[i][k] for i in range(n)]
+            row_k = list(w[k])
+            for i in range(n):
+                if i == k:
+                    continue
+                wik = col_k[i]
+                if wik == zero:
+                    continue
+                wik_skk = algebra.mul(wik, skk)
+                for j in range(n):
+                    if j == k:
+                        continue
+                    wkj = row_k[j]
+                    if wkj == zero:
+                        continue
+                    w[i][j] = algebra.add(w[i][j], algebra.mul(wik_skk, wkj))
+
+        src_idx = idx[src]
+        tgt_idx = idx[target]
+        return w[src_idx][tgt_idx]
 
     def call_weight(self, entry_exit: Tuple[int, int]) -> T:
-        """Compute the call weight for a call edge."""
-        # Default implementation - return the abstract weight
-        # A full implementation would compute call-specific weights
-        return self.abstract_weight
+        """Compute the call weight for a call edge.
 
-    def omega_path_weight(
-        self, omega_algebra: Any
-    ) -> Any:  # Would need proper omega algebra type
-        """Compute infinite path weights."""
-        # Default implementation - return the abstract weight
-        # A full implementation would handle infinite paths using omega algebra
-        return self.abstract_weight
+        Delegates to :meth:`path_weight` between the (entry, exit) pair.
+        """
+        entry, exit_v = entry_exit
+        return self.path_weight(exit_v)
+
+    def omega_path_weight(self, omega_algebra: Any) -> Any:
+        """Compute the omega path weight from *source*.
+
+        An omega path is an infinite path that eventually settles into a
+        cycle (a lasso-shaped path).  The omega weight is the semiring
+        sum, over all such infinite paths, of
+        ``path_to_cycle * omega(cycle_weight)``.
+
+        The algorithm uses Tarjan's SCC decomposition:
+        1. Find all SCCs reachable from source.
+        2. For each SCC that contains a cycle (multi-vertex or self-loop),
+           compute the cycle weight using edges within the SCC and the
+           full path closure from source into the SCC.
+        3. Apply the ``omega`` operation to each cycle weight and combine
+           with ``omega_add``.
+
+        Returns ``self.abstract_weight`` when no graph is attached.
+        """
+        wg = self.graph
+        if wg is None:
+            return self.abstract_weight
+
+        algebra = wg.algebra
+        src = self.source
+        zero = algebra.zero
+
+        omega_op = omega_algebra.omega
+        omega_add = omega_algebra.omega_add
+
+        # Collect reachable vertices and find SCCs
+        reachable = _find_reachable(wg, src)
+        if src not in reachable:
+            reachable = {src}
+
+        sccs = _find_sccs_in_vertices(wg, reachable)
+
+        omega_result = omega_op(zero)  # omega-algebra zero
+
+        for scc in sccs:
+            # Skip trivial SCCs without self-loops
+            if len(scc) == 1:
+                v = next(iter(scc))
+                if not wg.mem_edge(v, v):
+                    continue
+
+            # This SCC has a cycle.  Compute the weight of a cycle in
+            # this SCC using edges within the SCC.
+            cycle_w = _find_cycle_weight_in_scc(wg, scc)
+            if cycle_w == zero:
+                continue
+
+            omega_result = omega_add(omega_result, omega_op(cycle_w))
+
+        return omega_result
 
 
 # Box (Interval) Abstract Domain
@@ -516,10 +719,23 @@ def make_transition_system() -> TransitionSystem[T]:
 
 
 def make_query(
-    transition_system: TransitionSystem[T], source: int, abstract_weight: Any
+    transition_system: TransitionSystem[T],
+    source: int,
+    abstract_weight: Any,
+    graph: Optional[WeightedGraph[T]] = None,
 ) -> Query[T]:
-    """Create a query for path weight computation."""
-    return Query(transition_system, source, abstract_weight)
+    """Create a query for path weight computation.
+
+    Args:
+        transition_system: The transition system to query.
+        source: Source vertex for path weight computation.
+        abstract_weight: Fallback weight returned when no graph is attached.
+        graph: Optional weighted graph with a Kleene algebra over its
+            edge weights.  When provided, :meth:`Query.path_weight` and
+            :meth:`Query.omega_path_weight` compute actual path weights
+            via node elimination instead of returning the abstract weight.
+    """
+    return Query(transition_system, source, abstract_weight, graph=graph)
 
 
 def remove_temporaries(ts: TransitionSystem[T]) -> TransitionSystem[T]:

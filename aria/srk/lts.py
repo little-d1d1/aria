@@ -187,17 +187,66 @@ class PartialLinearMap:
         """Normalize the partial map.
 
         After normalization:
-        1. Guard vectors are linearly independent (basis)
-        2. Map sends every vector orthogonal to domain to 0
+        1. Guard vectors are linearly independent (basis for the guard space)
+        2. Map sends every vector in the guard space to 0
 
-        Simplified implementation - a full version would compute proper basis.
+        Algorithm (matching OCaml implementation):
+        1. Compute a basis for the guard space (linearly independent vectors).
+        2. Compute the nullspace of the guard = the domain of the partial map.
+        3. Combine [domain; guard] to form a full basis M for the ambient space.
+        4. Compute M_inv = inverse(M).
+        5. Rewrite map_matrix = map_matrix * domain^T * M_inv.
+
+        This ensures:
+        - For vectors in domain: new_map(x) = original_map(x)
+        - For guard vectors: new_map(x) = 0
         """
-        # For now, just keep the guard as-is
-        # A full implementation would:
-        # 1. Compute basis for guard space
-        # 2. Compute nullspace (domain)
-        # 3. Perform change of basis
-        pass
+        if not self.guard:
+            return
+
+        # Step 1: Compute linearly independent basis for guard space.
+        guard_basis = QQVectorSpace(self.guard).simplify().basis
+        if not guard_basis:
+            self.guard = []
+            return
+
+        # Step 2: Compute nullspace of guard = domain.
+        # guard_basis vectors are rows of the guard matrix G.
+        # Domain = {v : Gv = 0}, i.e., nullspace of G.
+        guard_mat = QQMatrix(guard_basis)
+        all_dims = set()
+        for row in self.map_matrix.rows:
+            all_dims.update(row.dimensions())
+        for row in guard_mat.rows:
+            all_dims.update(row.dimensions())
+        dims = sorted(all_dims) if all_dims else list(range(guard_mat.nb_rows()))
+
+        domain = nullspace(guard_mat, dims)
+
+        # Step 3: Stack [domain; guard] into full basis M for the ambient space.
+        combined = domain + guard_basis
+        M = QQMatrix(combined)
+
+        # Step 4: Compute M_inv via M * M_inv = I.
+        n = len(combined)
+        I_n = identity_matrix(n)
+        M_inv = divide_right(M, I_n)
+
+        if M_inv is None:
+            # Degenerate case — guard and domain don't span the space.
+            # Keep guard as-is; this shouldn't happen with correct inputs.
+            self.guard = guard_basis
+            return
+
+        # Step 5: Rewrite map_matrix = map_matrix * domain^T * M_inv.
+        # domain^T is the transpose of the domain matrix (rows -> columns).
+        # M_inv maps from the new basis back to standard coordinates.
+        # Composing map_matrix * domain^T * M_inv ensures:
+        #   - domain component preserved, guard component zeroed
+        domain_mat = QQMatrix(domain)
+        domain_T = domain_mat.transpose()
+        self.map_matrix = (self.map_matrix * domain_T) * M_inv
+        self.guard = guard_basis
 
     @staticmethod
     def make(map_matrix: QQMatrix, guard: List[QQVector]) -> PartialLinearMap:

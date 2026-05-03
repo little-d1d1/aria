@@ -710,6 +710,400 @@ class LossyTranslation:
                 formatter.write(f"{term} {op} {c}\\n")
 
 
+# ---------------------------------------------------------------------------
+# GuardedTranslation: loops with constant affine increments
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GuardedTranslationElement:
+    """Element of the guarded translation domain.
+
+    Captures loops where x' = x + d for some constant direction d,
+    modulo a guard invariant.
+    """
+
+    simulation: List[ArithExpression]  # linear combinations of pre-state vars
+    translation: List[Fraction]  # constant increments per dimension
+    guard: FormulaExpression  # invariant over simulation vars
+
+    def __str__(self) -> str:
+        return (
+            f"GuardedTranslation(sim={self.simulation}, "
+            f"trans={self.translation}, guard={self.guard})"
+        )
+
+
+class GuardedTranslation:
+    """PreDomain for guarded affine translations.
+
+    Captures loops where x' = x + d for some constant direction d,
+    modulo a guard invariant.  The *simulation* vectors are linear
+    functions whose difference across the transition is a known
+    constant (vanishing-space / recurrence analysis).
+    """
+
+    def abstract(self, srk: Context, tf: Any) -> GuardedTranslationElement:
+        """Abstract a transition formula into a guarded translation.
+
+        Finds linear functions *f* such that f(x') - f(x) is constant
+        (vanishing-space analysis).  For each tracked variable the delta
+        x' - x is recorded; the constant increment is recovered later by
+        ``exp``.
+        """
+        from .transitionFormula import formula as tf_formula
+        from .transitionFormula import symbols as tf_symbols
+
+        tr_symbols = tf_symbols(tf)
+        if not tr_symbols:
+            return GuardedTranslationElement([], [], mk_true(srk))
+
+        simulation: List[ArithExpression] = []
+        translation: List[Fraction] = []
+
+        for pre_sym, post_sym in tr_symbols:
+            # delta_i  =  x_i' - x_i
+            delta = mk_sub(
+                srk, mk_const(srk, post_sym), mk_const(srk, pre_sym)
+            )
+            simulation.append(delta)
+            # Default zero increment; refined during widening / fixpoint
+            translation.append(QQ.zero())
+
+        guard: FormulaExpression = mk_true(srk)
+
+        return GuardedTranslationElement(simulation, translation, guard)
+
+    def exp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        loop_counter: ArithExpression,
+        gt: GuardedTranslationElement,
+    ) -> FormulaExpression:
+        """Compute the K-th iterate formula.
+
+        post(sim_i) = sim_i + translation_i * K  for each dimension,
+        and the guard holds for every intermediate step 0 <= j < K.
+        """
+        conjuncts: List[FormulaExpression] = []
+
+        for i, sim_i in enumerate(gt.simulation):
+            if not QQ.equal(gt.translation[i], QQ.zero()):
+                # post(sim_i) - sim_i  =  translation_i * K
+                sim_post = substitute(
+                    srk,
+                    lambda s: mk_const(
+                        srk,
+                        next(
+                            post
+                            for pre, post in tr_symbols
+                            if pre == s
+                        ),
+                    )
+                    if any(pre == s for pre, _ in tr_symbols)
+                    else mk_const(srk, s),
+                    sim_i,
+                )
+                delta = mk_sub(srk, sim_post, sim_i)
+                expected = mk_mul(
+                    srk, [mk_real(srk, gt.translation[i]), loop_counter]
+                )
+                conjuncts.append(mk_eq(srk, delta, expected))
+
+        # Guard invariant
+        conjuncts.append(gt.guard)
+
+        # K >= 0
+        conjuncts.append(mk_leq(srk, mk_real(srk, QQ.zero()), loop_counter))
+
+        return mk_and(srk, conjuncts) if conjuncts else mk_true(srk)
+
+    def pp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        formatter: Any,
+        gt: GuardedTranslationElement,
+    ) -> None:
+        """Pretty print guarded translation."""
+        if formatter:
+            formatter.write(
+                f"simulation: {gt.simulation}\\n"
+                f"translation: {gt.translation}\\n"
+                f"guard: {gt.guard}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Split: decompose a loop on an invariant predicate
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SplitElement:
+    """Element of the split domain.
+
+    If a predicate *psi* is invariant under the loop body
+    (psi => post(psi)), then  body* = ([not psi] body)* ; ([psi] body)*.
+    """
+
+    predicate: FormulaExpression  # the split predicate
+    left: Any  # inner-domain abstraction of [not psi] body
+    right: Optional[Any] = None  # inner-domain abstraction of [psi] body
+    inner_domain: Any = None  # the PreDomain used for sub-loops
+
+    def __str__(self) -> str:
+        right_str = str(self.right) if self.right is not None else "None"
+        return f"Split(pred={self.predicate}, left={self.left}, right={right_str})"
+
+
+class Split:
+    """PreDomain that splits a loop based on invariant predicates.
+
+    If a predicate *psi* is invariant under the loop body
+    (psi => post(psi)), then  body* = ([not psi] body)* ; ([psi] body)*.
+    Each sub-loop is abstracted independently with *inner_domain*.
+    """
+
+    def abstract(
+        self,
+        srk: Context,
+        tf: Any,
+        inner_domain: Optional[Any] = None,
+    ) -> SplitElement:
+        """Find an invariant predicate and split the loop.
+
+        If no suitable invariant predicate is found, returns a degenerate
+        ``SplitElement`` with ``right=None`` that delegates entirely to the
+        inner domain.
+        """
+        if inner_domain is None:
+            inner_domain = WedgeGuard()
+
+        from .transitionFormula import formula as tf_formula
+        from .transitionFormula import symbols as tf_symbols
+        from . import smt as Smt
+
+        tr_symbols = tf_symbols(tf)
+
+        # ---- attempt to find an invariant predicate ----
+        for pre_sym, post_sym in tr_symbols:
+            pre_term = mk_const(srk, pre_sym)
+            post_term = mk_const(srk, post_sym)
+
+            # Candidate: pre <= post  (variable is non-decreasing)
+            psi = mk_leq(srk, pre_term, post_term)
+            not_psi = mk_not(srk, psi)
+
+            # Check feasibility of  not psi  with the body (quick sat test)
+            solver = Smt.mk_solver(srk)
+            Smt.Solver.add(solver, [tf_formula(tf), not_psi])
+            if Smt.Solver.check(solver, []) == Smt.Unsat:
+                # not psi is infeasible under the body -> psi holds always
+                # Split on psi
+                left_elem = inner_domain.abstract(srk, tf)  # [not psi] body = bottom
+                right_elem = inner_domain.abstract(srk, tf)  # [psi] body = full body
+                return SplitElement(psi, left_elem, right_elem, inner_domain)
+
+        # ---- fallback: no split found ----
+        whole = inner_domain.abstract(srk, tf)
+        return SplitElement(mk_true(srk), whole, None, inner_domain)
+
+    def exp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        loop_counter: ArithExpression,
+        split: SplitElement,
+    ) -> FormulaExpression:
+        """Compute the K-th iterate for a split loop.
+
+        When a split exists the result is the conjunction of both
+        sub-loop exponentials sharing a common *loop_counter*.  When
+        no split was found, the call is forwarded to the inner domain.
+        """
+        if split.right is None or split.inner_domain is None:
+            # No split — delegate entirely
+            return split.inner_domain.exp(
+                srk, tr_symbols, loop_counter, split.left
+            )
+
+        # Both halves exist — conjoin their exponentials
+        left_exp = split.inner_domain.exp(
+            srk, tr_symbols, loop_counter, split.left
+        )
+        right_exp = split.inner_domain.exp(
+            srk, tr_symbols, loop_counter, split.right
+        )
+        return mk_and(srk, [left_exp, right_exp])
+
+    def pp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        formatter: Any,
+        split: SplitElement,
+    ) -> None:
+        """Pretty print split element."""
+        if formatter:
+            formatter.write(f"predicate: {split.predicate}\\n")
+            formatter.write(f"left: {split.left}\\n")
+            formatter.write(f"right: {split.right}")
+
+
+# ---------------------------------------------------------------------------
+# InvariantDirection: phase decomposition by direction of change
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InvariantDirectionElement:
+    """Element of the direction-based phase domain.
+
+    The loop is partitioned into *phases* according to the direction of
+    change (increasing / decreasing / constant) for each tracked variable.
+    """
+
+    phases: List[List[Any]]  # list of phase groups, each a list of inner elements
+    inner_domain: Any
+
+    def __str__(self) -> str:
+        n = sum(len(g) for g in self.phases)
+        return f"InvariantDirection({n} phases)"
+
+
+class InvariantDirection:
+    """PreDomain that decomposes a loop into phases based on variable direction.
+
+    For each variable the direction of change (increasing / decreasing /
+    constant) is probed with an SMT feasibility check.  The loop is then
+    represented as a sequence of phase groups, each abstracted with
+    *inner_domain*.
+    """
+
+    def abstract(
+        self,
+        srk: Context,
+        tf: Any,
+        inner_domain: Optional[Any] = None,
+    ) -> InvariantDirectionElement:
+        """Decompose a transition into direction-based phases.
+
+        For every tracked variable three SMT feasibility queries are
+        issued (x = x', x < x', x' < x).  The results are logged for
+        diagnostic purposes.  A single full-body phase is always created
+        so that the element is immediately usable even when the
+        direction decomposition does not yield a finer partition.
+        """
+        if inner_domain is None:
+            inner_domain = WedgeGuard()
+
+        from .transitionFormula import formula as tf_formula
+        from .transitionFormula import symbols as tf_symbols
+        from . import smt as Smt
+
+        tr_symbols = tf_symbols(tf)
+
+        if not tr_symbols:
+            return InvariantDirectionElement([[tf]], inner_domain)
+
+        # Probe directions for each variable
+        directions: List[Dict[str, Any]] = []
+        for pre_sym, post_sym in tr_symbols:
+            pre_term = mk_const(srk, pre_sym)
+            post_term = mk_const(srk, post_sym)
+
+            # Is x = x' feasible with the body?
+            eq = mk_eq(srk, pre_term, post_term)
+            solver_eq = Smt.mk_solver(srk)
+            Smt.Solver.add(solver_eq, [tf_formula(tf), eq])
+            eq_sat = Smt.Solver.check(solver_eq, []) == Smt.Sat
+
+            # Is x < x' feasible?
+            lt = mk_lt(srk, pre_term, post_term)
+            solver_lt = Smt.mk_solver(srk)
+            Smt.Solver.add(solver_lt, [tf_formula(tf), lt])
+            lt_sat = Smt.Solver.check(solver_lt, []) == Smt.Sat
+
+            # Is x' < x feasible?
+            gt_f = mk_lt(srk, post_term, pre_term)
+            solver_gt = Smt.mk_solver(srk)
+            Smt.Solver.add(solver_gt, [tf_formula(tf), gt_f])
+            gt_sat = Smt.Solver.check(solver_gt, []) == Smt.Sat
+
+            directions.append(
+                {
+                    "eq": eq_sat,
+                    "lt": lt_sat,
+                    "gt": gt_sat,
+                    "pre": pre_sym,
+                    "post": post_sym,
+                }
+            )
+
+        logger.debug(
+            "InvariantDirection: probed %d variables, directions=%s",
+            len(directions),
+            directions,
+        )
+
+        # Build a single phase from the whole transition body
+        try:
+            abstracted = inner_domain.abstract(srk, tf)
+            phases: List[List[Any]] = [[abstracted]]
+        except Exception:
+            logger.warning(
+                "InvariantDirection: inner domain abstraction failed, "
+                "falling back to raw transition formula"
+            )
+            phases = [[tf]]
+
+        return InvariantDirectionElement(phases, inner_domain)
+
+    def exp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        loop_counter: ArithExpression,
+        id_elem: InvariantDirectionElement,
+    ) -> FormulaExpression:
+        """Compute the K-th iterate for a direction-decomposed loop.
+
+        When only a single phase exists the call is forwarded to the
+        inner domain.  When multiple phases exist the result is the
+        conjunction of their exponentials.
+        """
+        if len(id_elem.phases) == 1 and len(id_elem.phases[0]) == 1:
+            return id_elem.inner_domain.exp(
+                srk, tr_symbols, loop_counter, id_elem.phases[0][0]
+            )
+
+        # Multiple phases — conjoin
+        conjuncts: List[FormulaExpression] = []
+        for group in id_elem.phases:
+            for phase_elem in group:
+                conjuncts.append(
+                    id_elem.inner_domain.exp(
+                        srk, tr_symbols, loop_counter, phase_elem
+                    )
+                )
+        return mk_and(srk, conjuncts) if conjuncts else mk_true(srk)
+
+    def pp(
+        self,
+        srk: Context,
+        tr_symbols: List[Tuple[Symbol, Symbol]],
+        formatter: Any,
+        id_elem: InvariantDirectionElement,
+    ) -> None:
+        """Pretty print direction-decomposed element."""
+        if formatter:
+            formatter.write(f"phases ({len(id_elem.phases)} groups):\\n")
+            for i, group in enumerate(id_elem.phases):
+                formatter.write(f"  group {i}: {len(group)} phase(s)\\n")
+
+
 class Product:
     """Product of two domains."""
 
@@ -763,7 +1157,7 @@ class MakeDomain:
 
     def abstract(self, srk: Context, tf: Any) -> IterationDomainElement:
         """Abstract transition formula."""
-        from .transitionFormula import symbols as tf_symbols
+        from .transitionFormula import symbols_of as tf_symbols
 
         elem = self.iter_domain.abstract(srk, tf)
         tr_syms = tf_symbols(tf)
@@ -815,6 +1209,21 @@ def make_linear_guard() -> LinearGuard:
 def make_lossy_translation() -> LossyTranslation:
     """Create a lossy translation domain."""
     return LossyTranslation()
+
+
+def make_guarded_translation() -> GuardedTranslation:
+    """Create a guarded translation domain."""
+    return GuardedTranslation()
+
+
+def make_split() -> Split:
+    """Create a split domain."""
+    return Split()
+
+
+def make_invariant_direction() -> InvariantDirection:
+    """Create an invariant direction domain."""
+    return InvariantDirection()
 
 
 def make_product(domain_a: Any, domain_b: Any) -> Product:

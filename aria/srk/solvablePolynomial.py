@@ -285,8 +285,8 @@ class UPXs:
                 coeff = upxs._terms.get(monomial, UP.zero())
                 period_coeffs.append(coeff)
 
-            # Flatten the periodic coefficients
-            flattened_up = UP.flatten(period_coeffs)
+            # Flatten the periodic coefficients into a closed-form UP/UPCombination
+            flattened_up = _up_flatten(period_coeffs)
             if not _up_is_zero(flattened_up):
                 result = UPXs.add(result, UPXs.add_term(flattened_up, monomial, UPXs()))
 
@@ -404,7 +404,7 @@ def matrix_polyvec_mul(m: List[List[Fraction]], polyvec: List[QQX]) -> List[QQX]
     for i in range(rows):
         for j in range(cols):
             if j < len(m[i]) and m[i][j] != Fraction(0):
-                result[i] = QQX.add(result[i], QQX.scalar_mul(m[i][j], polyvec[j]))
+                result[i] = result[i] + polyvec[j].scalar_mul(m[i][j])
 
     return result
 
@@ -432,7 +432,7 @@ def vec_qqxsvec_dot(vec1: List[Fraction], vec2: List[QQX]) -> QQX:
     result = QQX.zero()
     for i in range(len(vec1)):
         if vec1[i] != Fraction(0):
-            result = QQX.add(result, QQX.scalar_mul(vec1[i], vec2[i]))
+            result = result + vec2[i].scalar_mul(vec1[i])
 
     return result
 
@@ -451,7 +451,7 @@ def matrix_polyvec_mul_improved(
     for i in range(rows):
         for j in range(cols):
             if j < len(m[i]) and m[i][j] != Fraction(0):
-                result[i] = QQX.add(result[i], QQX.scalar_mul(m[i][j], polyvec[j]))
+                result[i] = result[i] + polyvec[j].scalar_mul(m[i][j])
 
     return result
 
@@ -683,11 +683,20 @@ def _upxs_constant_value(upxs: UPXs) -> Optional[Fraction]:
     return _up_constant_value(upxs._terms[_monomial_one()])
 
 
-def _geometric_affine_sum(multiplier: Fraction, addend: Fraction) -> "UP":
+def _geometric_affine_sum(multiplier: Fraction, addend: Fraction) -> Union["UP", "UPCombination"]:
+    """Closed form of sum_{i=0}^{k-1} multiplier^i * addend.
+
+    Returns UP when the formula is a single exponential-polynomial, or
+    UPCombination when the multiplier is a root of unity (period > 1).
+    """
     if addend == 0:
         return UP.zero()
     if multiplier == 1:
         return _up_linear_k(addend)
+    if multiplier == -1:
+        # sum_{i=0}^{k-1} (-1)^i * addend = addend/2 * (1 - (-1)^k)
+        half = addend / Fraction(2)
+        return UPCombination([_up_constant(half), _up_exponential(Fraction(-1), -half)])
     scale = addend / (multiplier - 1)
     return _up_add(_up_exponential(multiplier, scale), _up_constant(-scale))
 
@@ -725,6 +734,122 @@ def closure_ocrs(sp: SolvablePolynomial) -> List[Any]:
     return closure_periodic_rational(sp)
 
 
+def _list_vector_left_mul(
+    vec: List[Fraction], matrix: List[List[Fraction]]
+) -> List[Fraction]:
+    """Compute v * M where vec is a row vector and matrix is a list-of-lists."""
+    rows = len(matrix)
+    cols = len(matrix[0]) if rows > 0 else 0
+    result = [Fraction(0)] * cols
+    for j in range(cols):
+        for i in range(rows):
+            if vec[i] != Fraction(0):
+                result[j] += vec[i] * matrix[i][j]
+    return result
+
+
+def _list_matrix_power(
+    matrix: List[List[Fraction]], n: int
+) -> List[List[Fraction]]:
+    """Compute M^n for a list-of-lists matrix via repeated squaring."""
+    size = len(matrix)
+    if n == 0:
+        return [
+            [Fraction(1) if i == j else Fraction(0) for j in range(size)]
+            for i in range(size)
+        ]
+    result = [
+        [Fraction(1) if i == j else Fraction(0) for j in range(size)]
+        for i in range(size)
+    ]
+    base = [row[:] for row in matrix]
+    while n > 0:
+        if n % 2 == 1:
+            # result = result * base
+            new_result = [[Fraction(0)] * size for _ in range(size)]
+            for i in range(size):
+                for j in range(size):
+                    for k in range(size):
+                        new_result[i][j] += result[i][k] * base[k][j]
+            result = new_result
+        # base = base * base
+        new_base = [[Fraction(0)] * size for _ in range(size)]
+        for i in range(size):
+            for j in range(size):
+                for k in range(size):
+                    new_base[i][j] += base[i][k] * base[k][j]
+        base = new_base
+        n //= 2
+    return result
+
+
+def _up_make(transient: List["UP"], periodic: List["UP"]) -> Union["UP", "UPCombination"]:
+    """Create an ultimately periodic sequence from transient and periodic parts.
+
+    For period p with shared base lambda, produces a closed-form representation
+    that evaluates to periodic[k % p].evaluate(k) at each step k.
+
+    For p=2, uses the (-1)^k decomposition:
+      f(k) = (ep0+ep1)/2 + (ep0-ep1)/2 * (-1)^k  (applied per polynomial part)
+    """
+    if not periodic:
+        return UP.zero()
+    if len(periodic) == 1:
+        return periodic[0]
+    # Use the same decomposition as _up_flatten for period 2.
+    return _up_flatten(periodic)
+
+
+def _up_flatten(period_list: List["UP"]) -> Union["UP", "UPCombination"]:
+    """Flatten a periodic list of UP values into a single closed-form expression.
+
+    For period p with shared base lambda, the k-th value is
+    period_list[k % p].evaluate(k), i.e., c_{k%p} * lambda^k (for constant
+    polynomial coefficients).
+
+    For p=2, the decomposition is:
+      f(k) = (c0+c1)/2 * lambda^k  +  (c0-c1)/2 * (-lambda)^k
+    using the indicator 1_{k even} = (1+(-1)^k)/2.
+    """
+    if not period_list:
+        return UP.zero()
+    if len(period_list) == 1:
+        return period_list[0]
+
+    p = len(period_list)
+    # Find lambda from the first non-zero period element (zero elements
+    # may have lost their base due to _up_exponential shortcutting on coeff=0).
+    lam = None
+    for ep in period_list:
+        if not _up_is_zero(ep) and ep.exponential_part != Fraction(0):
+            lam = ep.exponential_part
+            break
+    if lam is None:
+        # All zero or all base-0: fall back to first element's base.
+        lam = period_list[0].exponential_part
+
+    if p == 2:
+        c0_poly = period_list[0].polynomial_part
+        c1_poly = period_list[1].polynomial_part
+
+        avg_poly = (c0_poly + c1_poly).scalar_mul(Fraction(1, 2))
+        diff_poly = (c0_poly - c1_poly).scalar_mul(Fraction(1, 2))
+
+        parts: List[UP] = []
+        if not avg_poly.is_zero():
+            parts.append(UP(avg_poly, lam))
+        if not diff_poly.is_zero():
+            parts.append(UP(diff_poly, -lam))
+        if not parts:
+            return UP.zero()
+        if len(parts) == 1:
+            return parts[0]
+        return UPCombination(parts)
+
+    # General case: not needed for signed permutation matrices (p <= 2).
+    raise NotImplementedError(f"_up_flatten for period {p}")
+
+
 def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
     """Compute closed-form with periodic rational eigenvalues."""
     total_dim = dimension(sp)
@@ -735,27 +860,189 @@ def closure_periodic_rational(sp: SolvablePolynomial) -> List["UPXs"]:
         size = block_size(block)
         if size == 0:
             return
-        if not _is_diagonal_matrix(block.blk_transform, size):
+
+        # Substitute closed forms of previously-closed dimensions into the
+        # additive polynomial vector of this block.
+        add: List[UPXs] = []
+        for i in range(size):
+            add_poly = block.blk_add[i] if i < len(block.blk_add) else QQX.zero()
+            add.append(_substitute_closed_forms(add_poly, cf, offset, total_dim))
+
+        # Diagonal blocks use the legacy path (handles all multiplier values).
+        if _is_diagonal_matrix(block.blk_transform, size):
+            _close_block_diagonal(block, offset, size, add)
+            return
+
+        # Non-diagonal blocks: attempt signed-permutation PRSD.
+        try:
+            prsd = standard_basis_prsd(block.blk_transform, size)
+        except (NotImplementedError, ValueError):
             raise NotImplementedError(
-                "closure_periodic_rational currently supports diagonal blocks only"
+                "closure_periodic_rational: unsupported block structure"
             )
 
-        # For each dimension in the block, compute its closed form
+        # --- PRSD-based path for non-diagonal (signed permutation) blocks ---
+        for _group_idx, (p, lam, eigenvectors) in enumerate(prsd):
+            for v_idx, v in enumerate(eigenvectors):
+                # Locate which dimension this eigenvector contributes to.
+                # For standard-basis eigenvectors, find the nonzero entry.
+                nonzero_dims = [
+                    j for j in range(size) if v[j] != Fraction(0)
+                ]
+                if len(nonzero_dims) != 1 or v[nonzero_dims[0]] != Fraction(1):
+                    raise NotImplementedError(
+                        "closure_periodic_rational: expected standard-basis "
+                        "eigenvectors from standard_basis_prsd"
+                    )
+                row_i = nonzero_dims[0]
+
+                if lam == Fraction(0):
+                    # --- lambda == 0: polynomial growth ---
+                    _close_zero_eigenvalue(row_i, offset, size, add, cf, total_dim)
+                else:
+                    # --- lambda != 0: periodic orbit (non-diagonal path) ---
+                    _close_nonzero_eigenvalue(
+                        row_i, p, lam, v, block.blk_transform,
+                        size, offset, add, cf, total_dim,
+                    )
+
+    def _close_zero_eigenvalue(
+        row_i: int, offset: int, size: int,
+        add: List[UPXs], cf: List[UPXs], total_dim: int,
+    ) -> None:
+        """Closed form for a dimension with eigenvalue 0 (non-diagonal block).
+
+        x(k+1) = 0 * x(k) + add(k)  =>  x(k) = x(0) for k=0, add(k-1) for k>0.
+        For standard-basis eigenvectors this simplifies to the same form as the
+        diagonal lambda=0 case.
+        """
+        dim_idx = offset + row_i
+        initial = _upxs_variable(dim_idx, total_dim, _up_exponential(Fraction(0)))
+        cf[dim_idx] = initial.add(
+            add[row_i].map_coeff(
+                lambda _m, f: _up_make(
+                    [_up_constant(f.evaluate(0))],
+                    [UP.zero()],
+                )
+            )
+        )
+
+    def _close_nonzero_eigenvalue(
+        row_i: int,
+        p: int,
+        lam: "Fraction",
+        v: List[Fraction],
+        transform: List[List[Fraction]],
+        size: int,
+        offset: int,
+        add: List[UPXs],
+        cf: List[UPXs],
+        total_dim: int,
+    ) -> None:
+        """Compute closed form for one eigenvector with nonzero eigenvalue.
+
+        Mirrors the OCaml ``lambda != 0`` branch of ``closure_periodic_rational``.
+        """
+        # 1. Compute periodic orbit: v_Ai = [v*A^0, v*A^1, ..., v*A^{p-1}]
+        v_current = list(v)
+        v_Ai: List[List[Fraction]] = [list(v_current)]
+        for _ in range(1, p):
+            v_current = _list_vector_left_mul(v_current, transform)
+            v_Ai.append(list(v_current))
+
+        # 2. cf_transform: for each dimension i in the block, build a
+        #    periodic exponential polynomial with base lambda.
+        cf_transform = UPXs.zero()
+        for i in range(size):
+            period_list: List[UP] = []
+            for r in range(p):
+                coeff = v_Ai[r][i] if i < len(v_Ai[r]) else Fraction(0)
+                period_list.append(_up_exponential(lam, coeff))
+            up = _up_make([], period_list)
+            if not _up_is_zero(up):
+                cf_transform = UPXs.add(
+                    cf_transform,
+                    UPXs.add_term(up, _monomial_var(offset + i, offset + size)),
+                )
+
+        # 3. cf_add: solve the periodic recurrence for the additive terms.
+        #    For each phase i in 0..p-1, compute:
+        #      cf_add[i] = UP.solve_rec ~initial lambda (cf_pk_i + sum_pk_i)
+        #    then flatten.
+        cf_add_parts: List[UPXs] = []
+        for i in range(p):
+            # sum_{j=0}^{p-1} v * A^{p-j-1} * add(pk+j+i)
+            sum_pk_i = UPXs.zero()
+            for j in range(p):
+                vAj = _list_vector_left_mul(
+                    v, _list_matrix_power(transform, p - j - 1)
+                )
+                # add_composed[r] = add[r] with k ↦ p*k + j + i
+                add_composed = [
+                    add[r].map_coeff(
+                        lambda _m, f, _j=j, _i=i: f.compose_left_affine(p, _j + _i),
+                    )
+                    for r in range(size)
+                ]
+                sum_pk_i = UPXs.add(
+                    sum_pk_i,
+                    vec_upxsvec_dot(vAj, add_composed),
+                )
+
+            # cf(pk+i)
+            cf_pk_i = cf[offset + row_i].map_coeff(
+                lambda _m, f, _i=i: f.compose_left_affine(p, _i),
+            )
+
+            # sum_{j=0}^{i-1} v * A^{i-j-1} * cf_add(j)
+            initial_accum = QQX.zero()
+            for j in range(i):
+                cf_add_j = [add[r].eval(j) for r in range(size)]
+                vAij = _list_vector_left_mul(
+                    v, _list_matrix_power(transform, i - j - 1)
+                )
+                initial_accum = initial_accum + vec_qqxsvec_dot(vAij, cf_add_j)
+
+            # Build get_initial(m) to extract the coefficient for each monomial
+            def get_initial(m: Monomial, _acc=initial_accum) -> Fraction:
+                """Coefficient of monomial m in the initial accumulator."""
+                for m2, coeff in _acc.enum():
+                    if m2 == m:
+                        return coeff
+                return Fraction(0)
+
+            # Solve: f(k+1) = lambda * f(k) + (cf_pk_i + sum_pk_i)(k)
+            combined = UPXs.add(cf_pk_i, sum_pk_i)
+            cf_add_i = combined.map_coeff(
+                lambda m, f: f.solve_rec(
+                    initial=get_initial(m), lambda_val=lam
+                )
+            )
+            cf_add_parts.append(cf_add_i)
+
+        # Flatten the periodic sequence of UPXs
+        cf_add = UPXs.zero().flatten(cf_add_parts)
+
+        # Combine transform and additive parts
+        cf[offset + row_i] = UPXs.add(cf_transform, cf_add)
+
+    def _close_block_diagonal(
+        block: Block, offset: int, size: int, add: List[UPXs]
+    ) -> None:
+        """Legacy diagonal-only closed form (backward compatible)."""
         for i in range(size):
             dim_idx = offset + i
             multiplier = block.blk_transform[i][i]
-            add_poly = block.blk_add[i] if i < len(block.blk_add) else QQX.zero()
-            add_upxs = _substitute_closed_forms(add_poly, cf, offset, total_dim)
             initial = _upxs_variable(
                 dim_idx, total_dim, _up_exponential(multiplier)
             )
 
             if multiplier == Fraction(1):
-                cf[dim_idx] = initial.add(_upxs_summation(add_upxs))
-            elif _is_zero_polynomial(add_poly):
+                cf[dim_idx] = initial.add(_upxs_summation(add[i]))
+            elif _is_zero_polynomial(block.blk_add[i] if i < len(block.blk_add) else QQX.zero()):
                 cf[dim_idx] = initial
             else:
-                addend = _upxs_constant_value(add_upxs)
+                addend = _upxs_constant_value(add[i])
                 if addend is None:
                     raise NotImplementedError(
                         "non-unit affine closed forms require constant additives"

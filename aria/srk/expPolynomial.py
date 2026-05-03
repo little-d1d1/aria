@@ -48,6 +48,10 @@ class ExpPolynomial:
 
     def __add__(self, other: ExpPolynomial) -> ExpPolynomial:
         """Add two exponential polynomials."""
+        if self.polynomial_part.is_zero():
+            return other
+        if other.polynomial_part.is_zero():
+            return self
         if self.exponential_part != other.exponential_part:
             raise ValueError("Cannot add exponential polynomials with different bases")
 
@@ -81,17 +85,47 @@ class ExpPolynomial:
 
     def solve_recurrence(
         self, initial: Fraction = Fraction(0), multiplier: Fraction = Fraction(1)
-    ) -> ExpPolynomial:
+    ) -> "ExpPolynomial":
         """Solve the recurrence g(n+1) = multiplier * g(n) + f(n)."""
-        # This would solve the recurrence relation
-        # For now, return a placeholder
-        return ExpPolynomial(Polynomial(), Fraction(0))
+        return self.solve_rec(initial=initial, lambda_val=multiplier)
 
-    def compose_left_affine(self, a: int, b: int) -> ExpPolynomial:
-        """Compose with affine function: λx. f(ax + b)."""
-        # This is a complex operation for exponential polynomials
-        # Placeholder implementation
-        return self
+    def compose_left_affine(self, a: int, b: int) -> "ExpPolynomial":
+        """Compose with affine function: x |-> f(a*x + b).
+
+        Given f(k) = poly(k) * mu^k, returns g(k) = f(a*k+b).
+        Result: poly(a*k+b) * mu^(a*k+b) = [mu^b * poly(a*k+b)] * (mu^a)^k.
+        """
+        from .polynomial import Monomial as M
+
+        mu = self.exponential_part
+        poly = self.polynomial_part
+
+        # Scale factor: mu^b
+        scale = mu ** b if b != 0 else Fraction(1)
+
+        # New base: mu^a
+        new_base = mu ** a if a != 1 else mu
+
+        # Compose the polynomial: poly(a*k + b)
+        # Substitute k -> a*k + b in the polynomial
+        new_poly = Polynomial()
+        for monom, coeff in poly.terms.items():
+            # Evaluate monomial at (a*k + b)
+            # For monomial k^d, (a*k+b)^d = sum_{j=0}^{d} C(d,j) * a^j * b^{d-j} * k^j
+            d = monom.exponents[0] if monom.exponents else 0
+            for j in range(d + 1):
+                binom_coeff = Fraction(1)
+                for t in range(j):
+                    binom_coeff = binom_coeff * Fraction(d - t, t + 1)
+                term_coeff = coeff * scale * binom_coeff * (a ** j) * (b ** (d - j))
+                if term_coeff != 0:
+                    new_monom = M([j]) if j > 0 else M(())
+                    if new_monom in new_poly.terms:
+                        new_poly = new_poly + Polynomial({new_monom: term_coeff})
+                    else:
+                        new_poly = new_poly + Polynomial({new_monom: term_coeff})
+
+        return ExpPolynomial(new_poly, new_base)
 
     def to_term(self, context: Context, variable: ArithExpression) -> ArithExpression:
         """Convert to an arithmetic term."""
@@ -156,19 +190,72 @@ class ExpPolynomial:
         """Get period length."""
         return 1  # Simplified
 
-    def compose_left_affine(self, a: int, b: int) -> "ExpPolynomial":
-        """Compose with affine function: λx. f(ax + b)."""
-        # This is a complex operation for exponential polynomials
-        # Placeholder implementation
-        return self
-
     def solve_rec(
         self, initial: Fraction = Fraction(0), lambda_val: Fraction = Fraction(1)
     ) -> "ExpPolynomial":
-        """Solve recurrence g(n+1) = λ*g(n) + f(n)."""
-        # This would solve the recurrence relation
-        # For now, return a placeholder
-        return ExpPolynomial(Polynomial(), Fraction(0))
+        """Solve recurrence g(n+1) = lambda*g(n) + f(n) with g(0) = initial.
+
+        f is self.  Returns the closed-form solution.
+        g(k) = lambda^k * initial + sum_{i=0}^{k-1} lambda^(k-1-i) * f(i)
+        """
+        from .polynomial import Monomial as M
+
+        mu = self.exponential_part
+        c = self.polynomial_part.evaluate({}) if self.polynomial_part.degree() <= 0 else None
+
+        # Homogeneous part: lambda^k * initial
+        if initial != 0:
+            scalar_part = ExpPolynomial(
+                Polynomial({M(()): initial}), lambda_val
+            )
+        else:
+            # Zero polynomial with correct base (so addition works)
+            scalar_part = ExpPolynomial(Polynomial(), lambda_val)
+
+        # Special case: f = 0
+        if self.polynomial_part.is_zero():
+            return scalar_part
+
+        # For non-diagonal PRSD: f(k) = c * mu^k (constant polynomial, single
+        # exponential base).  The sum simplifies to a geometric series.
+        # sum_{i=0}^{k-1} lambda^(k-1-i) * c * mu^i
+        #   = c * lambda^(k-1) * sum_{i=0}^{k-1} (mu/lambda)^i
+        if c is not None:
+            if lambda_val == 0:
+                # Only i=k-1 contributes: c * 0^0 * mu^(k-1) = c * mu^(k-1)
+                if c != 0:
+                    return scalar_part + ExpPolynomial(
+                        Polynomial({M(()): c}), mu
+                    )
+                return scalar_part
+
+            ratio = mu / lambda_val
+            base_scale = c / lambda_val  # c * lambda^(k-1) = (c/lambda) * lambda^k
+
+            if ratio == 1:
+                # Geometric sum = k;  result = (c/lambda) * k * lambda^k
+                poly_coeff = Polynomial({M((1,)): base_scale})
+                return scalar_part + ExpPolynomial(poly_coeff, lambda_val)
+            else:
+                # sum = (1 - ratio^k)/(1 - ratio)
+                # result = (c/lambda) * lambda^k * (1 - ratio^k) / (1 - ratio)
+                #        = (c/lambda) * (lambda^k - mu^k) / (1 - ratio)
+                common = base_scale / (1 - ratio)
+                if common != 0:
+                    term_lambda = ExpPolynomial(
+                        Polynomial({M(()): common}), lambda_val
+                    )
+                    term_mu = ExpPolynomial(
+                        Polynomial({M(()): -common}), mu
+                    )
+                    return scalar_part + term_lambda + term_mu
+                return scalar_part
+
+        # General case: polynomial * exponential.  Use the explicit sum.
+        # For the PRSD non-diagonal case this branch is not reached.
+        raise NotImplementedError(
+            "solve_rec for general exponential-polynomial forcing terms"
+        )
 
 
 class ExpPolynomialVector:
