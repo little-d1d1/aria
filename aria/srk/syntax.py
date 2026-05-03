@@ -338,6 +338,22 @@ class ExpressionVisitor(Generic[T]):
         """Visit an if-then-else expression."""
         return self._default_visit(ite)
 
+    def visit_div(self, div: Div) -> T:
+        """Visit a division expression."""
+        return self._default_visit(div)
+
+    def visit_mod(self, mod: Mod) -> T:
+        """Visit a modulo expression."""
+        return self._default_visit(mod)
+
+    def visit_floor(self, floor: Floor) -> T:
+        """Visit a floor expression."""
+        return self._default_visit(floor)
+
+    def visit_neg(self, neg: Neg) -> T:
+        """Visit a negation expression."""
+        return self._default_visit(neg)
+
     def visit_true(self, true_expr: TrueExpr) -> T:
         """Visit a true expression."""
         return self._default_visit(true_expr)
@@ -413,6 +429,22 @@ class DefaultExpressionVisitor(ExpressionVisitor[T]):
     def visit_ite(self, ite: Ite) -> T:
         """Default visit for if-then-else."""
         return self._default_visit(ite)
+
+    def visit_div(self, div: Div) -> T:
+        """Default visit for division."""
+        return self._default_visit(div)
+
+    def visit_mod(self, mod: Mod) -> T:
+        """Default visit for modulo."""
+        return self._default_visit(mod)
+
+    def visit_floor(self, floor: Floor) -> T:
+        """Default visit for floor."""
+        return self._default_visit(floor)
+
+    def visit_neg(self, neg: Neg) -> T:
+        """Default visit for negation."""
+        return self._default_visit(neg)
 
     def visit_true(self, true_expr: TrueExpr) -> T:
         """Default visit for true."""
@@ -679,6 +711,100 @@ class Ite(Expression):
         return visitor.visit_ite(self)
 
 
+@dataclass(frozen=True)
+class Div(Expression):
+    """Division expression (C99 semantics: truncates toward zero for integers)."""
+
+    left: ArithExpression
+    right: ArithExpression
+
+    typ = Type.REAL
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Div):
+            return False
+        return self.left == other.left and self.right == other.right
+
+    def __hash__(self) -> int:
+        return hash((self.left, self.right))
+
+    def __str__(self) -> str:
+        return f"({self.left} / {self.right})"
+
+    def accept(self, visitor: ExpressionVisitor[T]) -> T:
+        return visitor.visit_div(self)
+
+
+@dataclass(frozen=True)
+class Mod(Expression):
+    """Modulo expression."""
+
+    left: ArithExpression
+    right: ArithExpression
+
+    typ = Type.INT
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Mod):
+            return False
+        return self.left == other.left and self.right == other.right
+
+    def __hash__(self) -> int:
+        return hash((self.left, self.right))
+
+    def __str__(self) -> str:
+        return f"({self.left} mod {self.right})"
+
+    def accept(self, visitor: ExpressionVisitor[T]) -> T:
+        return visitor.visit_mod(self)
+
+
+@dataclass(frozen=True)
+class Floor(Expression):
+    """Floor expression (round toward -infinity)."""
+
+    arg: ArithExpression
+
+    typ = Type.INT
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Floor):
+            return False
+        return self.arg == other.arg
+
+    def __hash__(self) -> int:
+        return hash(self.arg)
+
+    def __str__(self) -> str:
+        return f"⌊{self.arg}⌋"
+
+    def accept(self, visitor: ExpressionVisitor[T]) -> T:
+        return visitor.visit_floor(self)
+
+
+@dataclass(frozen=True)
+class Neg(Expression):
+    """Arithmetic negation expression."""
+
+    arg: ArithExpression
+
+    typ = Type.REAL
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Neg):
+            return False
+        return self.arg == other.arg
+
+    def __hash__(self) -> int:
+        return hash(self.arg)
+
+    def __str__(self) -> str:
+        return f"(-{self.arg})"
+
+    def accept(self, visitor: ExpressionVisitor[T]) -> T:
+        return visitor.visit_neg(self)
+
+
 # Boolean expressions (formulas)
 @dataclass(frozen=True)
 class TrueExpr(Expression):
@@ -923,8 +1049,8 @@ class Exists(Expression):
 
 
 # Type aliases for cleaner code
-ArithExpression = Union[Var, Const, App, Add, Mul, Ite, Select, Store]
-TermExpression = Union[Var, Const, App, Add, Mul, Ite, Select, Store]
+ArithExpression = Union[Var, Const, App, Add, Mul, Div, Mod, Floor, Neg, Ite, Select, Store]
+TermExpression = Union[Var, Const, App, Add, Mul, Div, Mod, Floor, Neg, Ite, Select, Store]
 # Alias for backward compatibility
 ArithTerm = TermExpression
 FormulaExpression = Union[
@@ -1038,30 +1164,87 @@ class ExpressionBuilder:
         # GEQ is equivalent to LEQ with arguments swapped
         return Leq(right, left)
 
-    def mk_div(self, left: ArithExpression, right: ArithExpression) -> Mul:
-        """Create a division expression (implemented as multiplication by reciprocal)."""
-        # For now, implement as multiplication by reciprocal
-        # A full implementation would need a proper Div expression class
-        return self.mk_mul([left, self.mk_const(self.mk_symbol("inv", Type.REAL))])
+    def mk_div(self, left: ArithExpression, right: ArithExpression) -> Div:
+        """Create a division expression."""
+        return Div(left, right)
 
-    def mk_mod(self, left: ArithExpression, right: ArithExpression) -> Mul:
+    def mk_mod(self, left: ArithExpression, right: ArithExpression) -> Mod:
         """Create a modulo expression."""
-        # For now, implement as multiplication by reciprocal
-        # A full implementation would need a proper Mod expression class
-        return self.mk_mul([left, self.mk_const(self.mk_symbol("mod", Type.REAL))])
+        return Mod(left, right)
 
-    def mk_floor(self, arg: ArithExpression) -> Mul:
+    def mk_floor(self, arg: ArithExpression) -> Floor:
         """Create a floor expression."""
-        # For now, implement as application of floor function
-        # A full implementation would need a proper Floor expression class
-        return self.mk_app(
-            self.mk_symbol("floor", Type.FUN([Type.REAL], Type.REAL)), [arg]
+        return Floor(arg)
+
+    def mk_neg(self, arg: ArithExpression) -> Neg:
+        """Create an arithmetic negation expression."""
+        return Neg(arg)
+
+    def mk_idiv(self, left: ArithExpression, right: ArithExpression) -> App:
+        """Create C99 integer division (truncate toward zero)."""
+        idiv_sym = self.mk_symbol("idiv", Type.FUN([Type.REAL, Type.REAL], Type.INT))
+        return App(idiv_sym, (left, right))
+
+    def mk_ceiling(self, arg: ArithExpression) -> App:
+        """Create a ceiling expression (round toward +infinity)."""
+        ceil_sym = self.mk_symbol("ceiling", Type.FUN([Type.REAL], Type.INT))
+        return App(ceil_sym, (arg,))
+
+    def mk_truncate(self, arg: ArithExpression) -> App:
+        """Create a truncation toward zero expression."""
+        trunc_sym = self.mk_symbol("truncate", Type.FUN([Type.REAL], Type.INT))
+        return App(trunc_sym, (arg,))
+
+    def mk_arr_eq(self, left: Expression, right: Expression) -> Eq:
+        """Create an array equality formula."""
+        return Eq(left, right)
+
+    def mk_compare(
+        self, op: str, left: ArithExpression, right: ArithExpression
+    ) -> FormulaExpression:
+        """Generic comparison factory (dispatches to mk_eq/mk_lt/mk_leq)."""
+        if op == "Eq":
+            return self.mk_eq(left, right)
+        elif op in ("Lt", "Leq"):
+            return self.mk_leq(left, right) if op == "Leq" else self.mk_lt(left, right)
+        else:
+            raise ValueError(f"Unknown comparison operator: {op}")
+
+    def mk_int(self, value: int) -> Const:
+        """Create an integer constant expression."""
+        int_symbol = self.mk_symbol(f"int_{value}", Type.INT)
+        return Const(int_symbol)
+
+    def mk_zz(self, value: int) -> Const:
+        """Create an arbitrary-precision integer constant (same as mk_int)."""
+        return self.mk_int(value)
+
+    def mk_if(self, cond: FormulaExpression, then_expr: FormulaExpression) -> Or:
+        """Create an implication (cond => then_expr), desugared as (!cond or then_expr)."""
+        return Or((then_expr, Not(cond)))
+
+    def mk_iff(self, left: FormulaExpression, right: FormulaExpression) -> And:
+        """Create if-and-only-if (left <=> right)."""
+        return And(
+            (
+                Or((right, Not(left))),
+                Or((left, Not(right))),
+            )
         )
 
-    def mk_neg(self, arg: ArithExpression) -> Mul:
-        """Create a negation expression."""
-        # For now, implement as multiplication by -1
-        return self.mk_mul([self.mk_real(-1.0), arg])
+    def mk_forall_const(
+        self, symbol: Symbol, body: FormulaExpression
+    ) -> Forall:
+        """Replace constant symbol with universally quantified variable."""
+        name = symbol.name or f"s{symbol.id}"
+        return Forall(name, symbol.typ, body)
+
+    def mk_exists_const(
+        self, symbol: Symbol, body: FormulaExpression
+    ) -> Exists:
+        """Replace constant symbol with existentially quantified variable."""
+        name = symbol.name or f"s{symbol.id}"
+        return Exists(name, symbol.typ, body)
 
     def mk_real(self, value: float) -> Const:
         """Create a real constant."""
@@ -1311,7 +1494,7 @@ def mk_geq(*args) -> Leq:
         )
 
 
-def mk_div(*args) -> Mul:
+def mk_div(*args) -> Div:
     """Create a division expression.
 
     Supports:
@@ -1331,7 +1514,7 @@ def mk_div(*args) -> Mul:
         )
 
 
-def mk_mod(*args) -> Mul:
+def mk_mod(*args) -> Mod:
     """Create a modulo expression.
 
     Supports:
@@ -1351,7 +1534,7 @@ def mk_mod(*args) -> Mul:
         )
 
 
-def mk_floor(*args) -> App:
+def mk_floor(*args) -> Floor:
     """Create a floor expression.
 
     Supports:
@@ -1360,25 +1543,35 @@ def mk_floor(*args) -> App:
     """
     if len(args) == 1:
         (arg,) = args
-        floor_symbol = _default_builder.mk_symbol(
-            "floor", Type.FUN([Type.REAL], Type.INT)
-        )
-        return _default_builder.mk_app(floor_symbol, [arg])
+        return _default_builder.mk_floor(arg)
     elif len(args) == 2 and isinstance(args[0], Context):
         context, arg = args
         builder = make_expression_builder(context)
-        floor_symbol = builder.mk_symbol("floor", Type.FUN([Type.REAL], Type.INT))
-        return builder.mk_app(floor_symbol, [arg])
+        return builder.mk_floor(arg)
     else:
         raise TypeError(
             f"mk_floor expects (arg) or (context, arg), got {len(args)} args"
         )
 
 
-def mk_neg(arg: ArithExpression) -> Mul:
-    """Create a negation expression in the default context."""
-    # For now, implement as multiplication by -1
-    return _default_builder.mk_mul([_default_builder.mk_real(-1.0), arg])
+def mk_neg(*args) -> Neg:
+    """Create an arithmetic negation expression.
+
+    Supports:
+    - mk_neg(arg)
+    - mk_neg(context, arg)
+    """
+    if len(args) == 1:
+        (arg,) = args
+        return _default_builder.mk_neg(arg)
+    elif len(args) == 2 and isinstance(args[0], Context):
+        context, arg = args
+        builder = make_expression_builder(context)
+        return builder.mk_neg(arg)
+    else:
+        raise TypeError(
+            f"mk_neg expects (arg) or (context, arg), got {len(args)} args"
+        )
 
 
 def mk_real(*args) -> Const:
@@ -1419,6 +1612,188 @@ def mk_real(*args) -> Const:
         raise TypeError(
             f"mk_real expects (value) or (context, value), got {len(args)} args"
         )
+
+
+def mk_idiv(*args) -> App:
+    """Create C99 integer division (truncate toward zero)."""
+    if len(args) == 2:
+        left, right = args
+        return _default_builder.mk_idiv(left, right)
+    elif len(args) == 3 and isinstance(args[0], Context):
+        context, left, right = args
+        builder = make_expression_builder(context)
+        return builder.mk_idiv(left, right)
+    else:
+        raise TypeError(
+            f"mk_idiv expects (left, right) or (context, left, right), got {len(args)} args"
+        )
+
+
+def mk_ceiling(*args) -> App:
+    """Create a ceiling expression (round toward +infinity)."""
+    if len(args) == 1:
+        (arg,) = args
+        return _default_builder.mk_ceiling(arg)
+    elif len(args) == 2 and isinstance(args[0], Context):
+        context, arg = args
+        builder = make_expression_builder(context)
+        return builder.mk_ceiling(arg)
+    else:
+        raise TypeError(
+            f"mk_ceiling expects (arg) or (context, arg), got {len(args)} args"
+        )
+
+
+def mk_truncate(*args) -> App:
+    """Create a truncation toward zero expression."""
+    if len(args) == 1:
+        (arg,) = args
+        return _default_builder.mk_truncate(arg)
+    elif len(args) == 2 and isinstance(args[0], Context):
+        context, arg = args
+        builder = make_expression_builder(context)
+        return builder.mk_truncate(arg)
+    else:
+        raise TypeError(
+            f"mk_truncate expects (arg) or (context, arg), got {len(args)} args"
+        )
+
+
+def mk_arr_eq(*args) -> Eq:
+    """Create an array equality formula."""
+    if len(args) == 2:
+        left, right = args
+        return _default_builder.mk_arr_eq(left, right)
+    elif len(args) == 3 and isinstance(args[0], Context):
+        context, left, right = args
+        builder = make_expression_builder(context)
+        return builder.mk_arr_eq(left, right)
+    else:
+        raise TypeError(
+            f"mk_arr_eq expects (left, right) or (context, left, right), got {len(args)} args"
+        )
+
+
+def mk_compare(*args) -> FormulaExpression:
+    """Generic comparison factory (dispatches to mk_eq/mk_lt/mk_leq)."""
+    if len(args) == 3:
+        op, left, right = args
+        return _default_builder.mk_compare(op, left, right)
+    elif len(args) == 4 and isinstance(args[0], Context):
+        context, op, left, right = args
+        builder = make_expression_builder(context)
+        return builder.mk_compare(op, left, right)
+    else:
+        raise TypeError(
+            f"mk_compare expects (op, left, right) or (context, op, left, right), got {len(args)} args"
+        )
+
+
+def mk_int(*args) -> Const:
+    """Create an integer constant expression."""
+    if len(args) == 1:
+        (value,) = args
+        return _default_builder.mk_int(value)
+    elif len(args) == 2 and isinstance(args[0], Context):
+        context, value = args
+        builder = make_expression_builder(context)
+        return builder.mk_int(value)
+    else:
+        raise TypeError(
+            f"mk_int expects (value) or (context, value), got {len(args)} args"
+        )
+
+
+def mk_if(*args) -> Or:
+    """Create an implication formula (cond => then_expr)."""
+    if len(args) == 2:
+        cond, then_expr = args
+        return _default_builder.mk_if(cond, then_expr)
+    elif len(args) == 3 and isinstance(args[0], Context):
+        context, cond, then_expr = args
+        builder = make_expression_builder(context)
+        return builder.mk_if(cond, then_expr)
+    else:
+        raise TypeError(
+            f"mk_if expects (cond, then) or (context, cond, then), got {len(args)} args"
+        )
+
+
+def mk_iff(*args) -> And:
+    """Create if-and-only-if formula."""
+    if len(args) == 2:
+        left, right = args
+        return _default_builder.mk_iff(left, right)
+    elif len(args) == 3 and isinstance(args[0], Context):
+        context, left, right = args
+        builder = make_expression_builder(context)
+        return builder.mk_iff(left, right)
+    else:
+        raise TypeError(
+            f"mk_iff expects (left, right) or (context, left, right), got {len(args)} args"
+        )
+
+
+def mk_forall_const(*args) -> Forall:
+    """Replace constant symbol with universally quantified variable."""
+    if len(args) == 2:
+        symbol, body = args
+        return _default_builder.mk_forall_const(symbol, body)
+    elif len(args) == 3 and isinstance(args[0], Context):
+        context, symbol, body = args
+        builder = make_expression_builder(context)
+        return builder.mk_forall_const(symbol, body)
+    else:
+        raise TypeError(
+            f"mk_forall_const expects (symbol, body) or (context, symbol, body), got {len(args)} args"
+        )
+
+
+def mk_exists_const(*args) -> Exists:
+    """Replace constant symbol with existentially quantified variable."""
+    if len(args) == 2:
+        symbol, body = args
+        return _default_builder.mk_exists_const(symbol, body)
+    elif len(args) == 3 and isinstance(args[0], Context):
+        context, symbol, body = args
+        builder = make_expression_builder(context)
+        return builder.mk_exists_const(symbol, body)
+    else:
+        raise TypeError(
+            f"mk_exists_const expects (symbol, body) or (context, symbol, body), got {len(args)} args"
+        )
+
+
+def mk_forall_consts(
+    srk: Context, pred: Callable[[Symbol], bool], body: FormulaExpression
+) -> FormulaExpression:
+    """Universally quantify all constant symbols matching a predicate."""
+    from .srkSimplify import purify
+
+    purify_body = purify(srk, body)
+    const_syms = [
+        s for s in symbols(purify_body) if pred(s) and s.typ != Type.BOOL
+    ]
+    result = body
+    for s in const_syms:
+        result = mk_forall_const(srk, s, result)
+    return result
+
+
+def mk_exists_consts(
+    srk: Context, pred: Callable[[Symbol], bool], body: FormulaExpression
+) -> FormulaExpression:
+    """Existentially quantify all constant symbols matching a predicate."""
+    from .srkSimplify import purify
+
+    purify_body = purify(srk, body)
+    const_syms = [
+        s for s in symbols(purify_body) if pred(s) and s.typ != Type.BOOL
+    ]
+    result = body
+    for s in const_syms:
+        result = mk_exists_const(srk, s, result)
+    return result
 
 
 def of_linterm(srk: Context, term: Any) -> ArithExpression:
@@ -1871,13 +2246,159 @@ Term = TermExpression
 
 
 # Utility functions that need to be implemented
-def substitute(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Expression:
-    """Substitute symbols in expression according to substitution map."""
+def substitute(
+    expr: Expression,
+    subst_map: Union[Dict[Symbol, Expression], Callable[[int, Type], Expression]],
+) -> Expression:
+    """Substitute in an expression.
 
-    class SubstitutionVisitor(ExpressionVisitor[Expression]):
+    Two modes:
+    1. **Constant substitution** (dict): replaces each `Const(s)` with the
+       mapped expression. Symbols are tracked by identity.
+    2. **De Bruijn substitution** (callable (int, Type) -> expr): replaces
+       each `Var(i, ty)` by calling the function with (i, ty). De Bruijn
+       indices are shifted when going under a quantifier (indices increase
+       by 1 for each additional enclosing binder).
+    """
+    if callable(subst_map):
+        return _substitute_de_bruijn(expr, subst_map, 0)
+    if isinstance(subst_map, dict):
+        return _substitute_const(expr, subst_map)
+    raise TypeError(f"substitute expects dict or callable, got {type(subst_map)}")
+
+
+def _substitute_de_bruijn(
+    expr: Expression,
+    subst_fn: Callable[[int, Type], Expression],
+    depth: int,
+) -> Expression:
+    """De Bruijn substitution: replaces Var(i, ty) with subst_fn(i + depth, ty).
+
+    The depth parameter tracks how many quantifiers we've passed through.
+    Each quantifier increases depth by 1, shifting indices in the body.
+    """
+    if isinstance(expr, Var):
+        return subst_fn(expr.var_id + depth, expr.var_type)
+    if isinstance(expr, Const):
+        return expr
+    if isinstance(expr, TrueExpr):
+        return expr
+    if isinstance(expr, FalseExpr):
+        return expr
+    if isinstance(expr, Add):
+        new_args = tuple(
+            _substitute_de_bruijn(a, subst_fn, depth) for a in expr.args
+        )
+        return Add(new_args) if new_args != expr.args else expr
+    if isinstance(expr, Mul):
+        new_args = tuple(
+            _substitute_de_bruijn(a, subst_fn, depth) for a in expr.args
+        )
+        return Mul(new_args) if new_args != expr.args else expr
+    if isinstance(expr, Div):
+        new_left = _substitute_de_bruijn(expr.left, subst_fn, depth)
+        new_right = _substitute_de_bruijn(expr.right, subst_fn, depth)
+        if new_left is not expr.left or new_right is not expr.right:
+            return Div(new_left, new_right)
+        return expr
+    if isinstance(expr, Mod):
+        new_left = _substitute_de_bruijn(expr.left, subst_fn, depth)
+        new_right = _substitute_de_bruijn(expr.right, subst_fn, depth)
+        if new_left is not expr.left or new_right is not expr.right:
+            return Mod(new_left, new_right)
+        return expr
+    if isinstance(expr, Floor):
+        new_arg = _substitute_de_bruijn(expr.arg, subst_fn, depth)
+        return Floor(new_arg) if new_arg is not expr.arg else expr
+    if isinstance(expr, Neg):
+        new_arg = _substitute_de_bruijn(expr.arg, subst_fn, depth)
+        return Neg(new_arg) if new_arg is not expr.arg else expr
+    if isinstance(expr, Ite):
+        new_cond = _substitute_de_bruijn(expr.condition, subst_fn, depth)
+        new_then = _substitute_de_bruijn(expr.then_branch, subst_fn, depth)
+        new_else = _substitute_de_bruijn(expr.else_branch, subst_fn, depth)
+        if (
+            new_cond is not expr.condition
+            or new_then is not expr.then_branch
+            or new_else is not expr.else_branch
+        ):
+            return Ite(new_cond, new_then, new_else)
+        return expr
+    if isinstance(expr, App):
+        new_args = tuple(
+            _substitute_de_bruijn(a, subst_fn, depth) for a in expr.args
+        )
+        return App(expr.symbol, new_args) if new_args != expr.args else expr
+    if isinstance(expr, Select):
+        new_arr = _substitute_de_bruijn(expr.array, subst_fn, depth)
+        new_idx = _substitute_de_bruijn(expr.index, subst_fn, depth)
+        if new_arr is not expr.array or new_idx is not expr.index:
+            return Select(new_arr, new_idx)
+        return expr
+    if isinstance(expr, Store):
+        new_arr = _substitute_de_bruijn(expr.array, subst_fn, depth)
+        new_idx = _substitute_de_bruijn(expr.index, subst_fn, depth)
+        new_val = _substitute_de_bruijn(expr.value, subst_fn, depth)
+        if (
+            new_arr is not expr.array
+            or new_idx is not expr.index
+            or new_val is not expr.value
+        ):
+            return Store(new_arr, new_idx, new_val)
+        return expr
+    if isinstance(expr, And):
+        new_args = tuple(
+            _substitute_de_bruijn(a, subst_fn, depth) for a in expr.args
+        )
+        return And(new_args) if new_args != expr.args else expr
+    if isinstance(expr, Or):
+        new_args = tuple(
+            _substitute_de_bruijn(a, subst_fn, depth) for a in expr.args
+        )
+        return Or(new_args) if new_args != expr.args else expr
+    if isinstance(expr, Not):
+        new_arg = _substitute_de_bruijn(expr.arg, subst_fn, depth)
+        return Not(new_arg) if new_arg is not expr.arg else expr
+    if isinstance(expr, Eq):
+        new_left = _substitute_de_bruijn(expr.left, subst_fn, depth)
+        new_right = _substitute_de_bruijn(expr.right, subst_fn, depth)
+        if new_left is not expr.left or new_right is not expr.right:
+            return Eq(new_left, new_right)
+        return expr
+    if isinstance(expr, Lt):
+        new_left = _substitute_de_bruijn(expr.left, subst_fn, depth)
+        new_right = _substitute_de_bruijn(expr.right, subst_fn, depth)
+        if new_left is not expr.left or new_right is not expr.right:
+            return Lt(new_left, new_right)
+        return expr
+    if isinstance(expr, Leq):
+        new_left = _substitute_de_bruijn(expr.left, subst_fn, depth)
+        new_right = _substitute_de_bruijn(expr.right, subst_fn, depth)
+        if new_left is not expr.left or new_right is not expr.right:
+            return Leq(new_left, new_right)
+        return expr
+    if isinstance(expr, Forall):
+        # Under a quantifier, existing de Bruijn indices shift by 1
+        # because the new bound variable occupies index 0
+        new_body = _substitute_de_bruijn(expr.body, subst_fn, depth + 1)
+        if new_body is not expr.body:
+            return Forall(expr.var_name, expr.var_type, new_body)
+        return expr
+    if isinstance(expr, Exists):
+        new_body = _substitute_de_bruijn(expr.body, subst_fn, depth + 1)
+        if new_body is not expr.body:
+            return Exists(expr.var_name, expr.var_type, new_body)
+        return expr
+    return expr
+
+
+def _substitute_const(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Expression:
+    """Constant-based substitution: replaces Const(s) by subst_map[s]."""
+
+    class ConstSubstVisitor(ExpressionVisitor[Expression]):
         def __init__(self, subst_map: Dict[Symbol, Expression]):
             self.subst_map = subst_map
-            self._by_id = {symbol.id: replacement for symbol, replacement in subst_map.items()}
+            self._by_id = {s.id: r for s, r in subst_map.items()}
 
         def visit_var(self, var: Var) -> Expression:
             if var.var_id in self._by_id:
@@ -1885,103 +2406,225 @@ def substitute(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Express
             return var
 
         def visit_const(self, const: Const) -> Expression:
-            # Check if this symbol should be substituted
             if const.symbol in self.subst_map:
                 return self.subst_map[const.symbol]
             return const
 
         def visit_app(self, app: App) -> Expression:
-            # Check if the function symbol should be substituted
-            new_symbol = self.subst_map.get(app.symbol, app.symbol)
-            new_args = [arg.accept(self) for arg in app.args]
-            return App(new_symbol, tuple(new_args))
+            new_sym = self.subst_map.get(app.symbol, app.symbol)
+            new_args = tuple(a.accept(self) for a in app.args)
+            return App(new_sym, new_args)
 
         def visit_select(self, select: Select) -> Expression:
-            new_array = select.array.accept(self)
-            new_index = select.index.accept(self)
-            return Select(new_array, new_index)
+            return Select(select.array.accept(self), select.index.accept(self))
 
         def visit_store(self, store: Store) -> Expression:
-            new_array = store.array.accept(self)
-            new_index = store.index.accept(self)
-            new_value = store.value.accept(self)
-            return Store(new_array, new_index, new_value)
+            return Store(store.array.accept(self), store.index.accept(self), store.value.accept(self))
 
         def visit_add(self, add: Add) -> Expression:
-            new_args = [arg.accept(self) for arg in add.args]
-            return Add(tuple(new_args))
+            return Add(tuple(a.accept(self) for a in add.args))
 
         def visit_mul(self, mul: Mul) -> Expression:
-            new_args = [arg.accept(self) for arg in mul.args]
-            return Mul(tuple(new_args))
+            return Mul(tuple(a.accept(self) for a in mul.args))
+
+        def visit_div(self, div: Div) -> Expression:
+            return Div(div.left.accept(self), div.right.accept(self))
+
+        def visit_mod(self, mod: Mod) -> Expression:
+            return Mod(mod.left.accept(self), mod.right.accept(self))
+
+        def visit_floor(self, floor: Floor) -> Expression:
+            return Floor(floor.arg.accept(self))
+
+        def visit_neg(self, neg: Neg) -> Expression:
+            return Neg(neg.arg.accept(self))
 
         def visit_ite(self, ite: Ite) -> Expression:
-            new_condition = ite.condition.accept(self)
-            new_then = ite.then_branch.accept(self)
-            new_else = ite.else_branch.accept(self)
-            return Ite(new_condition, new_then, new_else)
+            return Ite(ite.condition.accept(self), ite.then_branch.accept(self), ite.else_branch.accept(self))
 
-        def visit_true(self, true_expr: TrueExpr) -> Expression:
-            return true_expr
+        def visit_true(self, t: TrueExpr) -> Expression:
+            return t
 
-        def visit_false(self, false_expr: FalseExpr) -> Expression:
-            return false_expr
+        def visit_false(self, f: FalseExpr) -> Expression:
+            return f
 
-        def visit_and(self, and_expr: And) -> Expression:
-            new_args = [arg.accept(self) for arg in and_expr.args]
-            return And(tuple(new_args))
+        def visit_and(self, a: And) -> Expression:
+            return And(tuple(x.accept(self) for x in a.args))
 
-        def visit_or(self, or_expr: Or) -> Expression:
-            new_args = [arg.accept(self) for arg in or_expr.args]
-            return Or(tuple(new_args))
+        def visit_or(self, o: Or) -> Expression:
+            return Or(tuple(x.accept(self) for x in o.args))
 
-        def visit_not(self, not_expr: Not) -> Expression:
-            new_arg = not_expr.arg.accept(self)
-            return Not(new_arg)
+        def visit_not(self, n: Not) -> Expression:
+            return Not(n.arg.accept(self))
 
         def visit_eq(self, eq: Eq) -> Expression:
-            new_left = eq.left.accept(self)
-            new_right = eq.right.accept(self)
-            return Eq(new_left, new_right)
+            return Eq(eq.left.accept(self), eq.right.accept(self))
 
         def visit_lt(self, lt: Lt) -> Expression:
-            new_left = lt.left.accept(self)
-            new_right = lt.right.accept(self)
-            return Lt(new_left, new_right)
+            return Lt(lt.left.accept(self), lt.right.accept(self))
 
         def visit_leq(self, leq: Leq) -> Expression:
-            new_left = leq.left.accept(self)
-            new_right = leq.right.accept(self)
-            return Leq(new_left, new_right)
+            return Leq(leq.left.accept(self), leq.right.accept(self))
 
-        def visit_forall(self, forall: Forall) -> Expression:
-            new_body = self._visit_quantifier_body(forall.var_name, forall.body)
-            return Forall(forall.var_name, forall.var_type, new_body)
+        def visit_forall(self, f: Forall) -> Expression:
+            active = {s: r for s, r in self.subst_map.items() if s.name != f.var_name}
+            new_body = _substitute_const(f.body, active) if active else f.body
+            return Forall(f.var_name, f.var_type, new_body) if new_body is not f.body else f
 
-        def visit_exists(self, exists: Exists) -> Expression:
-            new_body = self._visit_quantifier_body(exists.var_name, exists.body)
-            return Exists(exists.var_name, exists.var_type, new_body)
-
-        def _visit_quantifier_body(
-            self, bound_name: str, body: FormulaExpression
-        ) -> Expression:
-            active = {
-                symbol: replacement
-                for symbol, replacement in self.subst_map.items()
-                if symbol.name != bound_name
-            }
-            return substitute(body, active) if active else body
+        def visit_exists(self, e: Exists) -> Expression:
+            active = {s: r for s, r in self.subst_map.items() if s.name != e.var_name}
+            new_body = _substitute_const(e.body, active) if active else e.body
+            return Exists(e.var_name, e.var_type, new_body) if new_body is not e.body else e
 
         def _default_visit(self, expr: Expression) -> Expression:
             return expr
 
-    visitor = SubstitutionVisitor(subst_map)
-    return expr.accept(visitor)
+    return expr.accept(ConstSubstVisitor(subst_map))
 
 
 def substitute_map(expr: Expression, subst_map: Dict[Symbol, Expression]) -> Expression:
     """Compatibility alias for substituting a symbol-to-expression map."""
     return substitute(expr, subst_map)
+
+
+def substitute_sym(srk: Context, subst: Callable[[Symbol], Expression], expr: Expression) -> Expression:
+    """Replace each application f(e0,...,en) with subst(f)[e0/0, ..., en/n].
+
+    Mirrors OCaml's substitute_sym: constant symbols are treated as
+    nullary function applications.
+    """
+    env: List[Expression] = []
+
+    def go(e: Expression, bound: Set[str]) -> Expression:
+        if isinstance(e, Const):
+            fn_body = subst(e.symbol)
+            return substitute_by_name(fn_body, {}, bound)
+        if isinstance(e, App):
+            fn_body = subst(e.symbol)
+            subst_map_local = {i: go(a, bound) for i, a in enumerate(e.args)}
+            return substitute_by_name(fn_body, subst_map_local, bound)
+        if isinstance(e, Add):
+            new_args = tuple(go(a, bound) for a in e.args)
+            return Add(new_args) if new_args != e.args else e
+        if isinstance(e, Mul):
+            new_args = tuple(go(a, bound) for a in e.args)
+            return Mul(new_args) if new_args != e.args else e
+        if isinstance(e, Div):
+            new_left = go(e.left, bound)
+            new_right = go(e.right, bound)
+            return Div(new_left, new_right) if new_left is not e.left or new_right is not e.right else e
+        if isinstance(e, Mod):
+            new_left = go(e.left, bound)
+            new_right = go(e.right, bound)
+            return Mod(new_left, new_right) if new_left is not e.left or new_right is not e.right else e
+        if isinstance(e, Floor):
+            new_arg = go(e.arg, bound)
+            return Floor(new_arg) if new_arg is not e.arg else e
+        if isinstance(e, Neg):
+            new_arg = go(e.arg, bound)
+            return Neg(new_arg) if new_arg is not e.arg else e
+        if isinstance(e, Ite):
+            return Ite(go(e.condition, bound), go(e.then_branch, bound), go(e.else_branch, bound))
+        if isinstance(e, Select):
+            return Select(go(e.array, bound), go(e.index, bound))
+        if isinstance(e, Store):
+            return Store(go(e.array, bound), go(e.index, bound), go(e.value, bound))
+        if isinstance(e, And):
+            new_args = tuple(go(a, bound) for a in e.args)
+            return And(new_args) if new_args != e.args else e
+        if isinstance(e, Or):
+            new_args = tuple(go(a, bound) for a in e.args)
+            return Or(new_args) if new_args != e.args else e
+        if isinstance(e, Not):
+            new_arg = go(e.arg, bound)
+            return Not(new_arg) if new_arg is not e.arg else e
+        if isinstance(e, Eq):
+            return Eq(go(e.left, bound), go(e.right, bound))
+        if isinstance(e, Lt):
+            return Lt(go(e.left, bound), go(e.right, bound))
+        if isinstance(e, Leq):
+            return Leq(go(e.left, bound), go(e.right, bound))
+        if isinstance(e, Forall):
+            return Forall(e.var_name, e.var_type, go(e.body, bound | {e.var_name}))
+        if isinstance(e, Exists):
+            return Exists(e.var_name, e.var_type, go(e.body, bound | {e.var_name}))
+        return e
+
+    def substitute_by_name(expr: Expression, var_map: Dict[int, Expression], bound: Set[str]) -> Expression:
+        if isinstance(expr, Var) and expr.var_id in var_map:
+            return var_map[expr.var_id]
+        return go(expr, bound)
+
+    return go(expr, set())
+
+
+def fold_constants(
+    f: Callable[[Symbol, Any], Any], expr: Expression, init: Any
+) -> Any:
+    """Fold over all constant symbols in an expression.
+
+    f receives (symbol, accumulator) for each constant occurrence.
+    """
+    acc = init
+
+    def walk(e: Expression) -> None:
+        nonlocal acc
+        if isinstance(e, Const):
+            acc = f(e.symbol, acc)
+        elif isinstance(e, App):
+            for arg in e.args:
+                walk(arg)
+        elif isinstance(e, Select):
+            walk(e.array)
+            walk(e.index)
+        elif isinstance(e, Store):
+            walk(e.array)
+            walk(e.index)
+            walk(e.value)
+        elif isinstance(e, Add):
+            for arg in e.args:
+                walk(arg)
+        elif isinstance(e, Mul):
+            for arg in e.args:
+                walk(arg)
+        elif isinstance(e, Div):
+            walk(e.left)
+            walk(e.right)
+        elif isinstance(e, Mod):
+            walk(e.left)
+            walk(e.right)
+        elif isinstance(e, Floor):
+            walk(e.arg)
+        elif isinstance(e, Neg):
+            walk(e.arg)
+        elif isinstance(e, Ite):
+            walk(e.condition)
+            walk(e.then_branch)
+            walk(e.else_branch)
+        elif isinstance(e, And):
+            for arg in e.args:
+                walk(arg)
+        elif isinstance(e, Or):
+            for arg in e.args:
+                walk(arg)
+        elif isinstance(e, Not):
+            walk(e.arg)
+        elif isinstance(e, Eq):
+            walk(e.left)
+            walk(e.right)
+        elif isinstance(e, Lt):
+            walk(e.left)
+            walk(e.right)
+        elif isinstance(e, Leq):
+            walk(e.left)
+            walk(e.right)
+        elif isinstance(e, Forall):
+            walk(e.body)
+        elif isinstance(e, Exists):
+            walk(e.body)
+
+    walk(expr)
+    return acc
 
 
 def free_vars(expr: Expression) -> Set[Symbol]:
@@ -2056,9 +2699,9 @@ def size(expr: Expression) -> int:
         return 1 + sum(size(arg) for arg in expr.args)
     if isinstance(expr, Ite):
         return 1 + size(expr.condition) + size(expr.then_branch) + size(expr.else_branch)
-    if isinstance(expr, Not):
+    if isinstance(expr, (Neg, Not, Floor)):
         return 1 + size(expr.arg)
-    if isinstance(expr, (Eq, Lt, Leq)):
+    if isinstance(expr, (Eq, Lt, Leq, Div, Mod)):
         return 1 + size(expr.left) + size(expr.right)
     if isinstance(expr, (Forall, Exists)):
         return 1 + size(expr.body)
@@ -2106,17 +2749,18 @@ def eliminate_arr_eq(expr: Expression) -> Expression:
 
 
 def rewrite(
-    *args, down: Optional[Callable] = None, up: Optional[Callable] = None
+    *args, down: Optional[Callable[[Expression], Expression]] = None, up: Optional[Callable[[Expression], Expression]] = None
 ) -> Expression:
     """Rewrite an expression using rewrite rules.
 
-    This module is used by components that follow the original SRK API, which
-    sometimes passes an explicit `Context` as the first argument. We accept
-    both calling conventions:
+    Performs a two-pass traversal: the *down* rewriter is applied to each
+    sub-expression on the way down the tree (pre-order), then the *up*
+    rewriter is applied on the way back up (post-order).
 
+    Accepts multiple calling conventions for compatibility:
     - rewrite(expr, down=..., up=...)
     - rewrite(srk, expr, down=..., up=...)
-    - rewrite(srk, down_fn, expr)   (legacy positional form used in `quantifier.py`)
+    - rewrite(srk, down_fn, expr)
     """
     # Normalize arguments to (expr, down, up)
     if not args:
@@ -2129,7 +2773,6 @@ def rewrite(
             _, down_fn, expr = args
             down = down_fn
         elif len(args) == 3:
-            # rewrite(srk, expr, up_fn) legacy convenience
             _, expr, up_fn = args
             if callable(up_fn) and up is None:
                 up = up_fn
@@ -2148,13 +2791,211 @@ def rewrite(
                 f"rewrite expects at most 3 positional args, got {len(args)}"
             )
 
-    # Placeholder implementation (kept intentionally lightweight)
-    return expr
+    def _rewrite_node(e: Expression) -> Expression:
+        # Down pass: apply down rewriter before recursing
+        if down:
+            e = down(e)
+        # Recurse into children and rebuild
+        e = _rewrite_children(e)
+        # Up pass: apply up rewriter after recursing
+        if up:
+            e = up(e)
+        return e
+
+    def _rewrite_children(e: Expression) -> Expression:
+        if isinstance(e, Var):
+            return e
+        if isinstance(e, Const):
+            return e
+        if isinstance(e, TrueExpr):
+            return e
+        if isinstance(e, FalseExpr):
+            return e
+        if isinstance(e, Add):
+            new_args = tuple(_rewrite_node(a) for a in e.args)
+            return Add(new_args) if new_args != e.args else e
+        if isinstance(e, Mul):
+            new_args = tuple(_rewrite_node(a) for a in e.args)
+            return Mul(new_args) if new_args != e.args else e
+        if isinstance(e, Div):
+            new_left = _rewrite_node(e.left)
+            new_right = _rewrite_node(e.right)
+            if new_left is not e.left or new_right is not e.right:
+                return Div(new_left, new_right)
+            return e
+        if isinstance(e, Mod):
+            new_left = _rewrite_node(e.left)
+            new_right = _rewrite_node(e.right)
+            if new_left is not e.left or new_right is not e.right:
+                return Mod(new_left, new_right)
+            return e
+        if isinstance(e, Floor):
+            new_arg = _rewrite_node(e.arg)
+            return Floor(new_arg) if new_arg is not e.arg else e
+        if isinstance(e, Neg):
+            new_arg = _rewrite_node(e.arg)
+            return Neg(new_arg) if new_arg is not e.arg else e
+        if isinstance(e, Ite):
+            new_cond = _rewrite_node(e.condition)
+            new_then = _rewrite_node(e.then_branch)
+            new_else = _rewrite_node(e.else_branch)
+            if new_cond is not e.condition or new_then is not e.then_branch or new_else is not e.else_branch:
+                return Ite(new_cond, new_then, new_else)
+            return e
+        if isinstance(e, App):
+            new_args = tuple(_rewrite_node(a) for a in e.args)
+            return App(e.symbol, new_args) if new_args != e.args else e
+        if isinstance(e, Select):
+            new_arr = _rewrite_node(e.array)
+            new_idx = _rewrite_node(e.index)
+            if new_arr is not e.array or new_idx is not e.index:
+                return Select(new_arr, new_idx)
+            return e
+        if isinstance(e, Store):
+            new_arr = _rewrite_node(e.array)
+            new_idx = _rewrite_node(e.index)
+            new_val = _rewrite_node(e.value)
+            if new_arr is not e.array or new_idx is not e.index or new_val is not e.value:
+                return Store(new_arr, new_idx, new_val)
+            return e
+        if isinstance(e, And):
+            new_args = tuple(_rewrite_node(a) for a in e.args)
+            return And(new_args) if new_args != e.args else e
+        if isinstance(e, Or):
+            new_args = tuple(_rewrite_node(a) for a in e.args)
+            return Or(new_args) if new_args != e.args else e
+        if isinstance(e, Not):
+            new_arg = _rewrite_node(e.arg)
+            return Not(new_arg) if new_arg is not e.arg else e
+        if isinstance(e, Eq):
+            new_left = _rewrite_node(e.left)
+            new_right = _rewrite_node(e.right)
+            if new_left is not e.left or new_right is not e.right:
+                return Eq(new_left, new_right)
+            return e
+        if isinstance(e, Lt):
+            new_left = _rewrite_node(e.left)
+            new_right = _rewrite_node(e.right)
+            if new_left is not e.left or new_right is not e.right:
+                return Lt(new_left, new_right)
+            return e
+        if isinstance(e, Leq):
+            new_left = _rewrite_node(e.left)
+            new_right = _rewrite_node(e.right)
+            if new_left is not e.left or new_right is not e.right:
+                return Leq(new_left, new_right)
+            return e
+        if isinstance(e, Forall):
+            new_body = _rewrite_node(e.body)
+            return Forall(e.var_name, e.var_type, new_body) if new_body is not e.body else e
+        if isinstance(e, Exists):
+            new_body = _rewrite_node(e.body)
+            return Exists(e.var_name, e.var_type, new_body) if new_body is not e.body else e
+        return e
+
+    return _rewrite_node(expr)
 
 
 def nnf_rewriter(expr: Expression) -> Expression:
-    """Convert to negation normal form."""
-    # Placeholder implementation
+    """Convert formula to negation normal form (NNF).
+
+    Pushes negations inward using De Morgan's laws and
+    eliminates double negations, implications, and iff.
+    """
+    return _nnf_rewriter(expr)
+
+
+def _nnf_rewriter(expr: Expression) -> Expression:
+    if isinstance(expr, Not):
+        inner = expr.arg
+        if isinstance(inner, Not):
+            # Double negation: !!p => p
+            return _nnf_rewriter(inner.arg)
+        if isinstance(inner, TrueExpr):
+            return FalseExpr()
+        if isinstance(inner, FalseExpr):
+            return TrueExpr()
+        if isinstance(inner, And):
+            # !(a && b) => !a || !b
+            return Or(tuple(_nnf_rewriter(Not(a)) for a in inner.args))
+        if isinstance(inner, Or):
+            # !(a || b) => !a && !b
+            return And(tuple(_nnf_rewriter(Not(a)) for a in inner.args))
+        if isinstance(inner, Eq):
+            # !(a = b) => a < b || b < a
+            return Or((Lt(inner.left, inner.right), Lt(inner.right, inner.left)))
+        if isinstance(inner, Lt):
+            # !(a < b) => b <= a
+            return Leq(inner.right, inner.left)
+        if isinstance(inner, Leq):
+            # !(a <= b) => b < a
+            return Lt(inner.right, inner.left)
+        if isinstance(inner, Forall):
+            # !(forall x. p) => exists x. !p
+            return Exists(inner.var_name, inner.var_type, _nnf_rewriter(Not(inner.body)))
+        if isinstance(inner, Exists):
+            # !(exists x. p) => forall x. !p
+            return Forall(inner.var_name, inner.var_type, _nnf_rewriter(Not(inner.body)))
+        if isinstance(inner, Ite) and inner.typ == Type.BOOL:
+            # !(ite c t e) => ite c (!t) (!e)
+            return Ite(
+                _nnf_rewriter(inner.condition),
+                _nnf_rewriter(Not(inner.then_branch)),
+                _nnf_rewriter(Not(inner.else_branch)),
+            )
+        # Negation of atomic formula or term case - keep as is
+        return Not(_nnf_rewriter(inner))
+    # Recurse into compound expressions
+    return _nnf_recurse(expr)
+
+
+def _nnf_recurse(expr: Expression) -> Expression:
+    if isinstance(expr, (Var, Const, TrueExpr, FalseExpr)):
+        return expr
+    if isinstance(expr, Add):
+        return Add(tuple(_nnf_recurse(a) for a in expr.args))
+    if isinstance(expr, Mul):
+        return Mul(tuple(_nnf_recurse(a) for a in expr.args))
+    if isinstance(expr, Div):
+        return Div(_nnf_recurse(expr.left), _nnf_recurse(expr.right))
+    if isinstance(expr, Mod):
+        return Mod(_nnf_recurse(expr.left), _nnf_recurse(expr.right))
+    if isinstance(expr, Floor):
+        return Floor(_nnf_recurse(expr.arg))
+    if isinstance(expr, Neg):
+        return Neg(_nnf_recurse(expr.arg))
+    if isinstance(expr, Ite):
+        return Ite(
+            _nnf_recurse(expr.condition),
+            _nnf_recurse(expr.then_branch),
+            _nnf_recurse(expr.else_branch),
+        )
+    if isinstance(expr, App):
+        return App(expr.symbol, tuple(_nnf_recurse(a) for a in expr.args))
+    if isinstance(expr, Select):
+        return Select(_nnf_recurse(expr.array), _nnf_recurse(expr.index))
+    if isinstance(expr, Store):
+        return Store(
+            _nnf_recurse(expr.array),
+            _nnf_recurse(expr.index),
+            _nnf_recurse(expr.value),
+        )
+    if isinstance(expr, And):
+        return And(tuple(_nnf_recurse(a) for a in expr.args))
+    if isinstance(expr, Or):
+        return Or(tuple(_nnf_recurse(a) for a in expr.args))
+    if isinstance(expr, Not):
+        return _nnf_rewriter(Not(_nnf_recurse(expr.arg)))
+    if isinstance(expr, Eq):
+        return Eq(_nnf_recurse(expr.left), _nnf_recurse(expr.right))
+    if isinstance(expr, Lt):
+        return Lt(_nnf_recurse(expr.left), _nnf_recurse(expr.right))
+    if isinstance(expr, Leq):
+        return Leq(_nnf_recurse(expr.left), _nnf_recurse(expr.right))
+    if isinstance(expr, Forall):
+        return Forall(expr.var_name, expr.var_type, _nnf_recurse(expr.body))
+    if isinstance(expr, Exists):
+        return Exists(expr.var_name, expr.var_type, _nnf_recurse(expr.body))
     return expr
 
 
@@ -2163,11 +3004,20 @@ def destruct(expr: Expression) -> Tuple[str, Any]:
 
     Returns a tuple where the first element is a string indicating the
     constructor type, and the second element contains the components.
+
+    Mirrors the OCaml polymorphic-variant-based destruct.
     """
     if isinstance(expr, Var):
         return ("Var", (expr.var_id, expr.var_type))
     elif isinstance(expr, Const):
-        return ("Const", expr.symbol)
+        symbol = expr.symbol
+        try:
+            if symbol.name and symbol.name.startswith("real_"):
+                val = float(symbol.name[5:])
+                return ("Real", val)
+        except (ValueError, AttributeError):
+            pass
+        return ("Const", symbol)
     elif isinstance(expr, App):
         return ("App", (expr.symbol, expr.args))
     elif isinstance(expr, Select):
@@ -2178,12 +3028,20 @@ def destruct(expr: Expression) -> Tuple[str, Any]:
         return ("Add", expr.args)
     elif isinstance(expr, Mul):
         return ("Mul", expr.args)
+    elif isinstance(expr, Div):
+        return ("Binop", ("Div", expr.left, expr.right))
+    elif isinstance(expr, Mod):
+        return ("Binop", ("Mod", expr.left, expr.right))
+    elif isinstance(expr, Floor):
+        return ("Unop", ("Floor", expr.arg))
+    elif isinstance(expr, Neg):
+        return ("Unop", ("Neg", expr.arg))
     elif isinstance(expr, Ite):
         return ("Ite", (expr.condition, expr.then_branch, expr.else_branch))
     elif isinstance(expr, TrueExpr):
-        return ("True", ())
+        return ("Tru", ())
     elif isinstance(expr, FalseExpr):
-        return ("False", ())
+        return ("Fls", ())
     elif isinstance(expr, And):
         return ("And", expr.args)
     elif isinstance(expr, Or):
@@ -2191,17 +3049,16 @@ def destruct(expr: Expression) -> Tuple[str, Any]:
     elif isinstance(expr, Not):
         return ("Not", expr.arg)
     elif isinstance(expr, Eq):
-        return ("Eq", (expr.left, expr.right))
+        return ("Atom", ("Arith", "Eq", expr.left, expr.right))
     elif isinstance(expr, Lt):
-        return ("Lt", (expr.left, expr.right))
+        return ("Atom", ("Arith", "Lt", expr.left, expr.right))
     elif isinstance(expr, Leq):
-        return ("Leq", (expr.left, expr.right))
+        return ("Atom", ("Arith", "Leq", expr.left, expr.right))
     elif isinstance(expr, Forall):
-        return ("Forall", (expr.var_name, expr.var_type, expr.body))
+        return ("Quantify", ("Forall", expr.var_name, expr.var_type, expr.body))
     elif isinstance(expr, Exists):
-        return ("Exists", (expr.var_name, expr.var_type, expr.body))
+        return ("Quantify", ("Exists", expr.var_name, expr.var_type, expr.body))
     else:
-        # For unknown expression types, return a generic representation
         return ("Unknown", expr)
 
 
@@ -2588,3 +3445,706 @@ def prenex(srk: Context, phi: Expression) -> Expression:
             result = mk_forall(name, typ, result)
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Compare functions
+# ---------------------------------------------------------------------------
+
+def compare_expr(a: Expression, b: Expression) -> int:
+    """Total order on expressions by structural hash then type-tag."""
+    if a is b:
+        return 0
+    tag_order = {
+        TrueExpr: 0, FalseExpr: 1, Var: 2, Const: 3, App: 4,
+        Add: 5, Mul: 6, Div: 7, Mod: 8, Floor: 9, Neg: 10,
+        Ite: 11, Select: 12, Store: 13,
+        And: 14, Or: 15, Not: 16, Eq: 17, Lt: 18, Leq: 19,
+        Forall: 20, Exists: 21,
+    }
+    ta = tag_order.get(type(a), 99)
+    tb = tag_order.get(type(b), 99)
+    if ta != tb:
+        return -1 if ta < tb else 1
+    ha = hash(a)
+    hb = hash(b)
+    if ha < hb:
+        return -1
+    if ha > hb:
+        return 1
+    return 0
+
+
+compare_formula = compare_expr
+compare_term = compare_expr
+
+
+# ---------------------------------------------------------------------------
+# Symbol.Set and Symbol.Map
+# ---------------------------------------------------------------------------
+
+class SymbolSet:
+    """Set of unique symbols (mirrors OCaml Symbol.Set)."""
+
+    def __init__(self, elements: Optional[Iterable[Symbol]] = None):
+        self._data: Set[Symbol] = set(elements) if elements else set()
+
+    def add(self, sym: Symbol) -> None:
+        self._data.add(sym)
+
+    def mem(self, sym: Symbol) -> bool:
+        return sym in self._data
+
+    def union(self, other: "SymbolSet") -> "SymbolSet":
+        result = SymbolSet()
+        result._data = self._data | other._data
+        return result
+
+    def inter(self, other: "SymbolSet") -> "SymbolSet":
+        result = SymbolSet()
+        result._data = self._data & other._data
+        return result
+
+    def equal(self, other: "SymbolSet") -> bool:
+        return self._data == other._data
+
+    def filter(self, pred: Callable[[Symbol], bool]) -> "SymbolSet":
+        return SymbolSet(s for s in self._data if pred(s))
+
+    def elements(self) -> List[Symbol]:
+        return list(self._data)
+
+    def enum(self) -> Iterator[Symbol]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self) -> Iterator[Symbol]:
+        return iter(self._data)
+
+    def __contains__(self, sym: Symbol) -> bool:
+        return sym in self._data
+
+
+class SymbolMap:
+    """Map keyed by symbols (mirrors OCaml Symbol.Map)."""
+
+    def __init__(self, init: Optional[Dict[Symbol, Any]] = None):
+        self._data: Dict[Symbol, Any] = dict(init) if init else {}
+
+    def add(self, key: Symbol, value: Any) -> None:
+        self._data[key] = value
+
+    def find(self, key: Symbol) -> Any:
+        return self._data[key]
+
+    def mem(self, key: Symbol) -> bool:
+        return key in self._data
+
+    def remove(self, key: Symbol) -> None:
+        self._data.pop(key, None)
+
+    def keys(self) -> Iterator[Symbol]:
+        return iter(self._data.keys())
+
+    def values(self) -> Iterator[Any]:
+        return iter(self._data.values())
+
+    def enum(self) -> Iterator[Tuple[Symbol, Any]]:
+        return iter(self._data.items())
+
+    def __getitem__(self, key: Symbol) -> Any:
+        return self._data[key]
+
+    def __setitem__(self, key: Symbol, value: Any) -> None:
+        self._data[key] = value
+
+    def __contains__(self, key: Symbol) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+# ---------------------------------------------------------------------------
+# Expr submodule (expression utilities)
+# ---------------------------------------------------------------------------
+
+class _ExprModule:
+    """Utilities for generic expressions (mirrors OCaml Expr module)."""
+
+    @staticmethod
+    def equal(a: Expression, b: Expression) -> bool:
+        return a == b
+
+    @staticmethod
+    def compare(a: Expression, b: Expression) -> int:
+        return compare_expr(a, b)
+
+    @staticmethod
+    def hash(e: Expression) -> int:
+        return hash(e)
+
+    @staticmethod
+    def term_of(srk: Context, e: Expression) -> "TermExpression":
+        if isinstance(e, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq, Forall, Exists)):
+            raise ValueError("Expression is not a term")
+        return e
+
+    @staticmethod
+    def formula_of(srk: Context, e: Expression) -> "FormulaExpression":
+        if not isinstance(e, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq, Forall, Exists)):
+            raise ValueError("Expression is not a formula")
+        return e
+
+
+Expr = _ExprModule()
+
+
+# ---------------------------------------------------------------------------
+# Env module (De Bruijn environments)
+# ---------------------------------------------------------------------------
+
+class Env:
+    """De Bruijn environment for traversing quantified formulas.
+    Mirrors OCaml's Env module: empty, push, find, enum.
+    """
+
+    def __init__(self):
+        self._stack: List[Any] = []
+
+    @staticmethod
+    def empty() -> "Env":
+        return Env()
+
+    def push(self, value: Any) -> "Env":
+        new_env = Env()
+        new_env._stack = list(self._stack)
+        new_env._stack.append(value)
+        return new_env
+
+    def find(self, idx: int) -> Any:
+        if idx < 0 or idx >= len(self._stack):
+            raise IndexError(f"De Bruijn index {idx} out of bounds")
+        return self._stack[idx]
+
+    def enum(self):
+        return iter(self._stack)
+
+    def __len__(self) -> int:
+        return len(self._stack)
+
+
+# ---------------------------------------------------------------------------
+# ContextTable (weak-keyed map from contexts to values)
+# ---------------------------------------------------------------------------
+
+class ContextTable:
+    """Map from Context objects to values (mirrors OCaml ContextTable)."""
+
+    def __init__(self):
+        self._data: Dict[int, Any] = {}
+
+    def add(self, ctx: Context, value: Any) -> None:
+        self._data[id(ctx)] = value
+
+    def find(self, ctx: Context) -> Any:
+        return self._data[id(ctx)]
+
+    def mem(self, ctx: Context) -> bool:
+        return id(ctx) in self._data
+
+    def remove(self, ctx: Context) -> None:
+        self._data.pop(id(ctx), None)
+
+
+# ---------------------------------------------------------------------------
+# Infix module (operator-style expression building)
+# ---------------------------------------------------------------------------
+
+class Infix:
+    """Operator-style expression building for a given Context.
+
+    Usage:
+        inf = Infix(ctx)
+        expr = inf.const(x) + inf.const(y)  # => x + y
+        formula = (inf.const(x) < inf.const(y)) & ~inf.const(z).eq(0)
+    """
+
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
+
+    class _InfixTerm:
+        def __init__(self, expr: ArithExpression, infix: "Infix"):
+            self.expr = expr
+            self._infix = infix
+
+        def __add__(self, other):
+            if isinstance(other, Infix._InfixTerm):
+                return Infix._InfixTerm(Add((self.expr, other.expr)), self._infix)
+            return Infix._InfixTerm(
+                Add((self.expr, self._infix.real(other))), self._infix
+            )
+
+        def __sub__(self, other):
+            if isinstance(other, Infix._InfixTerm):
+                rhs = other.expr
+            else:
+                rhs = self._infix.real(other)
+            return Infix._InfixTerm(
+                Add((self.expr, Neg(rhs))), self._infix
+            )
+
+        def __mul__(self, other):
+            if isinstance(other, Infix._InfixTerm):
+                return Infix._InfixTerm(Mul((self.expr, other.expr)), self._infix)
+            return Infix._InfixTerm(
+                Mul((self.expr, self._infix.real(other))), self._infix
+            )
+
+        def __truediv__(self, other):
+            if isinstance(other, Infix._InfixTerm):
+                return Infix._InfixTerm(Div(self.expr, other.expr), self._infix)
+            return Infix._InfixTerm(Div(self.expr, self._infix.real(other)), self._infix)
+
+        def __neg__(self):
+            return Infix._InfixTerm(Neg(self.expr), self._infix)
+
+        def __lt__(self, other) -> FormulaExpression:
+            if isinstance(other, Infix._InfixTerm):
+                return Lt(self.expr, other.expr)
+            return Lt(self.expr, self._infix.real(other))
+
+        def __le__(self, other) -> FormulaExpression:
+            if isinstance(other, Infix._InfixTerm):
+                return Leq(self.expr, other.expr)
+            return Leq(self.expr, self._infix.real(other))
+
+        def __gt__(self, other) -> FormulaExpression:
+            if isinstance(other, Infix._InfixTerm):
+                return Lt(other.expr, self.expr)
+            return Lt(self._infix.real(other), self.expr)
+
+        def __ge__(self, other) -> FormulaExpression:
+            if isinstance(other, Infix._InfixTerm):
+                return Leq(other.expr, self.expr)
+            return Leq(self._infix.real(other), self.expr)
+
+    class _InfixFormula:
+        def __init__(self, expr: FormulaExpression, infix: "Infix"):
+            self.expr = expr
+            self._infix = infix
+
+        def __and__(self, other: FormulaExpression) -> FormulaExpression:
+            if isinstance(other, Infix._InfixFormula):
+                other = other.expr
+            return And((self.expr, other))
+
+        def __or__(self, other: FormulaExpression) -> FormulaExpression:
+            if isinstance(other, Infix._InfixFormula):
+                other = other.expr
+            return Or((self.expr, other))
+
+        def __invert__(self) -> FormulaExpression:
+            return Not(self.expr)
+
+    def var(self, var_id: int, typ: Type = Type.REAL) -> _InfixTerm:
+        return self._InfixTerm(Var(var_id, typ), self)
+
+    def const(self, sym: Symbol) -> _InfixTerm:
+        return self._InfixTerm(Const(sym), self)
+
+    def real(self, value: float) -> Const:
+        real_sym = self.ctx.mk_symbol(f"real_{value}", Type.REAL)
+        return Const(real_sym)
+
+    def tru(self) -> FormulaExpression:
+        return TrueExpr()
+
+    def fls(self) -> FormulaExpression:
+        return FalseExpr()
+
+    def formula(self, expr: FormulaExpression) -> _InfixFormula:
+        return self._InfixFormula(expr, self)
+
+    def select(self, array: ArithExpression, index: ArithExpression) -> _InfixTerm:
+        return self._InfixTerm(Select(array, index), self)
+
+    def store(self, array: ArithExpression, index: ArithExpression, value: ArithExpression) -> _InfixTerm:
+        return self._InfixTerm(Store(array, index, value), self)
+
+    def forall(self, var_name: str, var_type: Type, body: FormulaExpression) -> FormulaExpression:
+        return Forall(var_name, var_type, body)
+
+    def exists(self, var_name: str, var_type: Type, body: FormulaExpression) -> FormulaExpression:
+        return Exists(var_name, var_type, body)
+
+
+# ---------------------------------------------------------------------------
+# Formula submodule operations
+# ---------------------------------------------------------------------------
+
+def existential_closure(srk: Context, phi: FormulaExpression, pred: Optional[Callable[[Symbol], bool]] = None) -> FormulaExpression:
+    """Existentially quantify all free constant symbols in the formula.
+
+    If pred is given, only symbols matching the predicate are quantified.
+    """
+    syms = symbols(phi)
+    result = phi
+    for sym in sorted(syms, key=lambda s: s.id, reverse=True):
+        if pred is None or pred(sym):
+            if sym.typ != Type.BOOL:
+                result = mk_exists_const(srk, sym, result)
+    return result
+
+
+def universal_closure(srk: Context, phi: FormulaExpression, pred: Optional[Callable[[Symbol], bool]] = None) -> FormulaExpression:
+    """Universally quantify all free constant symbols in the formula.
+
+    If pred is given, only symbols matching the predicate are quantified.
+    """
+    syms = symbols(phi)
+    result = phi
+    for sym in sorted(syms, key=lambda s: s.id, reverse=True):
+        if pred is None or pred(sym):
+            if sym.typ != Type.BOOL:
+                result = mk_forall_const(srk, sym, result)
+    return result
+
+
+def skolemize_free(srk: Context, phi: FormulaExpression) -> FormulaExpression:
+    """Skolemize free variables: replace existentials with fresh symbols."""
+    def go(e: Expression) -> Expression:
+        if isinstance(e, Exists):
+            sk_sym = mk_symbol(srk, f"sk_{e.var_name}", e.var_type)
+            body_sub = substitute_const(
+                srk,
+                lambda s: mk_const(srk, sk_sym) if s == e.var_name else mk_const(srk, s),
+                e.body,
+            )
+            return go(body_sub)
+        if isinstance(e, Add): return Add(tuple(go(a) for a in e.args))
+        if isinstance(e, Mul): return Mul(tuple(go(a) for a in e.args))
+        if isinstance(e, Div): return Div(go(e.left), go(e.right))
+        if isinstance(e, Mod): return Mod(go(e.left), go(e.right))
+        if isinstance(e, Floor): return Floor(go(e.arg))
+        if isinstance(e, Neg): return Neg(go(e.arg))
+        if isinstance(e, Ite): return Ite(go(e.condition), go(e.then_branch), go(e.else_branch))
+        if isinstance(e, App): return App(e.symbol, tuple(go(a) for a in e.args))
+        if isinstance(e, Select): return Select(go(e.array), go(e.index))
+        if isinstance(e, Store): return Store(go(e.array), go(e.index), go(e.value))
+        if isinstance(e, And): return And(tuple(go(a) for a in e.args))
+        if isinstance(e, Or): return Or(tuple(go(a) for a in e.args))
+        if isinstance(e, Not): return Not(go(e.arg))
+        if isinstance(e, Eq): return Eq(go(e.left), go(e.right))
+        if isinstance(e, Lt): return Lt(go(e.left), go(e.right))
+        if isinstance(e, Leq): return Leq(go(e.left), go(e.right))
+        if isinstance(e, Forall): return Forall(e.var_name, e.var_type, go(e.body))
+        return e
+    return go(phi)
+
+
+# ---------------------------------------------------------------------------
+# Expr submodule — expanded operations
+# ---------------------------------------------------------------------------
+
+class _ExprModule:
+    """Utilities for generic expressions (mirrors OCaml Expr module)."""
+
+    @staticmethod
+    def equal(a: Expression, b: Expression) -> bool:
+        return a == b
+
+    @staticmethod
+    def compare(a: Expression, b: Expression) -> int:
+        return compare_expr(a, b)
+
+    @staticmethod
+    def hash(e: Expression) -> int:
+        return hash(e)
+
+    @staticmethod
+    def term_of(srk: Context, e: Expression) -> "TermExpression":
+        if isinstance(e, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq, Forall, Exists)):
+            raise ValueError("Expression is not a term")
+        return e
+
+    @staticmethod
+    def formula_of(srk: Context, e: Expression) -> "FormulaExpression":
+        if not isinstance(e, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq, Forall, Exists)):
+            raise ValueError("Expression is not a formula")
+        return e
+
+    @staticmethod
+    def refine(srk: Context, e: Expression):
+        """Refine an expression into ArithTerm, ArrTerm, or Formula."""
+        if isinstance(e, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq, Forall, Exists)):
+            return ("Formula", e)
+        if isinstance(e, Store):
+            return ("ArrTerm", e)
+        return ("ArithTerm", e)
+
+    @staticmethod
+    def arith_term_of(srk: Context, e: Expression) -> "ArithExpression":
+        if isinstance(e, (TrueExpr, FalseExpr, And, Or, Not, Eq, Lt, Leq, Forall, Exists)):
+            raise ValueError("Expression is not an arith term")
+        return e
+
+    @staticmethod
+    def arr_term_of(srk: Context, e: Expression) -> "Expression":
+        if not isinstance(e, Store):
+            raise ValueError("Expression is not an arr term")
+        return e
+
+    @staticmethod
+    def destruct_sexpr(srk: Context, e: Expression) -> Tuple[str, List[Expression]]:
+        """Destruct an expression as an s-expression."""
+        tag, comps = destruct(e)
+        if tag == "Var":
+            return ("Var", [Var(comps[0], comps[1])])
+        if tag == "Const":
+            return ("Const", [Const(comps)])
+        if tag == "App":
+            sym, args = comps
+            return ("App", list(args))
+        if tag == "Add":
+            return ("Add", list(comps))
+        if tag == "Mul":
+            return ("Mul", list(comps))
+        if tag == "Binop":
+            op, left, right = comps
+            return (op, [left, right])
+        if tag == "Unop":
+            op, arg = comps
+            return (op, [arg])
+        if tag == "Ite":
+            return ("Ite", list(comps))
+        if tag == "Tru":
+            return ("True", [])
+        if tag == "Fls":
+            return ("False", [])
+        if tag == "And":
+            return ("And", list(comps))
+        if tag == "Or":
+            return ("Or", list(comps))
+        if tag == "Not":
+            return ("Not", [comps])
+        if tag == "Atom":
+            kind, op, left, right = comps
+            return (op, [left, right])
+        if tag == "Quantify":
+            qt, name, typ, body = comps
+            return (qt, [body])
+        return (tag, [])
+
+    @staticmethod
+    def construct_sexpr(srk: Context, label: str, children: List[Expression]) -> Expression:
+        """Construct an expression from a label and children (inverse of destruct_sexpr)."""
+        if label == "Var" and isinstance(children[0], Var):
+            v = children[0]
+            return Var(v.var_id, v.var_type, v.name)
+        if label == "Const" and children:
+            return children[0]
+        if label == "App" and len(children) >= 1:
+            return App(children[0].symbol if isinstance(children[0], App) else mk_symbol(srk, None, Type.INT), tuple(children[1:]) if len(children) > 1 else ())
+        if label == "Add":
+            return Add(tuple(children))
+        if label == "Mul":
+            return Mul(tuple(children))
+        if label == "Div" and len(children) >= 2:
+            return Div(children[0], children[1])
+        if label == "Mod" and len(children) >= 2:
+            return Mod(children[0], children[1])
+        if label == "Floor" and children:
+            return Floor(children[0])
+        if label == "Neg" and children:
+            return Neg(children[0])
+        if label == "Ite" and len(children) >= 3:
+            return Ite(children[0], children[1], children[2])
+        if label == "True":
+            return TrueExpr()
+        if label == "False":
+            return FalseExpr()
+        if label == "And":
+            return And(tuple(children))
+        if label == "Or":
+            return Or(tuple(children))
+        if label == "Not" and children:
+            return Not(children[0])
+        if label == "Eq" and len(children) >= 2:
+            return Eq(children[0], children[1])
+        if label == "Lt" and len(children) >= 2:
+            return Lt(children[0], children[1])
+        if label == "Leq" and len(children) >= 2:
+            return Leq(children[0], children[1])
+        if label == "Forall":
+            return Forall("x", Type.INT, children[0] if children else TrueExpr())
+        if label == "Exists":
+            return Exists("x", Type.INT, children[0] if children else TrueExpr())
+        if label == "Store" and len(children) >= 3:
+            return Store(children[0], children[1], children[2])
+        if label == "Select" and len(children) >= 2:
+            return Select(children[0], children[1])
+        return TrueExpr()
+
+    class HT(dict):
+        """Hashtable from expressions to values."""
+        def add(self, key: Expression, value: Any) -> None:
+            self[id(key)] = value
+
+        def replace(self, key: Expression, value: Any) -> None:
+            self[id(key)] = value
+
+        def remove(self, key: Expression) -> None:
+            self.pop(id(key), None)
+
+        def find(self, key: Expression) -> Any:
+            return self[id(key)]
+
+        def mem(self, key: Expression) -> bool:
+            return id(key) in self
+
+        def keys(self):
+            return iter(self)
+
+        def values(self):
+            return iter(super().values())
+
+        def enum(self):
+            return self.items()
+
+    class Set:
+        """Set of expressions by structural equality."""
+        def __init__(self):
+            self._data: Dict[int, Expression] = {}
+
+        def add(self, e: Expression) -> None:
+            self._data[hash(e)] = e
+
+        def mem(self, e: Expression) -> bool:
+            return hash(e) in self._data and self._data[hash(e)] == e
+
+        def enum(self):
+            return iter(self._data.values())
+
+        def elements(self):
+            return list(self._data.values())
+
+        def filter(self, pred: Callable[[Expression], bool]):
+            result = _ExprModule.Set()
+            for e in self._data.values():
+                if pred(e):
+                    result.add(e)
+            return result
+
+    class Map:
+        """Map keyed by expressions."""
+        def __init__(self):
+            self._data: Dict[int, Tuple[Expression, Any]] = {}
+
+        def add(self, key: Expression, value: Any) -> None:
+            self._data[hash(key)] = (key, value)
+
+        def find(self, key: Expression) -> Any:
+            return self._data[hash(key)][1]
+
+        def remove(self, key: Expression) -> None:
+            self._data.pop(hash(key), None)
+
+        def mem(self, key: Expression) -> bool:
+            return hash(key) in self._data
+
+        def keys(self):
+            for k, _ in self._data.values():
+                yield k
+
+        def values(self):
+            for _, v in self._data.values():
+                yield v
+
+        def enum(self):
+            for k, v in self._data.values():
+                yield (k, v)
+
+
+Expr = _ExprModule()
+
+
+# ---------------------------------------------------------------------------
+# pp_smtlib2 — SMTLIB2 serialization
+# ---------------------------------------------------------------------------
+
+def pp_smtlib2_gen(srk: Context, env: Optional[Env] = None) -> Callable[[Any, Expression], str]:
+    """Create a function that prints expressions in SMTLIB2 format.
+
+    Args:
+        srk: The SRK context for symbol name resolution.
+        env: Optional De Bruijn environment for resolving bound variables.
+
+    Returns:
+        A function taking (file-like, expression) and printing to the file.
+    """
+    def printer(out, expr: Expression) -> None:
+        s = _smtlib2_str(expr, env or Env.empty())
+        out.write(s)
+
+    return printer
+
+
+def _smtlib2_str(expr: Expression, env: Env) -> str:
+    """Convert an expression to an SMTLIB2 string."""
+    if isinstance(expr, TrueExpr):
+        return "true"
+    if isinstance(expr, FalseExpr):
+        return "false"
+    if isinstance(expr, Var):
+        return f"x{expr.var_id}"
+    if isinstance(expr, Const):
+        return str(expr.symbol)
+    if isinstance(expr, Add):
+        inner = " ".join(_smtlib2_str(a, env) for a in expr.args)
+        return f"(+ {inner})"
+    if isinstance(expr, Mul):
+        inner = " ".join(_smtlib2_str(a, env) for a in expr.args)
+        return f"(* {inner})"
+    if isinstance(expr, Div):
+        return f"(/ {_smtlib2_str(expr.left, env)} {_smtlib2_str(expr.right, env)})"
+    if isinstance(expr, Neg):
+        return f"(- {_smtlib2_str(expr.arg, env)})"
+    if isinstance(expr, And):
+        inner = " ".join(_smtlib2_str(a, env) for a in expr.args)
+        return f"(and {inner})"
+    if isinstance(expr, Or):
+        inner = " ".join(_smtlib2_str(a, env) for a in expr.args)
+        return f"(or {inner})"
+    if isinstance(expr, Not):
+        return f"(not {_smtlib2_str(expr.arg, env)})"
+    if isinstance(expr, Eq):
+        return f"(= {_smtlib2_str(expr.left, env)} {_smtlib2_str(expr.right, env)})"
+    if isinstance(expr, Lt):
+        return f"(< {_smtlib2_str(expr.left, env)} {_smtlib2_str(expr.right, env)})"
+    if isinstance(expr, Leq):
+        return f"(<= {_smtlib2_str(expr.left, env)} {_smtlib2_str(expr.right, env)})"
+    if isinstance(expr, Forall):
+        inner_name = f"({expr.var_name} {_smtlib2_type(expr.var_type)})"
+        return f"(forall ({inner_name}) {_smtlib2_str(expr.body, env.push(expr.var_name))})"
+    if isinstance(expr, Exists):
+        inner_name = f"({expr.var_name} {_smtlib2_type(expr.var_type)})"
+        return f"(exists ({inner_name}) {_smtlib2_str(expr.body, env.push(expr.var_name))})"
+    if isinstance(expr, Ite):
+        return f"(ite {_smtlib2_str(expr.condition, env)} {_smtlib2_str(expr.then_branch, env)} {_smtlib2_str(expr.else_branch, env)})"
+    if isinstance(expr, App):
+        args = " ".join(_smtlib2_str(a, env) for a in expr.args)
+        return f"({expr.symbol} {args})" if args else f"{expr.symbol}"
+    return str(expr)
+
+
+def _smtlib2_type(typ: Type) -> str:
+    if typ == Type.INT:
+        return "Int"
+    if typ == Type.REAL:
+        return "Real"
+    if typ == Type.BOOL:
+        return "Bool"
+    return "Int"
