@@ -39,6 +39,7 @@ from aria.srk.syntax import (
     mk_not,
     mk_exists,
     mk_real,
+    substitute,
 )
 from aria.srk.polynomial import Polynomial, Monomial
 from aria.srk.linear import QQVector, QQMatrix, QQ
@@ -388,7 +389,7 @@ def substitute_map(
     corresponding expression. Capture avoidance is handled by the
     syntax.substitute function.
     """
-    return syntax.substitute(formula, subst)
+    return substitute(formula, subst)
 
 
 def analyze_termination_exp_poly(

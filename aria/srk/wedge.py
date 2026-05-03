@@ -912,15 +912,14 @@ def bound_monomial(wedge: Wedge, monomial) -> "Interval":
 
 def symbolic_bounds(
     wedge: Wedge, symbol
-) -> Tuple[List[syntax.Formula], List[syntax.Formula]]:
+) -> Tuple[List[ArithExpression], List[ArithExpression]]:
     """Compute symbolic lower and upper bounds for *symbol*.
 
-    Returns ``(lower_bounds, upper_bounds)`` where each list contains SRK
-    terms representing the bound expressions.  For a constraint
-    ``a*sym + rest + c >= 0`` with ``a != 0``:
+    Returns ``(lower_bounds, upper_bounds)`` where each list contains
+    arithmetic terms representing the bound expressions.
 
-    - ``a > 0``  =>  ``sym >= -(rest + c) / a``  (lower bound)
-    - ``a < 0``  =>  ``sym <= -(rest + c) / a``  (upper bound)
+    Mirrors OCaml ``Wedge.symbolic_bounds`` which returns
+    ``('a arith_term) list * ('a arith_term) list``.
     """
     srk = wedge.srk
     cs = wedge.cs

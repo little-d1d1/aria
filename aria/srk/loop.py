@@ -166,14 +166,19 @@ def compute_loop_nesting_forest(graph: GraphProtocol[V]) -> List[Union[V, Loop[V
                 forest.append(loop)
             else:
                 forest.append(v)
+            # Add successors to entries (matching OCaml G.iter_succ add_entry g.graph v)
+            graph.iter_succ(lambda s: entries.add(s), v)
         else:
-        # Multi-vertex SCC - find header (entry vertex) and recursively decompose
-        header = _find_header(scc, graph, entries)
-        body = scc - {header}
+            # Multi-vertex SCC - find header (entry vertex) and recursively decompose
+            header = _find_header(scc, graph, entries)
+            body = scc - {header}
 
-        nested_forest = _recurse_body(body, graph, entries)
-        loop = Loop(header=header, children=nested_forest, body=scc)
-        forest.append(loop)
+            # Add header's successors to entries (matching OCaml G.iter_succ add_entry g.graph header)
+            graph.iter_succ(lambda s: entries.add(s), header)
+
+            nested_forest = _recurse_body(body, graph, entries)
+            loop = Loop(header=header, children=nested_forest, body=scc)
+            forest.append(loop)
 
     return forest
 
@@ -275,33 +280,15 @@ def _find_header(
 ) -> V:
     """Find the entry vertex (header) of an SCC.
 
-    The header is a vertex in the SCC that has an incoming edge from
-    a vertex outside the SCC or from the entries set.
+    The header is a vertex in the SCC that is already in the entries set
+    (i.e., reachable from a higher SCC). If none, pick an arbitrary vertex.
+
+    Matches OCaml ``loop.ml`` header selection exactly.
     """
     for v in scc:
         if v in entries:
             return v
-    for v in scc:
-        preds: List[V] = []
-        if hasattr(graph, 'fold_pred_edges'):
-            graph.fold_pred_edges(lambda _, __, acc: acc, graph, v)
-        for w in _get_predecessors(v, graph):
-            if w not in scc:
-                return v
     return next(iter(scc))
-
-
-def _get_predecessors(v: V, graph: GraphProtocol[V]) -> List[V]:
-    """Get predecessors of a vertex by scanning all edges."""
-    preds: List[V] = []
-    def check_edge(u: V, w: V) -> None:
-        if w == v:
-            preds.append(u)
-    all_verts: List[V] = []
-    graph.iter_vertex(lambda x: all_verts.append(x))
-    for u in all_verts:
-        graph.iter_succ(lambda w: check_edge(u, w), u)
-    return preds
 
 
 def _recurse_body(

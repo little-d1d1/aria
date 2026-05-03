@@ -601,8 +601,7 @@ def eval(
             inner_val = eval_rec(obj.expr)
             result = algebra(StarAlg(inner_val))
         elif isinstance(obj, Segment):
-            inner_val = eval_rec(obj.expr)
-            result = algebra(SegmentAlg(inner_val))
+            raise ValueError("eval: Segment is only valid in nested path expressions")
         else:
             raise ValueError(
                 f"Cannot evaluate path expression type {type(e.obj).__name__}: {e}"
