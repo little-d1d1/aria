@@ -192,21 +192,27 @@ class ModelSnapshot:
         self.assignments = assignments
 
     def eval(self, expr: z3.ExprRef, model_completion: bool = False) -> z3.ExprRef:
-        del model_completion
         if z3.is_const(expr) and expr.decl().kind() == z3.Z3_OP_UNINTERPRETED:
             value = self.assignments.get(str(expr))
             if value is not None:
                 return value
+            if model_completion and z3.is_bv_sort(expr.sort()):
+                return z3.BitVecVal(0, expr.size(), ctx=expr.ctx)
         raise KeyError(f"No assignment recorded for expression: {expr}")
 
 
 class ForAllSolver:
     """Forall solver for EFBV problems."""
 
-    def __init__(self, ctx: z3.Context, num_workers: int = 4):
+    def __init__(
+        self,
+        ctx: z3.Context,
+        forall_vars: Optional[List[z3.ExprRef]] = None,
+        num_workers: int = 4,
+    ):
         """Initialize forall solver."""
-        # self.forall_vars = []
         self.ctx = ctx  # the Z3 context of the main thread
+        self.forall_vars = forall_vars or []
         # self.phi = None
         self.num_workers = num_workers
         self.solver_name = "z3"
@@ -252,7 +258,10 @@ class ForAllSolver:
         pass
 
     def _serialize_model(
-        self, model: z3.ModelRef, expr: z3.ExprRef
+        self,
+        model: z3.ModelRef,
+        expr: z3.ExprRef,
+        local_forall_vars: List[z3.ExprRef],
     ) -> Dict[str, z3.ExprRef]:
         assignments: Dict[str, z3.ExprRef] = {}
         stack = [expr]
@@ -266,6 +275,8 @@ class ForAllSolver:
             if z3.is_const(current) and current.decl().kind() == z3.Z3_OP_UNINTERPRETED:
                 assignments[str(current)] = model.eval(current, model_completion=True)
             stack.extend(current.children())
+        for var in local_forall_vars:
+            assignments[str(var)] = model.eval(var, model_completion=True)
         return assignments
 
     def _check_in_worker(self, worker_idx: int, cnt: z3.BoolRef) -> Dict[str, z3.ExprRef]:
@@ -274,11 +285,12 @@ class ForAllSolver:
         del worker_idx
         worker_ctx = z3.Context()
         local_cnt = cnt.translate(worker_ctx)
+        local_forall_vars = [var.translate(worker_ctx) for var in self.forall_vars]
         solver = z3.SolverFor("QF_BV", ctx=worker_ctx)
         solver.add(local_cnt)
         res = solver.check()
         if res == z3.sat:
-            return self._serialize_model(solver.model(), local_cnt)
+            return self._serialize_model(solver.model(), local_cnt, local_forall_vars)
         if res == z3.unsat:
             raise ForAllSolverSuccess()
         raise ForAllSolverUnknown()

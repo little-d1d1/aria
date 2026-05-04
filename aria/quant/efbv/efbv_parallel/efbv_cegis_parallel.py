@@ -46,6 +46,22 @@ logger = logging.getLogger(__name__)
 g_efbv_tactic = EFBVTactic.Z3_QBF
 
 
+def _contains_quantifier(expr: z3.ExprRef) -> bool:
+    """Return True when an expression still contains nested quantifiers."""
+    stack = [expr]
+    seen = set()
+    while stack:
+        current = stack.pop()
+        key = current.get_id()
+        if key in seen:
+            continue
+        seen.add(key)
+        if z3.is_quantifier(current):
+            return True
+        stack.extend(current.children())
+    return False
+
+
 @dataclass
 class CEGISProfile:
     iterations: int = 0
@@ -121,6 +137,13 @@ def bv_efsmt_with_uniform_sampling(
     """
     # x = [item for item in get_vars(phi) if item not in y]
 
+    if _contains_quantifier(phi):
+        logger.warning(
+            "efbv-par expects a quantifier-free EFSMT body; "
+            "nested quantifiers remain after parsing, so returning UNKNOWN"
+        )
+        return EFBVResult.UNKNOWN
+
     if forall_mode is not None:
         efbv_forall_solver.m_forall_solver_strategy = forall_mode
     if num_samples is None:
@@ -129,7 +152,11 @@ def bv_efsmt_with_uniform_sampling(
         num_samples = num_workers
 
     esolver = ExistsSolver(exists_vars, z3.BoolVal(True))
-    fsolver = ForAllSolver(exists_vars[0].ctx, num_workers=num_workers)
+    fsolver = ForAllSolver(
+        exists_vars[0].ctx,
+        forall_vars=forall_vars,
+        num_workers=num_workers,
+    )
     # fsolver.vars = forall_vars
     # fsolver.phi = phi
 

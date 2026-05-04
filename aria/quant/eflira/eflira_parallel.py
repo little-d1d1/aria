@@ -184,12 +184,14 @@ def _parse_values_output(raw: str) -> dict:
 def _value_from_smt2_string(
     name: str, value_str: str, sort: z3.SortRef, ctx: z3.Context
 ) -> z3.ExprRef:
-    decls = {name: z3.Const(name, sort, ctx=ctx)}
+    del name
+    value_name = "__aria_model_value"
+    decls = {value_name: z3.Const(value_name, sort)}
     assertions = z3.parse_smt2_string(
-        f"(assert (= {name} {value_str}))", decls=decls, ctx=ctx
+        f"(assert (= {value_name} {value_str}))", decls=decls, ctx=ctx
     )
     if not assertions:
-        raise ValueError(f"Could not parse value for {name}: {value_str}")
+        raise ValueError(f"Could not parse model value: {value_str}")
     eq = assertions[0]
     return eq.arg(1)
 
@@ -284,10 +286,12 @@ def _parallel_check_candidates_ipc(
     num_workers: int,
     executor: Optional[concurrent.futures.ProcessPoolExecutor] = None,
 ) -> List[tuple]:
+    del var_names
     tasks = []
     for fml in fmls:
         script = _build_smt2_script(logic, fml)
-        tasks.append((script, var_names, solver_name))
+        local_var_names = sorted({v.sexpr() for v in get_vars(fml)})
+        tasks.append((script, local_var_names, solver_name))
     if not tasks:
         return []
 
