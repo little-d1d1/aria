@@ -2986,10 +2986,8 @@ def _fm_eliminate_atoms(srk, atoms, var_ids):
         cst = lc.linexpr0.cst if lc.linexpr0.cst is not None else Frac(0)
         if cst != 0:
             terms.append(syntax.mk_real(srk, cst))
-        if not terms:
-            continue
-        lin = terms[0] if len(terms) == 1 else syntax.mk_add(srk, terms)
         zero_expr = syntax.mk_real(srk, Frac(0))
+        lin = zero_expr if not terms else (terms[0] if len(terms) == 1 else syntax.mk_add(srk, terms))
         if lc.typ == Lincons0.EQ:
             new_atoms.append(syntax.mk_eq(srk, lin, zero_expr))
         elif lc.typ == Lincons0.SUP:

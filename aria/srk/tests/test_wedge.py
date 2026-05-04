@@ -24,6 +24,7 @@ from aria.srk.syntax import (
 )
 from aria.srk.wedge import WedgeDomain, WedgeElement
 from aria.srk.qQ import QQ
+from aria.srk.smt import SMTResult, is_sat
 
 
 class TestWedge(unittest.TestCase):
@@ -95,6 +96,21 @@ class TestWedge(unittest.TestCase):
         )
         projected = wedge.project([self.y, self.z])
         self.assertIsNotNone(projected)
+
+    def test_wedge_exists_preserves_contradiction_after_elimination(self):
+        wedge = WedgeElement(
+            self.ctx,
+            [
+                mk_lt(mk_const(self.x), mk_real(self.ctx, QQ.zero())),
+                mk_lt(mk_real(self.ctx, QQ.zero()), mk_const(self.x)),
+            ],
+        )
+
+        exists_x = wedge.exists([self.x])
+        atoms = exists_x.to_atoms()
+
+        self.assertEqual(len(atoms), 1)
+        self.assertEqual(is_sat(self.ctx, atoms[0]), SMTResult.UNSAT)
 
     def test_wedge_strengthen(self):
         wedge = WedgeElement(
