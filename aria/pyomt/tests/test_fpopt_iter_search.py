@@ -12,12 +12,9 @@ from aria.pyomt.omtfp.fp_omt_parser import FPOMTParser
 from aria.pyomt.omtfp.fp_opt_iterative_search import (
     fp_opt_with_binary_search,
     fp_opt_with_linear_search,
+    fp_opt_with_ofpbs,
 )
-from aria.pyomt.omtfp.fp_opt_qsmt import (
-    fp_opt_with_qsmt,
-    fp_optimize_pareto,
-    fp_total_key,
-)
+from aria.pyomt.omtfp.fp_opt_multiobj import fp_optimize_pareto
 
 
 def _fp_bits(value: z3.ExprRef) -> int:
@@ -28,16 +25,11 @@ def _fp_bits(value: z3.ExprRef) -> int:
     solver = z3.Solver()
     solver.add(z3.fpToIEEEBV(probe) == z3.fpToIEEEBV(value))
     assert solver.check() == z3.sat
-    bits = cast(z3.BitVecNumRef, solver.model().eval(z3.fpToIEEEBV(probe), model_completion=True))
+    bits = cast(
+        z3.BitVecNumRef,
+        solver.model().eval(z3.fpToIEEEBV(probe), model_completion=True),
+    )
     return bits.as_long()
-
-
-def _fp_total_key(bits: int, width: int = 32) -> int:
-    sign_mask = 1 << (width - 1)
-    full_mask = (1 << width) - 1
-    if bits & sign_mask:
-        return (~bits) & full_mask
-    return bits ^ sign_mask
 
 
 def _is_nan_bits(bits: int, ebits: int = 8, sbits: int = 24) -> bool:
@@ -89,7 +81,7 @@ class TestFPOMTParser(unittest.TestCase):
         self.assertEqual(parser.original_directions, ["max", "min"])
 
 
-class TestFPOMTIterativeSearch(unittest.TestCase):
+class TestFPOMTSearches(unittest.TestCase):
     """Optimization tests for floating-point objectives."""
 
     def setUp(self):
@@ -103,18 +95,18 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
         self.pos_nan = z3.fpBVToFP(z3.BitVecVal(0x7FC00001, 32), self.sort)
         self.neg_nan = z3.fpBVToFP(z3.BitVecVal(0xFFC00001, 32), self.sort)
 
-    def test_binary_search_maximize_fp_variable(self):
+    def test_ofpbs_maximize_fp_variable(self):
         x = z3.FP("x", self.sort)
         fml = cast(
             z3.ExprRef,
             z3.Or(
-            z3.fpEQ(x, self.neg_two),
-            z3.fpEQ(x, self.neg_zero),
-            z3.fpEQ(x, self.one),
+                z3.fpEQ(x, self.neg_two),
+                z3.fpEQ(x, self.neg_zero),
+                z3.fpEQ(x, self.one),
             ),
         )
 
-        result = fp_opt_with_binary_search(fml, x, minimize=False)
+        result = fp_opt_with_ofpbs(fml, x, minimize=False)
 
         self.assertIsNotNone(result)
         self.assertEqual(_fp_bits(cast(z3.ExprRef, result)), _fp_bits(self.one))
@@ -124,9 +116,9 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
         fml = cast(
             z3.ExprRef,
             z3.Or(
-            z3.fpEQ(x, self.neg_two),
-            z3.fpEQ(x, self.neg_zero),
-            z3.fpEQ(x, self.one),
+                z3.fpEQ(x, self.neg_two),
+                z3.fpEQ(x, self.neg_zero),
+                z3.fpEQ(x, self.one),
             ),
         )
 
@@ -152,7 +144,30 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(_fp_bits(cast(z3.ExprRef, result)), _fp_bits(self.two))
 
-    def test_binary_search_excludes_nan_models(self):
+    def test_all_iterative_engines_agree_on_optimum(self):
+        x = z3.FP("x_all_iter", self.sort)
+        fml = cast(
+            z3.ExprRef,
+            z3.Or(
+                z3.fpEQ(x, self.neg_two),
+                z3.fpEQ(x, self.neg_zero),
+                z3.fpEQ(x, self.one),
+                z3.fpEQ(x, self.two),
+            ),
+        )
+
+        linear = fp_opt_with_linear_search(fml, x, minimize=False)
+        binary = fp_opt_with_binary_search(fml, x, minimize=False)
+        ofpbs = fp_opt_with_ofpbs(fml, x, minimize=False)
+
+        self.assertIsNotNone(linear)
+        self.assertIsNotNone(binary)
+        self.assertIsNotNone(ofpbs)
+        self.assertEqual(_fp_bits(cast(z3.ExprRef, linear)), _fp_bits(self.two))
+        self.assertEqual(_fp_bits(cast(z3.ExprRef, binary)), _fp_bits(self.two))
+        self.assertEqual(_fp_bits(cast(z3.ExprRef, ofpbs)), _fp_bits(self.two))
+
+    def test_mixed_nan_and_non_nan_prefers_non_nan(self):
         x = z3.FP("x", self.sort)
         xb = z3.BitVec("xb", 32)
         fml = cast(
@@ -166,78 +181,29 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
             ),
         )
 
-        result = fp_opt_with_binary_search(fml, x, minimize=False)
+        result = fp_opt_with_ofpbs(fml, x, minimize=False)
 
         self.assertIsNotNone(result)
-        result_bits = _fp_bits(cast(z3.ExprRef, result))
-        self.assertTrue(_is_nan_bits(result_bits))
-        self.assertGreater(_fp_total_key(result_bits), _fp_total_key(_fp_bits(self.one)))
+        self.assertEqual(_fp_bits(cast(z3.ExprRef, result)), _fp_bits(self.one))
 
-    def test_qsmt_respects_total_order_for_signed_zero(self):
+    def test_nan_only_feasible_space_returns_nan(self):
         x = z3.FP("x", self.sort)
-        fml = cast(
-            z3.ExprRef,
-            z3.Or(z3.fpToIEEEBV(x) == z3.fpToIEEEBV(self.neg_zero), z3.fpToIEEEBV(x) == z3.fpToIEEEBV(self.zero)),
-        )
-
-        min_result = fp_opt_with_qsmt(fml, x, minimize=True)
-        max_result = fp_opt_with_qsmt(fml, x, minimize=False)
-
-        self.assertIsNotNone(min_result)
-        self.assertIsNotNone(max_result)
-        self.assertEqual(_fp_bits(cast(z3.ExprRef, min_result)), _fp_bits(self.neg_zero))
-        self.assertEqual(_fp_bits(cast(z3.ExprRef, max_result)), _fp_bits(self.zero))
-
-    def test_qsmt_orders_nan_and_infinity_faithfully(self):
-        x = z3.FP("x", self.sort)
-        xb = z3.BitVec("xb_qsmt", 32)
+        xb = z3.BitVec("xb_nan_only", 32)
         fml = cast(
             z3.ExprRef,
             z3.And(
                 x == z3.fpBVToFP(xb, self.sort),
                 z3.Or(
-                    xb == z3.BitVecVal(_fp_bits(self.neg_nan), 32),
-                    xb == z3.BitVecVal(_fp_bits(z3.fpMinusInfinity(self.sort)), 32),
-                    xb == z3.BitVecVal(_fp_bits(z3.fpPlusInfinity(self.sort)), 32),
                     xb == z3.BitVecVal(_fp_bits(self.pos_nan), 32),
+                    xb == z3.BitVecVal(_fp_bits(self.neg_nan), 32),
                 ),
             ),
         )
 
-        min_result = fp_opt_with_qsmt(fml, x, minimize=True)
-        max_result = fp_opt_with_qsmt(fml, x, minimize=False)
+        result = fp_opt_with_ofpbs(fml, x, minimize=True)
 
-        self.assertIsNotNone(min_result)
-        self.assertIsNotNone(max_result)
-        min_bits = _fp_bits(cast(z3.ExprRef, min_result))
-        max_bits = _fp_bits(cast(z3.ExprRef, max_result))
-        self.assertTrue(_is_nan_bits(min_bits))
-        self.assertTrue(_is_nan_bits(max_bits))
-        self.assertLess(
-            _fp_total_key(min_bits),
-            _fp_total_key(_fp_bits(z3.fpMinusInfinity(self.sort))),
-        )
-        self.assertGreater(
-            _fp_total_key(max_bits),
-            _fp_total_key(_fp_bits(z3.fpPlusInfinity(self.sort))),
-        )
-
-    def test_total_key_matches_total_order_samples(self):
-        samples = [
-            self.neg_nan,
-            z3.fpMinusInfinity(self.sort),
-            self.neg_two,
-            self.neg_zero,
-            self.zero,
-            self.one,
-            z3.fpPlusInfinity(self.sort),
-            self.pos_nan,
-        ]
-        width = self.sort.ebits() + self.sort.sbits()
-        keys = []
-        for sample in samples:
-            keys.append(_fp_total_key(_fp_bits(sample), width))
-        self.assertEqual(keys, sorted(keys))
+        self.assertIsNotNone(result)
+        self.assertTrue(_is_nan_bits(_fp_bits(cast(z3.ExprRef, result))))
 
     def test_solve_opt_file_uses_fp_backend(self):
         smt2 = """
@@ -255,67 +221,12 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
             filename = handle.name
 
         try:
-            result = solve_opt_file(filename, engine="iter", solver_name="z3-bs")
+            result = solve_opt_file(filename, engine="iter", solver_name="z3-ofpbs")
         finally:
             os.unlink(filename)
 
         self.assertIsNotNone(result)
         self.assertIn("-1*(2**1)", cast(str, result))
-
-    def test_solve_opt_file_supports_qsmt_fp(self):
-        smt2 = """
-        (set-logic QF_FP)
-        (declare-fun x () (_ FloatingPoint 8 24))
-        (assert (or (= (fp.to_ieee_bv x) (fp.to_ieee_bv (_ NaN 8 24)))
-                    (= (fp.to_ieee_bv x) (fp.to_ieee_bv (_ -zero 8 24)))))
-        (maximize x)
-        (check-sat)
-        """
-
-        with tempfile.NamedTemporaryFile("w", suffix=".smt2", delete=False) as handle:
-            handle.write(smt2)
-            filename = handle.name
-
-        try:
-            result = solve_opt_file(filename, engine="qsmt", solver_name="z3")
-        finally:
-            os.unlink(filename)
-
-        self.assertIsNotNone(result)
-        self.assertIn("NaN", cast(str, result))
-
-    def test_solve_opt_file_supports_lex_multi_objective_fp(self):
-        smt2 = """
-        (set-logic QF_FP)
-        (declare-fun x () (_ FloatingPoint 8 24))
-        (declare-fun y () (_ FloatingPoint 8 24))
-        (assert (or (= (fp.to_ieee_bv x) (fp.to_ieee_bv (_ -zero 8 24)))
-                    (= (fp.to_ieee_bv x) (fp.to_ieee_bv (_ +zero 8 24)))))
-        (assert (or (= (fp.to_ieee_bv y) (fp.to_ieee_bv ((_ to_fp 8 24) RNE 1.0)))
-                    (= (fp.to_ieee_bv y) (fp.to_ieee_bv ((_ to_fp 8 24) RNE 2.0)))))
-        (minimize x)
-        (maximize y)
-        (check-sat)
-        """
-
-        with tempfile.NamedTemporaryFile("w", suffix=".smt2", delete=False) as handle:
-            handle.write(smt2)
-            filename = handle.name
-
-        try:
-            result = solve_opt_file(
-                filename,
-                engine="qsmt",
-                solver_name="z3",
-                opt_priority="lex",
-            )
-        finally:
-            os.unlink(filename)
-
-        self.assertIsNotNone(result)
-        result_text = cast(str, result)
-        self.assertIn("-0.0", result_text)
-        self.assertIn("2", result_text)
 
     def test_fp_optimize_pareto_enumerates_frontier(self):
         x = z3.FP("x_pareto", self.sort)
@@ -343,7 +254,7 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
             [x, y],
             ["max", "max"],
             engine="iter",
-            solver_name="z3-bs",
+            solver_name="z3-ofpbs",
         )
 
         points = {tuple(_fp_bits(value) for value in point) for point in frontier}
@@ -378,7 +289,7 @@ class TestFPOMTIterativeSearch(unittest.TestCase):
             result = solve_opt_file(
                 filename,
                 engine="iter",
-                solver_name="z3-bs",
+                solver_name="z3-ofpbs",
                 opt_priority="par",
             )
         finally:

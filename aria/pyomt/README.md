@@ -24,25 +24,26 @@ Optimization and Maximum Satisfiability (MaxSAT) solvers.
   - `boxed/`: Boxed optimization variants
 - `omtfp/`: OMT for floating-point theories
   - `fp_omt_parser.py`: SMT-LIB parser for FP objectives
-  - `fp_opt_iterative_search.py`: IEEE-754 total-order iterative optimization
-  - `fp_opt_qsmt.py`: Exact quantified-SMT floating-point optimization
+  - `fp_opt_iterative_search.py`: Iterative FP search backends (`ls`, `bs`, `ofpbs`)
 
 ### Floating-Point OMT Semantics
-- FP optimization uses IEEE-754 `totalOrder` over exact floating-point encodings.
-- This is intentionally different from `fp.lt` / `fp.leq`, which define only a partial
-  numeric order and do not provide a total ordering over NaNs or distinguish all
-  bit-level cases needed for general optimization.
-- As a result, optimization over QF_FP objectives is well-defined for signed zeros,
-  infinities, and NaNs, including distinct NaN payload/sign encodings.
+- FP optimization follows the OFPBS algorithm from the reference paper.
+- The dedicated `ofpbs` backend implements the paper's core bitwise search.
+- The optional paper enhancements for branching preference and polarity updates are
+  intentionally not applied on the current Z3 backend because the Python solver API
+  does not expose equivalent per-bit controls.
+- Optimization prefers non-NaN models whenever any exist, and returns a NaN value only
+  when every feasible model assigns NaN to the objective.
+- Among non-NaN values, optimization uses the usual floating-point numeric order, while
+  exact IEEE bit patterns are still preserved in rendered results and lexicographic
+  pinning steps.
 
 ### Floating-Point Pareto Semantics
 - FP Pareto optimization compares objective tuples componentwise using the same
-  IEEE-754 `totalOrder` semantics.
+  non-NaN-first paper semantics as single-objective optimization.
 - A point is Pareto-optimal if no other feasible point is at least as good in every
   objective and strictly better in at least one objective under the per-objective
   direction (`maximize` or `minimize`).
-- The reported frontier therefore preserves floating-point distinctions such as
-  `-0.0` versus `+0.0` and different NaN encodings whenever they affect dominance.
 - Pareto results are rendered as lists of objective tuples, and each FP value is
   shown with both a readable form and its exact IEEE bit pattern.
 

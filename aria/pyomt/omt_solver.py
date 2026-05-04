@@ -10,14 +10,16 @@ import z3
 
 from aria.pyomt.result import OptimizationResult, OptimizationStatus
 from aria.pyomt.omtfp.fp_omt_parser import FPOMTParser
-from aria.pyomt.omtfp.fp_opt_qsmt import (
-    format_fp_value,
-    format_fp_frontier,
-    format_fp_values,
+from aria.pyomt.omtfp.fp_opt_multiobj import (
     fp_optimize_boxed,
     fp_optimize_lex,
     fp_optimize_pareto,
     solve_fp_objective,
+)
+from aria.pyomt.omtfp.fp_opt_utils import (
+    format_fp_value,
+    format_fp_frontier,
+    format_fp_values,
 )
 from aria.pyomt.omtbv.bv_opt_iterative_search import (
     bv_opt_with_linear_search,
@@ -51,7 +53,7 @@ def _result_with_value(
 def _solve_fp_opt_file(
     filename: str, engine: str, solver_name: str, opt_priority: str
 ) -> OptimizationResult:
-    """Solve OMT(QF_FP) instances with IEEE-754 faithful semantics."""
+    """Solve OMT(QF_FP) instances with the OFPBS floating-point semantics."""
     logger = logging.getLogger(__name__)
 
     parser = FPOMTParser()
@@ -267,11 +269,12 @@ def main() -> None:
     iter_group.add_argument(
         "--solver-iter",
         type=str,
-        default="z3-ls",
+        default="z3-ofpbs",
         choices=[i + "-ls" for i in ["z3", "cvc5", "yices", "msat", "btor"]]
-        + [i + "-bs" for i in ["z3", "cvc5", "yices", "msat", "btor"]],
+        + [i + "-bs" for i in ["z3", "cvc5", "yices", "msat", "btor"]]
+        + [i + "-ofpbs" for i in ["z3", "cvc5", "yices", "msat", "btor"]],
         help="Choose the quantifier-free SMT solver to use. ls - linear search,"
-        " bs - binary search",
+        " bs - binary search, ofpbs - objective-fp bitwise search",
     )
 
     # Optimization General Options
