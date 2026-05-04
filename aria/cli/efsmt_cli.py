@@ -14,6 +14,7 @@ from aria.utils.z3.expr import get_variables, get_z3_logic
 if TYPE_CHECKING:
     from aria.quant.efbv.efbv_parallel.efbv_cegis_parallel import ParallelEFBVSolver
     from aria.quant.efbv.efbv_parallel.efbv_utils import EFBVResult
+    from aria.quant.efbv.efbv_parallel.efbv_utils import FSolverMode as EFBVForallMode
     from aria.quant.efbv.efbv_seq.efbv_solver import EFBVSequentialSolver
     from aria.quant.eflira.eflira_parallel import EFLIRAResult, ParallelEFLIRASolver
     from aria.quant.eflira.eflira_parallel import FSolverMode as EFLIRAForallMode
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 ParallelEFBVSolver: Any = None
 EFBVSequentialSolver: Any = None
 ParallelEFLIRASolver: Any = None
+EFBVForallMode: Any = None
 EFLIRAForallMode: Any = None
 ESolverSampleStrategy: Any = None
 simple_cegar_efsmt: Any = None
@@ -108,6 +110,15 @@ def _load_lira_runtime() -> None:
 def _load_bv_runtime() -> None:
     _get_parallel_efbv_solver_cls()
     _get_efbv_sequential_solver_cls()
+
+
+def _get_efbv_forall_mode_enum() -> Any:
+    global EFBVForallMode
+    if EFBVForallMode is None:
+        from aria.quant.efbv.efbv_parallel.efbv_utils import FSolverMode as efbv_forall_mode
+
+        EFBVForallMode = efbv_forall_mode
+    return EFBVForallMode
 
 
 def _load_lira_runtime_for_solver() -> None:
@@ -196,6 +207,18 @@ def _parse_eflira_forall_mode(mode: Optional[str]) -> Optional[object]:
     return mode_map[mode]
 
 
+def _parse_efbv_forall_mode(mode: Optional[str]) -> Optional[object]:
+    if mode is None:
+        return None
+    forall_mode_enum = _get_efbv_forall_mode_enum()
+    mode_map = {
+        "sequential": forall_mode_enum.SEQUENTIAL,
+        "parallel-thread": forall_mode_enum.PARALLEL_THREAD,
+        "parallel-process": forall_mode_enum.PARALLEL_PROCESS,
+    }
+    return mode_map[mode]
+
+
 def _parse_eflira_sample_strategy(strategy: str) -> object:
     sample_strategy_enum = _get_eflira_sample_strategy_enum()
 
@@ -258,12 +281,16 @@ def _solve_bv(
     bv_solver: str,
     bv_pysmt_solver: str,
     max_loops: Optional[int],
-    efbv_num_samples: int,
+    efbv_num_samples: Optional[int],
+    efbv_forall_mode: Optional[str],
+    efbv_num_workers: int,
 ) -> str:
     if engine in ("auto", "efbv-par"):
         solver = _get_parallel_efbv_solver_cls()(
             mode="canary",
             maxloops=max_loops,
+            forall_mode=_parse_efbv_forall_mode(efbv_forall_mode),
+            num_workers=efbv_num_workers,
             num_samples=efbv_num_samples,
         )
         return _format_result(solver.solve_efsmt_bv(exists_vars, forall_vars, phi))
@@ -375,10 +402,21 @@ def main() -> int:
         help="PySMT backend used when --bv-solver=cegis (default: z3)",
     )
     bv_group.add_argument(
+        "--efbv-forall-mode",
+        choices=["sequential", "parallel-thread", "parallel-process"],
+        help="Forall-check scheduling mode for efbv-par",
+    )
+    bv_group.add_argument(
+        "--efbv-num-workers",
+        type=int,
+        default=4,
+        help="Worker count for efbv-par forall checks (default: 4)",
+    )
+    bv_group.add_argument(
         "--efbv-num-samples",
         type=int,
-        default=5,
-        help="Number of existential samples per efbv-par iteration (default: 5)",
+        default=None,
+        help="Number of existential samples per efbv-par iteration (default: same as --efbv-num-workers)",
     )
     lira_group.add_argument(
         "--forall-solver",
@@ -400,8 +438,8 @@ def main() -> int:
     lira_group.add_argument(
         "--eflira-num-samples",
         type=int,
-        default=5,
-        help="Number of existential samples per eflira-par iteration (default: 5)",
+        default=None,
+        help="Number of existential samples per eflira-par iteration (default: same as --eflira-num-workers)",
     )
     lira_group.add_argument(
         "--eflira-sample-strategy",
@@ -538,6 +576,8 @@ def main() -> int:
                 bv_pysmt_solver=args.bv_pysmt_solver,
                 max_loops=args.max_loops,
                 efbv_num_samples=args.efbv_num_samples,
+                efbv_forall_mode=args.efbv_forall_mode,
+                efbv_num_workers=args.efbv_num_workers,
             )
         elif theory == "lira":
             result = _solve_lira(

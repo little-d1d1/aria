@@ -313,9 +313,8 @@ class SMTLIBSolver:
         Auxiliary method to reset the smtlib external solver to initial defaults
         TODO: Z3 and CVC5 supports the "reset" cmd. Maybe we can use it
         """
-        self._smtlib.stop()  # does not do anything if already stopped
         self._smtlib.start()
-        self._smtlib.clear_buffers()  # need this?
+        self._smtlib.send("(reset)")
 
     def stop(self):
         self._smtlib.stop()
