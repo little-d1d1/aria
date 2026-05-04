@@ -1,8 +1,10 @@
 """
-Dtree
+Decision-tree helpers for knowledge compilation.
 """
 
-from typing import List, Optional, Dict
+from __future__ import annotations
+
+from typing import Dict, List, Optional
 
 
 class Node:
@@ -15,48 +17,77 @@ class Node:
         right_child: Optional["Node"] = None,
         clause: Optional[List[int]] = None,
     ) -> None:
-        """
-        Initialize a Dtree node.
+        self.node_id: Optional[int] = node_id
+        self.left_child: Optional["Node"] = left_child
+        self.right_child: Optional["Node"] = right_child
+        self.clauses: List[List[int]] = []
+        self.atoms: List[int] = []
+        self.separators: List[int] = []
+        self.clause_key: List[int] = []
+        self.lit_key = 0
 
-        Args:
-            node_id: Node identifier
-            left_child: Left child node
-            right_child: Right child node
-            clause: Clause (for leaf nodes)
-        """
-        self.node_id: Optional[int] = None
-        self.left_child: Optional["Node"] = None
-        self.right_child: Optional["Node"] = None
-        self.clauses: Optional[List[List[int]]] = None
-        self.atoms: Optional[List[int]] = None
-        self.separators: Optional[List[int]] = None
+        if clause is not None and (left_child is not None or right_child is not None):
+            raise ValueError("A dtree node cannot be both a leaf and an internal node")
+        if (left_child is None) != (right_child is None):
+            raise ValueError("A dtree internal node must have both children present")
 
-        if node_id is not None:
-            self.node_id = node_id
-        if left_child is not None:
-            self.left_child = left_child
-        if right_child is not None:
-            self.right_child = right_child
         if clause is not None:
-            # This implies this node is a leaf
-            self.clauses = [clause]
-            self.atoms = [abs(lit) for lit in clause]
-            if len(clause) == 0:
-                self.clause_key = [1]
-            else:
-                self.clause_key = [0]
-        if self.left_child is not None and self.right_child is not None:
-            # In case of internal node
-            # atoms(t) = atoms(t_left) union atoms(t_right)
-            self.clauses = self.left_child.clauses + self.right_child.clauses
-            self.atoms = list(set(self.left_child.atoms).union(self.right_child.atoms))
-            self.separators = list(
+            self.clauses = [list(clause)]
+            self.atoms = sorted({abs(lit) for lit in clause})
+            self.separators = []
+            self.clause_key = [1 if len(clause) == 0 else 0]
+        elif left_child is not None and right_child is not None:
+            self.refresh_metadata()
+
+        self.validate()
+
+    def refresh_metadata(self) -> None:
+        """Recompute the derived metadata of this node from its children."""
+        if self.is_leaf():
+            return
+        assert self.left_child is not None
+        assert self.right_child is not None
+        self.clauses = list(self.left_child.clauses) + list(self.right_child.clauses)
+        left_atoms = set(self.left_child.atoms)
+        right_atoms = set(self.right_child.atoms)
+        self.atoms = sorted(left_atoms | right_atoms)
+        self.separators = sorted(left_atoms & right_atoms)
+        self.clause_key = list(self.left_child.clause_key) + list(
+            self.right_child.clause_key
+        )
+        self.validate()
+
+    def validate(self) -> None:
+        """Validate basic structural invariants."""
+        if self.is_leaf():
+            if self.left_child is not None or self.right_child is not None:
+                raise ValueError("Leaf nodes cannot have children")
+            if len(self.clauses) != 1 or len(self.clause_key) != 1:
+                raise ValueError("Leaf nodes must own exactly one clause and one key bit")
+            expected_atoms = sorted({abs(lit) for lit in self.clauses[0]})
+            if self.atoms != expected_atoms:
+                raise ValueError("Leaf atom metadata is inconsistent with the clause")
+            if self.separators:
+                raise ValueError("Leaf nodes cannot have separators")
+        else:
+            if self.left_child is None or self.right_child is None:
+                raise ValueError("Internal nodes must have both children")
+            expected_clauses = self.left_child.clauses + self.right_child.clauses
+            if self.clauses != expected_clauses:
+                raise ValueError("Internal node clauses must be the concatenation of children")
+            expected_atoms = sorted(
+                set(self.left_child.atoms).union(self.right_child.atoms)
+            )
+            if self.atoms != expected_atoms:
+                raise ValueError("Internal node atoms are inconsistent with children")
+            expected_separators = sorted(
                 set(self.left_child.atoms).intersection(self.right_child.atoms)
             )
-            self.clause_key = self.left_child.clause_key + self.right_child.clause_key
-
-        # self.cache = None
-        self.lit_key = 0
+            if self.separators != expected_separators:
+                raise ValueError("Internal node separators are inconsistent with children")
+            expected_clause_key = self.left_child.clause_key + self.right_child.clause_key
+            if self.clause_key != expected_clause_key:
+                raise ValueError("Internal node clause keys are inconsistent with children")
 
     def is_leaf(self) -> bool:
         """Check if this is a leaf node."""
@@ -66,56 +97,41 @@ class Node:
         """Check if this is a full binary tree."""
         if self.is_leaf():
             return True
-        if self.left_child is None and self.right_child is not None:
-            return False
-        if self.left_child is not None and self.right_child is None:
-            return False
+        assert self.left_child is not None
+        assert self.right_child is not None
         return self.left_child.is_full_binary() and self.right_child.is_full_binary()
 
     def get_counter(self) -> Dict[int, int]:
         """
         Count occurrences of literals in clauses.
-
-        Returns:
-            Dictionary mapping literals to their counts
         """
         counter: Dict[int, int] = {}
         for clause in self.clauses:
             for literal in clause:
-                if literal in counter:
-                    counter[literal] += 1
-                else:
-                    counter[literal] = 1
+                counter[literal] = counter.get(literal, 0) + 1
         return counter
 
     def pick_most(self) -> int:
         """
-        Pick a variable with the most occurrences in separator.
-
-        Returns:
-            Variable with most occurrences
+        Pick a separator variable with the most occurrences.
         """
+        if not self.separators:
+            raise ValueError("Cannot pick a separator variable when no separator exists")
         counter = self.get_counter()
-        sep_counter = {s: 0 for s in self.separators}
-        for key, count in counter.items():
-            if abs(key) in self.separators:
-                sep_counter[abs(key)] += count
-        sort_counter = sorted(sep_counter, key=sep_counter.get, reverse=True)
-        # print(sep_counter)
-        return sort_counter[0]
+        best_var = self.separators[0]
+        best_count = -1
+        for var in self.separators:
+            count = counter.get(var, 0) + counter.get(-var, 0)
+            if count > best_count:
+                best_var = var
+                best_count = count
+        return best_var
 
     def print_info(
         self, leaf: List[int], output_file: Optional[str] = None
     ) -> List[int]:
         """
-        Print node information.
-
-        Args:
-            leaf: List of leaf node IDs
-            output_file: Optional output file path
-
-        Returns:
-            Updated list of leaf node IDs
+        Print node information in the legacy dtree format.
         """
         if self.is_leaf():
             if output_file is not None:
@@ -123,21 +139,24 @@ class Node:
                     out.write(f"L {self.node_id}\n")
             else:
                 print("L ", self.node_id)
-            leaf.append(self.node_id)
+            leaf.append(int(self.node_id))
+            return leaf
+
+        assert self.left_child is not None
+        assert self.right_child is not None
+        leaf = self.left_child.print_info(leaf, output_file)
+        leaf = self.right_child.print_info(leaf, output_file)
+        left_child_pos = self.left_child.node_id
+        right_child_pos = self.right_child.node_id
+        if self.left_child.node_id in leaf:
+            left_child_pos = leaf.index(int(self.left_child.node_id))
+        if self.right_child.node_id in leaf:
+            right_child_pos = leaf.index(int(self.right_child.node_id))
+        if output_file is not None:
+            with open(output_file, "a", encoding="utf-8") as out:
+                out.write(f"I {left_child_pos} {right_child_pos}\n")
         else:
-            leaf = self.left_child.print_info(leaf, output_file)
-            leaf = self.right_child.print_info(leaf, output_file)
-            left_child_pos = self.left_child.node_id
-            right_child_pos = self.right_child.node_id
-            if self.left_child.node_id in leaf:
-                left_child_pos = leaf.index(self.left_child.node_id)
-            if self.right_child.node_id in leaf:
-                right_child_pos = leaf.index(self.right_child.node_id)
-            if output_file is not None:
-                with open(output_file, "a", encoding="utf-8") as out:
-                    out.write(f"I {left_child_pos} {right_child_pos}\n")
-            else:
-                print("I ", left_child_pos, right_child_pos)
+            print("I ", left_child_pos, right_child_pos)
         return leaf
 
 
@@ -145,52 +164,62 @@ class Dtree_Compiler:
     """Compiler for constructing decision trees from CNF formulas."""
 
     def __init__(self, clausal_form: List[List[int]]) -> None:
-        """
-        Initialize Dtree compiler.
-
-        Args:
-            clausal_form: CNF formula as list of clauses
-        """
         self.node_id = 0
-        self.clausal_form = clausal_form
+        self.clausal_form = [list(clause) for clause in clausal_form]
+
+    def default_ordering(self, strategy: str = "appearance") -> List[int]:
+        """
+        Compute a deterministic variable ordering for the current CNF.
+
+        Strategies:
+        - ``appearance``: first-appearance order in the input clauses
+        - ``frequency``: descending variable frequency, then variable id
+        """
+        variables = [abs(lit) for clause in self.clausal_form for lit in clause]
+        if strategy == "appearance":
+            ordering: List[int] = []
+            seen = set()
+            for var in variables:
+                if var not in seen:
+                    seen.add(var)
+                    ordering.append(var)
+            return ordering
+        if strategy == "frequency":
+            counts: Dict[int, int] = {}
+            first_index: Dict[int, int] = {}
+            for index, var in enumerate(variables):
+                counts[var] = counts.get(var, 0) + 1
+                first_index.setdefault(var, index)
+            return sorted(
+                counts,
+                key=lambda var: (-counts[var], first_index[var], var),
+            )
+        raise ValueError(f"Unknown dtree ordering strategy: {strategy}")
 
     def compose(self, list_tree: List[Node]) -> Node:
         """
-        Compose nodes into a tree.
-
-        Args:
-            list_tree: List of nodes to compose
-
-        Returns:
-            Composed node
+        Compose nodes into a right-associated binary tree in stable order.
         """
-        assert len(list_tree) > 0
+        if not list_tree:
+            raise ValueError("Cannot compose an empty dtree node list")
         if len(list_tree) == 1:
-            composed_node = list_tree[0]
-        elif len(list_tree) == 2:
-            composed_node = Node(
-                node_id=self.node_id, left_child=list_tree[0], right_child=list_tree[1]
-            )
-            self.node_id += 1
-        else:
-            right_composed_node = self.compose(list_tree[1:])
-            composed_node = Node(
+            return list_tree[0]
+
+        current = list_tree[-1]
+        for node in reversed(list_tree[:-1]):
+            current = Node(
                 node_id=self.node_id,
-                left_child=list_tree[0],
-                right_child=right_composed_node,
+                left_child=node,
+                right_child=current,
             )
             self.node_id += 1
-        return composed_node
+        return current
 
-    def el2dt(self, ordering: List[int]) -> Node:
+    def el2dt(
+        self, ordering: Optional[List[int]] = None, strategy: str = "appearance"
+    ) -> Node:
         """
-        Construct a dtree according to given ordering of atoms.
-
-        Args:
-            ordering: Ordering of atoms
-
-        Returns:
-            Root node of the constructed dtree
+        Construct a dtree according to a given variable ordering.
         """
         sigma: List[Node] = []
         for clause in self.clausal_form:
@@ -198,14 +227,23 @@ class Dtree_Compiler:
             self.node_id += 1
             sigma.append(leaf)
 
+        if ordering is None:
+            ordering = self.default_ordering(strategy=strategy)
+
+        seen = set()
+        stable_ordering: List[int] = []
         for lit in ordering:
-            t_nodes: List[Node] = []
-            for node in sigma:
-                if lit in node.atoms:
-                    t_nodes.append(node)
-            if len(t_nodes) > 0:
-                composed_node = self.compose(t_nodes)
-                sigma = list(set(sigma) ^ set(t_nodes))
-                sigma.append(composed_node)
+            var = abs(lit)
+            if var not in seen:
+                seen.add(var)
+                stable_ordering.append(var)
+
+        for var in stable_ordering:
+            t_nodes = [node for node in sigma if var in node.atoms]
+            if not t_nodes:
+                continue
+            composed_node = self.compose(t_nodes)
+            sigma = [node for node in sigma if var not in node.atoms]
+            sigma.append(composed_node)
 
         return self.compose(sigma)

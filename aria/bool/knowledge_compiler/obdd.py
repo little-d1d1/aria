@@ -1,24 +1,21 @@
 """
-OBDD: Ordered Binary Decision Diagrams
+OBDD: Ordered Binary Decision Diagrams.
 """
 
+from __future__ import annotations
+
 import copy
-import itertools
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from aria.bool import nnf as aria_nnf
+
+Clause = Tuple[int, ...]
+FormulaState = Tuple[Clause, ...]
 
 
 class BDD:
     """Represents a Binary Decision Diagram (BDD) node."""
 
     def __init__(self, var: int, low: Optional["BDD"], high: Optional["BDD"]) -> None:
-        """
-        Initialize a BDD node.
-
-        Args:
-            var: Variable index (0 for sink nodes)
-            low: Low branch (False branch)
-            high: High branch (True branch)
-        """
         self.var = var
         self.low = low
         self.high = high
@@ -31,17 +28,6 @@ class BDD:
     def _print_info(
         self, current_id: int, rank: List[List[int]], output_file: Optional[str] = None
     ) -> Tuple[int, List[List[int]]]:
-        """
-        Internal method to print BDD information.
-
-        Args:
-            current_id: Current node ID
-            rank: List of node ranks
-            output_file: Optional output file path
-
-        Returns:
-            Tuple of (next_id, updated_rank)
-        """
         if self.explore_id > 0:
             return current_id, rank
 
@@ -50,25 +36,23 @@ class BDD:
                 with open(output_file, "a", encoding="utf-8") as out:
                     if self.var:
                         out.write(
-                            f'     {current_id + 1} [label="True", '
-                            f"color=green, shape=square];\n"
+                            f'     {current_id + 1} [label="True", color=green, shape=square];\n'
                         )
                     else:
                         out.write(
-                            f'     {current_id + 1} [label="False", '
-                            f"color=red, shape=square];\n"
+                            f'     {current_id + 1} [label="False", color=red, shape=square];\n'
                         )
             else:
                 print(f"{current_id + 1}-SINK : {self.var}")
         else:
+            assert self.low is not None and self.high is not None
             left_current_id, rank = self.low._print_info(current_id, rank, output_file)
             current_id, rank = self.high._print_info(left_current_id, rank, output_file)
             if output_file is not None:
                 with open(output_file, "a", encoding="utf-8") as out:
                     out.write(f'     {current_id + 1} [label="{self.var}"];\n')
                     out.write(
-                        f"     {current_id + 1} -> {self.low.explore_id} "
-                        f"[style=dotted];\n"
+                        f"     {current_id + 1} -> {self.low.explore_id} [style=dotted];\n"
                     )
                     out.write(f"     {current_id + 1} -> {self.high.explore_id};\n")
             else:
@@ -83,81 +67,75 @@ class BDD:
     def print_info(
         self, nvars: int, output_file: Optional[str] = None
     ) -> List[List[int]]:
-        """
-        Print BDD information.
-
-        Args:
-            nvars: Number of variables
-            output_file: Optional output file path
-
-        Returns:
-            List of node ranks
-        """
+        """Print BDD information."""
         rank = [[] for _ in range(nvars + 1)]
         _, rank = copy.deepcopy(self)._print_info(0, rank, output_file)
-        # for i in range(len(rank)):
-        #     print(i, ': ', rank[i])
         return rank
+
+    def validate(self) -> None:
+        """Validate basic BDD node invariants."""
+        if self.is_sink():
+            return
+        if self.low is None or self.high is None:
+            raise ValueError("Non-sink BDD nodes must have both low/high branches")
+        if self.var <= 0:
+            raise ValueError("Non-sink BDD nodes must branch on a positive variable id")
 
 
 class BDD_Compiler:
-    """Compiler for converting CNF to OBDD (Ordered Binary Decision Diagram)."""
+    """Compiler for converting CNF to OBDD."""
 
-    def __init__(self, n_vars: int, clausal_form: List[List[int]]) -> None:
-        """
-        Initialize BDD compiler.
-
-        Args:
-            n_vars: Number of variables
-            clausal_form: CNF formula as list of clauses
-        """
-        self.clausal_form = clausal_form
-        self.n_vars = n_vars
-        self.unique: Dict[Tuple[int, Optional[BDD], Optional[BDD]], BDD] = {}
-        self.cache: Dict[int, Dict[int, BDD]] = {}
-        for i in range(n_vars + 1):
-            self.cache[i] = {}
-        self.cutset_cache = self._generate_cutset_cache()
-        self.separator_cache = self._generate_separator_cache()
-
+    def __init__(
+        self,
+        n_vars: int,
+        clausal_form: List[List[int]],
+        variable_order: Optional[Sequence[int]] = None,
+    ) -> None:
+        self.clausal_form = [list(clause) for clause in clausal_form]
+        self.variable_order = list(variable_order) if variable_order is not None else list(
+            range(1, n_vars + 1)
+        )
+        self.n_vars = len(self.variable_order)
+        self.level_of_var = {
+            var: index + 1 for index, var in enumerate(self.variable_order)
+        }
+        self.unique: Dict[Tuple[int, BDD, BDD], BDD] = {}
+        self.cache: Dict[Tuple[int, str, FormulaState], BDD] = {}
         self.f_sink = BDD(False, None, None)
         self.t_sink = BDD(True, None, None)
 
-    def bcp(self, formula: List[List[int]], literal: int) -> List[List[int]]:
-        """
-        Boolean Constraint Propagation.
+    def _normalize_formula(self, clauses: Sequence[Sequence[int]]) -> FormulaState:
+        normalized: List[Clause] = []
+        for clause in clauses:
+            if len(clause) == 0:
+                normalized.append(tuple())
+                continue
+            deduped = sorted(set(int(lit) for lit in clause), key=lambda lit: (abs(lit), lit))
+            clause_set = set(deduped)
+            if any(-lit in clause_set for lit in deduped):
+                continue
+            normalized.append(tuple(deduped))
+        normalized.sort()
+        return tuple(normalized)
 
-        Args:
-            formula: CNF formula
-            literal: Literal to propagate
-
-        Returns:
-            Modified formula after BCP
-        """
-        modified = []
+    def bcp(self, formula: Sequence[Sequence[int]], literal: int) -> Union[FormulaState, int]:
+        """Boolean Constraint Propagation."""
+        modified: List[Clause] = []
         for clause in formula:
-            if literal in clause:
-                modified.append([])
-            elif -literal in clause:
-                c = [x for x in clause if x != -literal]
-                if len(c) == 0:
+            clause_set = set(clause)
+            if literal in clause_set:
+                continue
+            if -literal in clause_set:
+                reduced = tuple(lit for lit in clause if lit != -literal)
+                if len(reduced) == 0:
                     return -1
-                modified.append(c)
+                modified.append(reduced)
             else:
-                modified.append(clause)
-        return modified
+                modified.append(tuple(clause))
+        return self._normalize_formula(modified)
 
-    def _compute_cutset(self, clausal_form: List[List[int]], var: int) -> List[int]:
-        """
-        Compute cutset for a variable.
-
-        Args:
-            clausal_form: CNF formula
-            var: Variable index
-
-        Returns:
-            List of clause indices in cutset
-        """
+    def _compute_cutset(self, clausal_form: Sequence[Sequence[int]], var: int) -> List[int]:
+        """Compute cutset clause indices for a variable in the current residual formula."""
         cutset = []
         for i, clause in enumerate(clausal_form):
             if len(clause) == 0:
@@ -167,151 +145,267 @@ class BDD_Compiler:
                 cutset.append(i)
         return cutset
 
-    def _generate_cutset_cache(self) -> List[List[int]]:
-        """Generate cutset cache for all variables."""
-        cutset_cache = []
-        print("CUTSET CACHE:")
-        for i in range(self.n_vars):
-            cutset_i = self._compute_cutset(self.clausal_form, i + 1)
-            cutset_cache.append(cutset_i)
-            print(f"-cutset {i + 1} : {cutset_i}")
-        return cutset_cache
-
-    def compute_cutset_key(self, clausal_form: List[List[int]], var: int) -> int:
-        """
-        Compute cutset key for caching.
-
-        Args:
-            clausal_form: CNF formula (unused, uses cache instead)
-            var: Variable index
-
-        Returns:
-            Cutset key
-        """
-        # clausal_form is kept for interface compatibility but uses cache
-        del clausal_form
-        cutset_var = self.cutset_cache[var - 1]
+    def compute_cutset_key(self, clausal_form: Sequence[Sequence[int]], var: int) -> int:
+        """Compute a cutset key from the current residual formula."""
         cutset_key = 0
-        for i, c in enumerate(cutset_var):
-            if len(self.clausal_form[c]) == 0:
+        for i, clause_index in enumerate(self._compute_cutset(clausal_form, var)):
+            if len(clausal_form[clause_index]) == 0:
                 cutset_key += 2**i
+            else:
+                cutset_key += hash(clausal_form[clause_index]) & ((1 << (i + 1)) - 1)
         return cutset_key
 
-    def _compute_separator(self, clausal_form: List[List[int]], var: int) -> List[int]:
-        """
-        Compute separator for a variable.
+    def _compute_separator(
+        self, clausal_form: Sequence[Sequence[int]], var: int
+    ) -> List[int]:
+        """Compute the separator variables for a variable in the current residual formula."""
+        sep = set()
+        for clause_index in self._compute_cutset(clausal_form, var):
+            for literal in clausal_form[clause_index]:
+                if abs(literal) <= var:
+                    sep.add(abs(literal))
+        return sorted(sep)
 
-        Args:
-            clausal_form: CNF formula
-            var: Variable index
-
-        Returns:
-            List of variables in separator
-        """
-        sep = []
-        for ci in self.cutset_cache[var - 1]:
-            sep += self.clausal_form[ci]
-        sep = [abs(lit) for lit in sep if abs(lit) <= var]
-        sep = list(set(sep))
-        return sep
-
-    def _generate_separator_cache(self) -> List[List[int]]:
-        """Generate separator cache for all variables."""
-        sep_cache = []
-        print("SEPARATOR CACHE:")
-        for i in range(self.n_vars):
-            sep_i = self._compute_separator(self.clausal_form, i + 1)
-            sep_cache.append(sep_i)
-            print(f"-sep {i + 1} : {sep_i}")
-        return sep_cache
-
-    def compute_separator_key(self, clausal_form: List[List[int]], var: int) -> int:
-        """
-        Compute separator key for caching.
-
-        Args:
-            clausal_form: CNF formula (unused, uses cache instead)
-            var: Variable index
-
-        Returns:
-            Separator key
-        """
-        # clausal_form is kept for interface compatibility but uses cache
-        del clausal_form
-        sep_var = self.separator_cache[var - 1]
+    def compute_separator_key(self, clausal_form: Sequence[Sequence[int]], var: int) -> int:
+        """Compute a separator key from the current residual formula."""
         sep_key = 0
-        for v in sep_var:
-            sep_key += 2**v
+        for variable in self._compute_separator(clausal_form, var):
+            sep_key += 2**variable
         return sep_key
 
     def get_nodes(self, var: int, low: BDD, high: BDD) -> BDD:
-        """
-        Get or create a BDD node.
-
-        Args:
-            var: Variable index
-            low: Low branch
-            high: High branch
-
-        Returns:
-            BDD node
-        """
+        """Get or create a reduced BDD node."""
         if low == high:
             return low
-        if (var, low, high) in self.unique:
-            return self.unique[(var, low, high)]
-        result = BDD(var, low, high)
-        self.unique[(var, low, high)] = result
-        return result
+        key = (var, low, high)
+        if key not in self.unique:
+            self.unique[key] = BDD(var, low, high)
+        return self.unique[key]
+
+    def _formula_empty(self, clausal_form: FormulaState) -> bool:
+        return len(clausal_form) == 0
+
+    def _formula_unsat(self, clausal_form: FormulaState) -> bool:
+        return any(len(clause) == 0 for clause in clausal_form)
 
     def cnf2obdd(
-        self, clausal_form: List[List[int]], i: int, key_type: str = "cutset"
+        self, clausal_form: Union[Sequence[Sequence[int]], int], i: int, key_type: str = "cutset"
     ) -> BDD:
-        """
-        Convert CNF to OBDD.
-
-        Args:
-            clausal_form: CNF formula
-            i: Variable index
-            key_type: Type of key for caching ('cutset' or 'separator')
-
-        Returns:
-            BDD representing the formula
-        """
-        assert key_type in ("cutset", "separator")
+        """Convert CNF to OBDD."""
+        if key_type not in ("cutset", "separator"):
+            raise ValueError("key_type must be 'cutset' or 'separator'")
 
         if clausal_form == -1:
             return self.f_sink
-        if len(list(itertools.chain(*clausal_form))) == 0:
+        formula = self._normalize_formula(clausal_form)
+        if self._formula_unsat(formula):
+            return self.f_sink
+        if self._formula_empty(formula):
             return self.t_sink
+        if i > self.n_vars:
+            return self.f_sink
+        branch_var = self.variable_order[i - 1]
 
-        assert i <= self.n_vars + 1
+        state_key = (i, key_type, formula)
+        cached = self.cache.get(state_key)
+        if cached is not None:
+            return cached
 
         if key_type == "cutset":
-            key = self.compute_cutset_key(clausal_form, i - 1)
+            _ = self.compute_cutset_key(formula, branch_var)
         else:
-            key = self.compute_separator_key(clausal_form, i - 1)
+            _ = self.compute_separator_key(formula, branch_var)
 
-        if key in self.cache[i - 1]:
-            print(f"This node is already in cache {i - 1} with key {key}")
-            return self.cache[i - 1][key]
-
-        low = self.cnf2obdd(self.bcp(clausal_form, -i), i + 1)
-        high = self.cnf2obdd(self.bcp(clausal_form, i), i + 1)
-        result = self.get_nodes(i, low, high)
-
-        self.cache[i - 1][key] = result
-        # print('This node is stored in cache {} with key {}'.format(i-1, key))
+        low = self.cnf2obdd(
+            self.bcp(formula, -branch_var) if not self._formula_empty(formula) else formula,
+            i + 1,
+            key_type,
+        )
+        high = self.cnf2obdd(
+            self.bcp(formula, branch_var) if not self._formula_empty(formula) else formula,
+            i + 1,
+            key_type,
+        )
+        result = self.get_nodes(branch_var, low, high)
+        self.cache[state_key] = result
         return result
 
     def compile(self, key_type: str = "cutset") -> BDD:
-        """
-        Compile CNF formula to OBDD.
-
-        Args:
-            key_type: Type of key for caching
-
-        Returns:
-            Compiled BDD
-        """
+        """Compile a CNF formula to OBDD."""
         return self.cnf2obdd(self.clausal_form, 1, key_type)
+
+    def validate(self, bdd: BDD) -> None:
+        """Validate reduced ordered BDD invariants recursively."""
+        seen: Set[int] = set()
+
+        def walk(node: BDD, min_var: int) -> None:
+            node_id = id(node)
+            if node_id in seen:
+                return
+            seen.add(node_id)
+            node.validate()
+            if node.is_sink():
+                return
+            assert node.low is not None and node.high is not None
+            current_level = self.level_of_var[node.var]
+            if current_level < min_var:
+                raise ValueError("BDD variable ordering is inconsistent along a path")
+            if node.low == node.high:
+                raise ValueError("Reduced BDD nodes cannot have identical children")
+            walk(node.low, current_level + 1)
+            walk(node.high, current_level + 1)
+
+        walk(bdd, 1)
+
+    def is_sat(self, bdd: BDD) -> bool:
+        """Check if the BDD is satisfiable."""
+        if bdd.is_sink():
+            return bool(bdd.var)
+        assert bdd.low is not None and bdd.high is not None
+        return self.is_sat(bdd.low) or self.is_sat(bdd.high)
+
+    def condition(self, bdd: BDD, literals: Sequence[int]) -> BDD:
+        """Condition a BDD on a set of literals."""
+        assignment = {abs(lit): lit > 0 for lit in literals}
+        memo: Dict[int, BDD] = {}
+
+        def restrict(node: BDD) -> BDD:
+            node_id = id(node)
+            cached = memo.get(node_id)
+            if cached is not None:
+                return cached
+            if node.is_sink():
+                memo[node_id] = node
+                return node
+            assert node.low is not None and node.high is not None
+            choice = assignment.get(node.var)
+            if choice is True:
+                result = restrict(node.high)
+            elif choice is False:
+                result = restrict(node.low)
+            else:
+                low = restrict(node.low)
+                high = restrict(node.high)
+                result = self.get_nodes(node.var, low, high)
+            memo[node_id] = result
+            return result
+
+        return restrict(bdd)
+
+    def one_model(self, bdd: BDD) -> Optional[List[int]]:
+        """Extract one satisfying assignment from the BDD."""
+        if bdd.is_sink():
+            return [] if bdd.var else None
+        assert bdd.low is not None and bdd.high is not None
+        high_model = self.one_model(bdd.high)
+        if high_model is not None:
+            return [bdd.var] + high_model
+        low_model = self.one_model(bdd.low)
+        if low_model is not None:
+            return [-bdd.var] + low_model
+        return None
+
+    def enumerate_models(
+        self, bdd: BDD, variables: Optional[Sequence[int]] = None
+    ) -> List[List[int]]:
+        """Enumerate full satisfying assignments over the given variable order."""
+        if variables is None:
+            variables = self.variable_order
+        variable_order = list(variables)
+        level_of_var = {var: index for index, var in enumerate(variable_order)}
+
+        memo: Dict[Tuple[int, int], List[List[int]]] = {}
+
+        def suffix_assignments(start_index: int) -> List[List[int]]:
+            if start_index >= len(variable_order):
+                return [[]]
+            result = [[]]
+            for var in variable_order[start_index:]:
+                next_result: List[List[int]] = []
+                for assignment in result:
+                    next_result.append([var] + assignment)
+                    next_result.append([-var] + assignment)
+                result = next_result
+            return result
+
+        def walk(node: BDD, level_index: int) -> List[List[int]]:
+            key = (id(node), level_index)
+            cached = memo.get(key)
+            if cached is not None:
+                return cached
+            if node.is_sink():
+                result = suffix_assignments(level_index) if node.var else []
+                memo[key] = result
+                return result
+
+            assert node.low is not None and node.high is not None
+            node_index = level_of_var[node.var]
+            skipped = variable_order[level_index:node_index]
+            skipped_assignments = suffix_assignments(level_index) if node_index == len(variable_order) else None
+            del skipped_assignments  # keep structure explicit; skipped handled below
+
+            prefix_choices = [[]]
+            for skipped_var in skipped:
+                next_prefixes: List[List[int]] = []
+                for prefix in prefix_choices:
+                    next_prefixes.append(prefix + [skipped_var])
+                    next_prefixes.append(prefix + [-skipped_var])
+                prefix_choices = next_prefixes
+
+            result: List[List[int]] = []
+            for prefix in prefix_choices:
+                for suffix in walk(node.low, node_index + 1):
+                    result.append(prefix + [-node.var] + suffix)
+                for suffix in walk(node.high, node_index + 1):
+                    result.append(prefix + [node.var] + suffix)
+            memo[key] = result
+            return result
+
+        models = walk(bdd, 0)
+        models.sort()
+        return models
+
+    def model_count(self, bdd: BDD) -> int:
+        """Count satisfying assignments represented by the BDD."""
+        memo: Dict[Tuple[int, int], int] = {}
+
+        def count(node: BDD, level: int) -> int:
+            node_id = (id(node), level)
+            cached = memo.get(node_id)
+            if cached is not None:
+                return cached
+            if node.is_sink():
+                result = (2 ** (self.n_vars - level + 1)) if node.var else 0
+            else:
+                assert node.low is not None and node.high is not None
+                node_level = self.level_of_var[node.var]
+                skipped = max(0, node_level - level)
+                multiplier = 2**skipped
+                result = multiplier * (
+                    count(node.low, node_level + 1) + count(node.high, node_level + 1)
+                )
+            memo[node_id] = result
+            return result
+
+        return count(bdd, 1)
+
+    def to_nnf(self, bdd: BDD) -> aria_nnf.NNF:
+        """Convert an OBDD into an equivalent deterministic/decomposable NNF."""
+        memo: Dict[int, aria_nnf.NNF] = {}
+
+        def convert(node: BDD) -> aria_nnf.NNF:
+            node_id = id(node)
+            cached = memo.get(node_id)
+            if cached is not None:
+                return cached
+            if node.is_sink():
+                result = aria_nnf.true if node.var else aria_nnf.false
+            else:
+                assert node.low is not None and node.high is not None
+                var = aria_nnf.Var(node.var)
+                result = aria_nnf.decision(var, convert(node.high), convert(node.low)).simplify()
+                result.mark_deterministic()
+            memo[node_id] = result
+            return result
+
+        return convert(bdd)

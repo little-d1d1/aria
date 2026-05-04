@@ -17,7 +17,7 @@ This package provides CLI tools for various automated reasoning tasks:
 | `allsmt` | Enumerate all satisfying models of an SMT formula |
 | `smt_server` | Enhanced SMT server with advanced features |
 | `efmc` | Transition-system verification across CHC, SyGuS, Boogie, and C |
-| `efmc_efsmt` | EFMC-specific EFSMT frontend |
+| `efmc_efsmt` | Legacy EFMC-oriented EFSMT frontend |
 | `polyhorn` | Polynomial Horn constraint solving |
 
 After `pip install -e .`, the same tools are available as `aria-fmldoc`, `aria-mc`, `aria-pyomt`, `aria-efsmt`, `aria-efmc-efsmt`, `aria-maxsat`, `aria-unsat-core`, `aria-allsmt`, `aria-smt-server`, `aria-efmc`, and `aria-polyhorn`.
@@ -162,6 +162,15 @@ python -m aria.cli.pyomt_cli problem.smt2 --theory arith
 
 Solve Exists-Forall SMT problems.
 
+### Relationship to `efmc` and `efmc_efsmt`
+
+There are currently two user-facing EFSMT CLIs in the repository:
+
+- `aria-efsmt` / `python -m aria.cli.efsmt_cli` is the general-purpose EFSMT frontend. It is intended for standalone `.smt2` exists-forall queries and supports the newer `aria.quant`-based theory-specific engines.
+- `aria-efmc-efsmt` / `python -m aria.cli.efmc_efsmt_cli` is an EFMC-adjacent frontend that uses the EFMC solver stack under `aria.efmc.engines.ef.efsmt`.
+
+They overlap in purpose, which is partly historical: `aria/efmc` was migrated from another repository and both frontends were kept. If you are starting fresh with an EFSMT `.smt2` file, prefer `aria-efsmt`. Use `aria-efmc` for transition-system verification and `aria-efmc-efsmt` only when you specifically want the EFMC-oriented solver/dumping behavior documented below.
+
 ### Usage
 
 ```bash
@@ -209,6 +218,36 @@ Example:
 (declare-fun x () Int)
 (assert (forall ((y Int)) (=> (>= y 0) (>= x y))))
 (check-sat)
+```
+
+## efmc_efsmt - Legacy EFMC-Oriented EFSMT Frontend
+
+Solve Exists-Forall SMT problems using the EFMC EFSMT backend.
+
+### When to use it
+
+Prefer this frontend only if you specifically need one of these EFMC-oriented behaviors:
+
+- direct access to the solver stack in `aria.efmc.engines.ef.efsmt`
+- dump helpers for EFSMT/QBF/CNF produced by that backend
+- behavior that matches EFMC's internal template-based verification pipeline more closely
+
+For most standalone EFSMT `.smt2` workflows, prefer `aria-efsmt` instead.
+
+### Key differences from `efsmt`
+
+| CLI | Primary code path | Intended input | Notes |
+|-----|-------------------|----------------|-------|
+| `aria-efsmt` | `aria.quant.*` | standalone EFSMT `.smt2` | general-purpose frontend; newer theory-specific split |
+| `aria-efmc-efsmt` | `aria.efmc.engines.ef.efsmt.*` | standalone EFSMT `.smt2` | legacy overlap; closer to EFMC internals |
+| `aria-efmc` | `aria.efmc.*` verification stack | CHC, SyGuS, Boogie, C | transition-system verification, not a raw EFSMT solver |
+
+### Usage
+
+```bash
+python -m aria.cli.efmc_efsmt_cli --file problem.smt2 z3 --logic BV
+python -m aria.cli.efmc_efsmt_cli --file problem.smt2 z3api --logic LIA
+python -m aria.cli.efmc_efsmt_cli --file problem.smt2 z3 --logic BV --dump-qbf
 ```
 
 ---
