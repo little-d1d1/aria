@@ -15,6 +15,9 @@ from enum import Enum
 import math
 from fractions import Fraction
 
+from .linear import QQVector, of_linterm, const_dim
+from .algebra import QQ
+
 
 # Helper function for pivot operation on linear terms
 def pivot(term: Any, symbol: Any) -> Tuple[Any, Any]:

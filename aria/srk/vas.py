@@ -7,7 +7,7 @@ Based on the OCaml implementation in src/vas.ml.
 """
 
 import logging
-from typing import List, Dict, Set, Tuple, Optional, Any, Union
+from typing import List, Dict, Set, Tuple, Optional, Any, Union, Deque
 from dataclasses import dataclass
 from enum import Enum
 from collections import deque

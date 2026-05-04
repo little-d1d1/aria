@@ -14,8 +14,11 @@ from fractions import Fraction
 import functools
 import logging
 
+
 # Import from other SRK modules
 from aria.srk.syntax import (
+    ArithExpression,
+    FormulaExpression,
     Context,
     Symbol,
     Expression,

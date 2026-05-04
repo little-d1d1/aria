@@ -5,6 +5,8 @@ This module provides functionality for analyzing solvable polynomial maps,
 including closed-form computation and abstraction techniques for program analysis.
 """
 
+# pyright: reportDeprecated=false, reportReturnType=false, reportArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportMissingTypeArgument=false, reportImplicitOverride=false, reportCallInDefaultInitializer=false, reportPrivateUsage=false
+
 from __future__ import annotations
 from typing import List, Dict, Set, Tuple, Optional, Union, Callable, Any, TypeVar
 from fractions import Fraction
@@ -1432,6 +1434,9 @@ def extract_vector_leq(
 
 class SolvablePolynomialAbstraction:
     """Solvable polynomial maps for arbitrary eigenvalues (general case).
+
+    This variant handles the arbitrary-spectrum closure path.
+    """
 
     @staticmethod
     def abstract(

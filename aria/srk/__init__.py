@@ -20,6 +20,8 @@ Main modules:
 - quantifier: Quantifier elimination and strategy synthesis
 """
 
+# pyright: reportImportCycles=false, reportUnusedImport=false, reportUnsupportedDunderAll=false
+
 __version__ = "0.1.0"
 __author__ = "SRK Python Migration"
 

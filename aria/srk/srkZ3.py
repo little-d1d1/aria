@@ -21,6 +21,7 @@ except ImportError:
 from aria.srk.syntax import (
     Context,
     Symbol,
+    Neg,
     Type,
     Expression,
     Var,

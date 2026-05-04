@@ -40,6 +40,8 @@ import itertools
 import math
 from functools import cmp_to_key
 import heapq
+from .syntax import mk_real, ArithExpression, Context
+from .linear import QQVector, of_linterm, const_dim
 
 # Optional SymPy integration for advanced polynomial operations
 try:

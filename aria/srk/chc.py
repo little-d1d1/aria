@@ -11,6 +11,8 @@ from __future__ import annotations
 from typing import Dict, List, Set, Tuple, Optional, Union, Any, Callable
 from dataclasses import dataclass, field
 import logging
+from .syntax import Context
+
 
 # Type aliases
 Relation = int

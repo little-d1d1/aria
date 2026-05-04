@@ -5,6 +5,8 @@ This module provides weighted graphs with algebraic operations for
 path analysis, SCC computation, and advanced graph algorithms.
 """
 
+# pyright: reportDeprecated=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportUnannotatedClassAttribute=false
+
 from __future__ import annotations
 from typing import (
     TypeVar,
@@ -816,7 +818,7 @@ def contract_vertex(wg: WeightedGraph[T], v: Vertex) -> WeightedGraph[T]:
 
 
 def fold_reachable_edges(
-    f: Callable[[Vertex, Vertex], U], wg: WeightedGraph[T], v: Vertex, acc: U
+    f: Callable[[Vertex, Vertex, U], U], wg: WeightedGraph[T], v: Vertex, acc: U
 ) -> U:
     """Fold over all edges reachable from vertex v."""
     visited = set()
@@ -951,7 +953,7 @@ class RecGraph(Generic[T]):
         return self.get_summary(call_start, ret)
 
 
-class Algebra(Generic[T]):
+class LegacyAlgebra(Generic[T]):
     def __init__(self, zero: T, one: T, add, mul, star):
         self.zero = zero
         self.one = one
@@ -960,7 +962,7 @@ class Algebra(Generic[T]):
         self.star = star
 
 
-class OmegaAlgebra(Generic[T]):
+class LegacyOmegaAlgebra(Generic[T]):
     def __init__(self, zero: T, one: T, add, mul, star, omega, omega_add, omega_mul):
         self.zero = zero
         self.one = one

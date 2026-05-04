@@ -10,8 +10,8 @@ from typing import Dict, List, Set, Tuple, Optional, Union, Any, Iterator
 from dataclasses import dataclass, field
 from fractions import Fraction
 
-from .syntax import Context, Symbol, Type, FormulaExpression, ArithExpression
-from .linear import QQVector, QQMatrix
+from .syntax import Context, Symbol, Type, FormulaExpression, ArithExpression, Lt, Leq, Eq, mk_leq, mk_eq, mk_lt
+from .linear import QQVector, QQMatrix, QQVectorSpace
 
 
 class Constraint:

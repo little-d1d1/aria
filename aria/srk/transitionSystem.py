@@ -7,6 +7,7 @@ of transition systems.
 """
 
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import Dict, List, Set, Tuple, Optional, Callable, TypeVar, Generic, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -16,6 +17,7 @@ from aria.srk.interval import Interval
 from aria.srk.weightedGraph import (
     WeightedGraph,
     Algebra,
+    Vertex,
     OmegaAlgebra,
     Vertex as WGVertex,
     _find_sccs_in_vertices,

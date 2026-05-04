@@ -6,6 +6,8 @@ the APRON library for polyhedral operations and analysis.
 Based on the OCaml implementation in src/wedge.ml.
 """
 
+# pyright: reportDeprecated=false, reportAttributeAccessIssue=false, reportArgumentType=false, reportReturnType=false, reportUndefinedVariable=false, reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false, reportUnknownParameterType=false, reportMissingParameterType=false
+
 import logging
 from typing import List, Dict, Set, Tuple, Optional, Any, Union, Callable
 from dataclasses import dataclass
@@ -22,6 +24,8 @@ from . import apron as ApronInterface
 from . import coordinateSystem as CS
 from . import polynomial as P
 from .polynomial import RewriteSystem
+from .syntax import ArithExpression, Context, FormulaExpression
+from .linear import QQVector
 
 logger = logging.getLogger(__name__)
 

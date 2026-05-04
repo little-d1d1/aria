@@ -26,6 +26,8 @@ import logging
 
 from aria.srk.syntax import (
     Context,
+    TrueExpr,
+    FalseExpr,
     Symbol,
     Type,
     FormulaExpression,

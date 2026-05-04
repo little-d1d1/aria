@@ -19,6 +19,10 @@ from aria.srk.syntax import Context, ArithExpression
 from aria.srk.polynomial import Polynomial, QQX
 from aria.srk.linear import QQVector, QQMatrix
 
+from .linear import QQVector, QQMatrix, QQ
+from .polynomial import Polynomial, Monomial, Pol
+from .syntax import Context, ArithExpression, mk_add
+
 
 class ExpPolynomial:
     """Represents an exponential polynomial."""

@@ -59,6 +59,10 @@ from aria.srk.syntax import (
     rewrite,
     nnf_rewriter,
     free_vars,
+    Not,
+    Eq,
+    Leq,
+    Lt
 )
 from .qQ import QQ
 from .linear import QQVector, QQMatrix

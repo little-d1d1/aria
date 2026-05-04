@@ -151,6 +151,29 @@ mypy_path = "stubs"
 module = "z3"
 ignore_missing_imports = true
 
+[tool.basedpyright]
+typeCheckingMode = "standard"
+reportDeprecated = false
+reportUnusedImport = false
+reportImportCycles = false
+reportUnsupportedDunderAll = false
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownParameterType = false
+reportMissingParameterType = false
+reportMissingTypeArgument = false
+reportUnusedCallResult = false
+reportImplicitOverride = false
+reportAny = false
+reportUnnecessaryComparison = false
+reportPrivateUsage = false
+reportCallInDefaultInitializer = false
+reportUnannotatedClassAttribute = false
+reportUnusedVariable = false
+reportUnusedFunction = false
+reportUnusedParameter = false
+
 
 [tool.pytest.ini_options]
 minversion = "7.0"

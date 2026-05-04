@@ -290,7 +290,9 @@ class Interval:
             base = self.lower if self.lower is not None else QQ(0)
             exponent = other.lower if other.lower is not None else QQ(0)
             try:
-                result = base**exponent
+                if exponent.denominator != 1:
+                    return Interval.top()
+                result = base ** int(exponent)
                 return Interval(result, result)
             except:
                 return Interval.top()
@@ -378,6 +380,23 @@ class Interval:
         return (Interval(self.lower, mid), Interval(mid, self.upper))
 
 
+# Module-level constructors matching the older OCaml-style API.
+def bottom() -> Interval:
+    return Interval.bottom()
+
+
+def top() -> Interval:
+    return Interval.top()
+
+
+def const(k: QQ) -> Interval:
+    return Interval.const(k)
+
+
+def make(lower: Optional[QQ], upper: Optional[QQ]) -> Interval:
+    return Interval.make(lower, upper)
+
+
 # Standalone functions matching OCaml API
 def compare(a: Interval, b: Interval) -> int:
     if a == b: return 0
@@ -386,12 +405,17 @@ def compare(a: Interval, b: Interval) -> int:
 
 def pp(out, x: Interval) -> None: out.write(str(x))
 def show(x: Interval) -> str: return str(x)
-def negate_fn(x: Interval) -> Interval: return Interval.negate(x)
-def mul_fn(a: Interval, b: Interval) -> Interval: return Interval.mul(a, b)
-def div_fn(a: Interval, b: Interval) -> Interval: return Interval.truediv(a, b)
-def add_fn(a: Interval, b: Interval) -> Interval: return Interval.add(a, b)
-def sub_fn(a: Interval, b: Interval) -> Interval: return Interval.sub(a, b)
-def floor_fn(x: Interval) -> Interval: return Interval.floor(x)
+def negate_fn(x: Interval) -> Interval: return -x
+def mul_fn(a: Interval, b: Interval) -> Interval: return a * b
+def div_fn(a: Interval, b: Interval) -> Interval: return a / b
+def add_fn(a: Interval, b: Interval) -> Interval: return a + b
+def sub_fn(a: Interval, b: Interval) -> Interval: return a - b
+def floor_fn(x: Interval) -> Interval:
+    if x.is_bottom():
+        return Interval.bottom()
+    if x.lower is None or x.upper is None:
+        return Interval.top()
+    return Interval(Fraction(x.lower.numerator // x.lower.denominator), Fraction(x.upper.numerator // x.upper.denominator))
 def modulo(a: Interval, b: Interval) -> Interval: return top() if b.is_bottom() else top()
 def is_nonpositive(x: Interval) -> bool: return x.upper is not None and x.upper <= 0
 def is_negative(x: Interval) -> bool: return x.upper is not None and x.upper < 0
@@ -402,7 +426,7 @@ def integral(x: Interval) -> Interval:
 def log_fn(a: Interval, b: Interval) -> Interval: return top()
 def exp_const_fn(a: Interval, n: int) -> Interval:
     if n < 0: return top()
-    r = const(1); base = a
+    r = const(QQ(1)); base = a
     while n:
         if n & 1: r = mul_fn(r, base)
         base = mul_fn(base, base); n >>= 1
