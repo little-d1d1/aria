@@ -27,7 +27,7 @@ from aria.efmc.utils.verification_utils import VerificationResult
 
 # for the less-used prover, I move them to the corresponding functions.
 # the followings only serve as "docs"
-""" 
+"""
 from aria.efmc.engines.qi import QuantifierInstantiationProver
 from aria.efmc.engines.houdini import HoudiniProver
 from aria.efmc.engines.abduction import AbductionProver
@@ -384,7 +384,7 @@ def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description="EFMC - A Software Model Checker",
-        usage="efmc --file FILE [options]",
+        usage="aria-efmc --file FILE [options]",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 

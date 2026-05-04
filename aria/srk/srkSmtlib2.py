@@ -14,6 +14,7 @@ from aria.srk.srkSmtlib2Defs import *
 from aria.srk.syntax import Context, Symbol as SRKSymbol, Type
 from aria.srk import zZ
 from aria.srk import qQ
+from .srkSmtlib2Parse import SMTLib2Parser as PLYSMTLib2Parser
 
 # SMT-LIB 2 keywords and reserved words
 SMTLIB2_KEYWORDS = {
@@ -190,391 +191,48 @@ SMTLIB2_KEYWORDS = {
 
 
 class SMTLib2Parser:
-    """Parser for SMT-LIB 2 expressions."""
+    """Parser for SMT-LIB 2 expressions using PLY-based lexer/parser."""
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context = None):
         self.context = context
-        self.tokens: List[str] = []
-        self.pos = 0
+        self._parser = PLYSMTLib2Parser()
 
-    def tokenize(self, text: str) -> List[str]:
-        """Tokenize SMT-LIB 2 text."""
-        tokens = []
-        current = ""
-        i = 0
-
-        while i < len(text):
-            char = text[i]
-
-            # Handle parentheses
-            if char in "()":
-                if current:
-                    tokens.append(current)
-                    current = ""
-                tokens.append(char)
-
-            # Handle whitespace
-            elif char.isspace():
-                if current:
-                    tokens.append(current)
-                    current = ""
-
-            # Handle string literals
-            elif char == '"' and current == "":
-                # Start of string literal
-                j = i + 1
-                while j < len(text) and text[j] != '"':
-                    j += 1
-                if j < len(text):
-                    tokens.append('"' + text[i + 1 : j] + '"')
-                    i = j
-                else:
-                    current += char
-
-            # Handle comments
-            elif char == ";" and current == "":
-                # Comment - skip to end of line
-                j = i + 1
-                while j < len(text) and text[j] != "\n":
-                    j += 1
-                i = j - 1
-
-            # Handle hex/binary/decimal numerics
-            elif char == "#" and current == "" and i + 1 < len(text):
-                if text[i + 1].lower() == "x":
-                    j = i + 2
-                    while j < len(text) and text[j] in "0123456789abcdefABCDEF":
-                        j += 1
-                    if j > i + 2:
-                        raw = text[i + 2 : j]
-                        try:
-                            val = int(raw, 16)
-                            tokens.append(str(val))
-                            i = j - 1
-                            continue
-                        except ValueError:
-                            pass
-                elif text[i + 1].lower() == "b":
-                    j = i + 2
-                    while j < len(text) and text[j] in "01":
-                        j += 1
-                    if j > i + 2:
-                        raw = text[i + 2 : j]
-                        try:
-                            val = int(raw, 2)
-                            tokens.append(str(val))
-                            i = j - 1
-                            continue
-                        except ValueError:
-                            pass
-                current += char
-
-            # Handle decimal numbers (including negative and fractional)
-            elif (char.isdigit() or char == ".") and current == "" and char != ".":
-                j = i
-                while j < len(text) and (text[j].isdigit() or text[j] == "."):
-                    j += 1
-                if j > i:
-                    num_str = text[i:j]
-                    tokens.append(num_str)
-                    i = j - 1
-                    continue
-                current += char
-
-            # Handle keywords and symbols
-            else:
-                current += char
-
-            i += 1
-
-        if current:
-            tokens.append(current)
-
-        # Post-process tokens to handle keywords
-        processed_tokens = []
-        for token in tokens:
-            if token in SMTLIB2_KEYWORDS:
-                processed_tokens.append(token.upper())
-            elif token.startswith(":"):
-                processed_tokens.append(token)
-            else:
-                processed_tokens.append(token)
-
-        return processed_tokens
-
-    def parse_expression(self, tokens: List[str]) -> SExpr:
-        """Parse tokens into an S-expression."""
-        if not tokens:
-            raise ValueError("Empty token list")
-
-        # Find the matching closing parenthesis for the entire expression
-        i = 0
-        paren_depth = 0
-
-        while i < len(tokens):
-            if tokens[i] == "(":
-                paren_depth += 1
-            elif tokens[i] == ")":
-                paren_depth -= 1
-                if paren_depth == 0:
-                    # Found the matching closing paren
-                    break
-            i += 1
-
-        if paren_depth != 0:
-            raise ValueError("Unmatched parentheses")
-
-        # Parse the content between the outer parentheses
-        return self._parse_sexpr_content(tokens[1:i])
-
-    def _parse_sexpr_content(self, tokens: List[str]) -> SExpr:
-        """Parse the content of an S-expression."""
-        if not tokens:
-            return SExpr.SSexpr([])
-
-        content = []
-        i = 0
-
-        while i < len(tokens):
-            if tokens[i] == "(":
-                # Find the matching closing paren for this nested expression
-                nested_end = self._find_matching_paren(tokens, i)
-                if nested_end == -1:
-                    raise ValueError("Unmatched parentheses in nested expression")
-
-                # Parse the nested expression
-                nested_tokens = tokens[i : nested_end + 1]
-                nested_expr = self.parse_expression(nested_tokens)
-                content.append(nested_expr)
-                i = nested_end + 1
-            else:
-                # Atomic token
-                content.append(tokens[i])
-                i += 1
-
-        return SExpr.SSexpr(content)
-
-    def _find_matching_paren(self, tokens: List[str], start: int) -> int:
-        """Find the matching closing parenthesis starting from position start."""
-        paren_depth = 0
-        i = start
-
-        while i < len(tokens):
-            if tokens[i] == "(":
-                paren_depth += 1
-            elif tokens[i] == ")":
-                paren_depth -= 1
-                if paren_depth == 0:
-                    return i
-            i += 1
-
-        return -1  # No matching paren found
+    def parse_term(self, input_str: str) -> Term:
+        return self._parser.parse_term(input_str)
 
     def parse_model(self, model_text: str) -> Model:
-        """Parse SMT-LIB 2 model response."""
-        functions = []
-        sorts = []
-
-        try:
-            tokens = self.tokenize(model_text)
-            if not tokens:
-                return Model(functions, sorts)
-
-            # Parse the model S-expression
-            sexpr = self.parse_expression(tokens)
-
-            if isinstance(sexpr.content, list) and len(sexpr.content) > 0:
-                # First element should be "MODEL" keyword
-                first_elem = sexpr.content[0]
-                if isinstance(first_elem, str) and first_elem.upper() == "MODEL":
-                    # Parse the model content
-                    for elem in sexpr.content[1:]:
-                        if isinstance(elem, SExpr) and isinstance(elem.content, list):
-                            self._parse_model_element(elem, functions, sorts)
-
-        except Exception as e:
-            # If parsing fails, return empty model
-            pass
-
-        return Model(functions, sorts)
-
-    def _parse_model_element(
-        self, elem: SExpr, functions: List[Any], sorts: List[Any]
-    ) -> None:
-        """Parse a single element from the model (define-fun, etc.)."""
-        if not isinstance(elem.content, list) or len(elem.content) < 2:
-            return
-
-        # Check if this is a define-fun
-        first_token = elem.content[0]
-        if isinstance(first_token, str) and first_token == "DEFINE-FUN":
-            self._parse_define_fun(elem, functions)
-
-        # Could extend for other model elements like define-fun-rec, declare-fun, etc.
-
-    def _parse_define_fun(self, elem: SExpr, functions: List[Any]) -> None:
-        """Parse a define-fun expression."""
-        content = elem.content
-        if len(content) < 4:
-            return
-
-        # Format: (define-fun name (params) return-type body)
-        # content[1] = function name
-        # content[2] = parameter list
-        # content[3] = return type
-        # content[4] = body
-
-        func_name = content[1]
-        if not isinstance(func_name, str):
-            return
-
-        # Parse parameters (if any)
-        params = []
-        param_list = content[2]
-        if isinstance(param_list, SExpr) and isinstance(param_list.content, list):
-            # Handle parameter list - each parameter is (name type)
-            for param_spec in param_list.content:
-                if isinstance(param_spec, SExpr) and isinstance(
-                    param_spec.content, list
-                ):
-                    # Parameter specification: (name type)
-                    if len(param_spec.content) >= 2:
-                        param_name = param_spec.content[
-                            0
-                        ]  # Should be the parameter name
-                        param_type = param_spec.content[
-                            1
-                        ]  # Should be the parameter type
-                        if isinstance(param_name, str):
-                            params.append((param_name, self._parse_sort(param_type)))
-                elif isinstance(param_spec, str) and param_spec == "(":
-                    # Empty parameter list case
-                    pass
-
-        # Parse return type
-        return_type = self._parse_sort(content[3]) if len(content) > 3 else None
-
-        # Parse body
-        body = self._parse_term(content[4]) if len(content) > 4 else None
-
-        # Create function definition
-        if return_type and body:
-            func_def = FunctionDefinition(
-                name=func_name, parameters=params, return_type=return_type, body=body
-            )
-            functions.append(func_def)
-
-    def _parse_sort(self, sort_expr: Any) -> Sort:
-        """Parse a sort expression."""
-        if isinstance(sort_expr, str):
-            # Simple sort name
-            identifier = Identifier(sort_expr, [])
-            return Sort(identifier, [])
-        elif isinstance(sort_expr, SExpr) and isinstance(sort_expr.content, list):
-            # Parametric sort like (Array Int Real) or (Set Int)
-            if len(sort_expr.content) >= 1:
-                name = sort_expr.content[0]
-                if isinstance(name, str):
-                    args = []
-                    for arg in sort_expr.content[1:]:
-                        args.append(self._parse_sort(arg))
-
-                    identifier = Identifier(name, [])
-                    return Sort(identifier, args)
-
-        # Fallback
-        identifier = Identifier("Unknown", [])
-        return Sort(identifier, [])
-
-    def _parse_term(self, term_expr: Any) -> Term:
-        """Parse a term expression."""
-        if isinstance(term_expr, str):
-            identifier = Identifier(term_expr, [])
-            return Term(QualId(identifier, None), [])
-        elif isinstance(term_expr, SExpr) and isinstance(term_expr.content, list):
-            if len(term_expr.content) >= 1:
-                head = term_expr.content[0]
-                # Handle (as identifier sort) qualifier
-                if isinstance(head, str) and head.upper() == "AS" and len(term_expr.content) >= 3:
-                    name = term_expr.content[1]
-                    sort_expr = term_expr.content[2]
-                    if isinstance(name, str):
-                        sort = self._parse_sort(sort_expr)
-                        identifier = Identifier(name, [])
-                        return Term(QualId(identifier, sort), [])
-                # Handle LET terms: (let ((v1 t1) ...) body)
-                elif isinstance(head, str) and head.upper() == "LET" and len(term_expr.content) >= 3:
-                    bindings_raw = term_expr.content[1]
-                    bindings = []
-                    if isinstance(bindings_raw, SExpr) and isinstance(bindings_raw.content, list):
-                        for binding in bindings_raw.content:
-                            if isinstance(binding, SExpr) and isinstance(binding.content, list):
-                                if len(binding.content) >= 2:
-                                    var_name = binding.content[0]
-                                    if isinstance(var_name, str):
-                                        var_term = self._parse_term(binding.content[1])
-                                        bindings.append((var_name, var_term))
-                    body_expr = self._parse_term(term_expr.content[2])
-                    body = body_expr if isinstance(body_expr, Term) else Term(QualId(Identifier("true", []), None), [])
-                    return LetTerm(tuple(bindings), body)
-                # Handle FORALL terms: (forall ((v1 T1) ...) body)
-                elif isinstance(head, str) and head.upper() == "FORALL" and len(term_expr.content) >= 3:
-                    vars_raw = term_expr.content[1]
-                    bound_vars = []
-                    if isinstance(vars_raw, SExpr) and isinstance(vars_raw.content, list):
-                        for var_decl in vars_raw.content:
-                            if isinstance(var_decl, SExpr) and isinstance(var_decl.content, list):
-                                if len(var_decl.content) >= 2:
-                                    bound_vars.append((str(var_decl.content[0]), str(var_decl.content[1])))
-                    body = self._parse_term(term_expr.content[2])
-                    body_term = body if isinstance(body, Term) else Term(QualId(Identifier("true", []), None), [])
-                    return QuantifiedTerm("forall", tuple(bound_vars), body_term)
-                # Handle EXISTS terms: (exists ((v1 T1) ...) body)
-                elif isinstance(head, str) and head.upper() == "EXISTS" and len(term_expr.content) >= 3:
-                    vars_raw = term_expr.content[1]
-                    bound_vars = []
-                    if isinstance(vars_raw, SExpr) and isinstance(vars_raw.content, list):
-                        for var_decl in vars_raw.content:
-                            if isinstance(var_decl, SExpr) and isinstance(var_decl.content, list):
-                                if len(var_decl.content) >= 2:
-                                    bound_vars.append((str(var_decl.content[0]), str(var_decl.content[1])))
-                    body = self._parse_term(term_expr.content[2])
-                    body_term = body if isinstance(body, Term) else Term(QualId(Identifier("true", []), None), [])
-                    return QuantifiedTerm("exists", tuple(bound_vars), body_term)
-                elif isinstance(head, str):
-                    args = []
-                    for arg in term_expr.content[1:]:
-                        args.append(self._parse_term(arg))
-                    identifier = Identifier(head, [])
-                    return Term(QualId(identifier, None), args)
-            elif isinstance(term_expr.content, Constant):
-                identifier = Identifier(str(term_expr.content), [])
-                return Term(QualId(identifier, None), [])
-        # Fallback
-        identifier = Identifier("Unknown", [])
-        return Term(QualId(identifier, None), [])
-
-    def _validate_model_text(self, model_text: str) -> bool:
-        """Validate that the model text looks like a valid SMT-LIB 2 model."""
-        if not model_text or not model_text.strip():
-            return False
-
-        # Basic validation - should start with "(model" and end with ")"
-        stripped = model_text.strip()
-        return stripped.startswith("(model") and stripped.endswith(")")
+        return self._parser.parse_model(model_text)
 
     def parse_model_with_validation(self, model_text: str) -> Model:
-        """Parse SMT-LIB 2 model response with validation."""
-        if not self._validate_model_text(model_text):
-            raise ValueError("Invalid SMT-LIB 2 model format")
-
+        if not is_valid_smtlib2_model(model_text):
+            raise ValueError("Invalid SMT-LIB 2 model text")
         return self.parse_model(model_text)
+
+
+def string_parse_term(s: str) -> Term:
+    parser = PLYSMTLib2Parser()
+    return parser.parse_term(s)
+
+
+def string_parse_model(s: str) -> Model:
+    parser = PLYSMTLib2Parser()
+    return parser.parse_model(s)
+
+
+def file_parse_term(filename: str) -> Term:
+    with open(filename, 'r') as f:
+        return string_parse_term(f.read())
+
+
+def file_parse_model(filename: str) -> Model:
+    with open(filename, 'r') as f:
+        return string_parse_model(f.read())
 
 
 class SMTLib2Printer:
     """Pretty-printer for SMT-LIB 2 expressions."""
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context = None):
         self.context = context
 
     def print_list(self, items: List[Any], sep: str = " ") -> str:
@@ -660,46 +318,35 @@ class SMTLib2Printer:
         return model.to_smtlib2_string()
 
 
-def parse_smtlib2_expression(text: str, context: Context) -> SExpr:
-    """Parse SMT-LIB 2 expression from text."""
+def parse_smtlib2_expression(text: str, context: Context = None) -> Term:
     parser = SMTLib2Parser(context)
-    tokens = parser.tokenize(text)
-    # Add the outer parentheses if not present
-    if not tokens or tokens[0] != "(":
-        tokens = ["("] + tokens + [")"]
-    return parser.parse_expression(tokens)
+    return parser.parse_term(text)
 
 
-def print_smtlib2_expression(expr: SExpr, context: Context) -> str:
-    """Print SMT-LIB 2 expression to string."""
+def print_smtlib2_expression(expr: Term, context: Context = None) -> str:
     printer = SMTLib2Printer(context)
-    return printer.print_sexpr(expr)
+    return printer.print_term(expr)
 
 
-def parse_smtlib2_model(model_text: str, context: Context) -> Model:
-    """Parse SMT-LIB 2 model response."""
+def parse_smtlib2_model(model_text: str, context: Context = None) -> Model:
     parser = SMTLib2Parser(context)
     return parser.parse_model(model_text)
 
 
-def parse_smtlib2_model_validated(model_text: str, context: Context) -> Model:
-    """Parse SMT-LIB 2 model response with validation."""
+def parse_smtlib2_model_validated(model_text: str, context: Context = None) -> Model:
     parser = SMTLib2Parser(context)
     return parser.parse_model_with_validation(model_text)
 
 
-def print_smtlib2_model(model: Model, context: Context) -> str:
-    """Print SMT-LIB 2 model to string."""
+def print_smtlib2_model(model: Model, context: Context = None) -> str:
     printer = SMTLib2Printer(context)
     return printer.print_model(model)
 
 
-def parse_smtlib2_model_from_string(model_str: str, context: Context) -> Model:
-    """Parse SMT-LIB 2 model from string with error handling."""
+def parse_smtlib2_model_from_string(model_str: str, context: Context = None) -> Model:
     try:
         return parse_smtlib2_model_validated(model_str, context)
-    except Exception as e:
-        # Return empty model on parse error
+    except Exception:
         return Model([], [])
 
 

@@ -833,12 +833,12 @@ class GuardedTranslation:
         from . import quantifier
 
         zz_symbols = [
-            (s, sp) for s, sp in TF.symbols(tf)
+            (s, sp) for s, sp in getattr(tf, 'symbols', [])
             if hasattr(s, "typ") and s.typ == Type.INT
             and hasattr(sp, "typ") and sp.typ == Type.INT
         ]
         if not zz_symbols:
-            zz_symbols = TF.symbols(tf)
+            zz_symbols = getattr(tf, 'symbols', [])
         if not zz_symbols:
             return GuardedTranslationElement([], [], mk_true(srk))
 
@@ -1028,7 +1028,7 @@ class Split:
             inner_domain = WedgeGuard()
 
         body = TF.formula(tf)
-        tr_symbols = TF.symbols(tf)
+        tr_symbols = getattr(tf, 'symbols', [])
         exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
         post_symbols = TF.post_symbols(tr_symbols)
 
@@ -1457,8 +1457,8 @@ def phase_mp(
         exists_fn = lambda x: x != k_sym and (transition_tf.exists(x) if hasattr(transition_tf, "exists") else True)
         lt = LossyTranslation()
         elem = lt.abstract(srk, transition_tf)
-        formula = lt.exp(srk, TF.symbols(transition_tf), mk_const(srk, k_sym), elem)
-        return TF.make(formula, TF.symbols(transition_tf), exists=exists_fn)
+        formula = lt.exp(srk, getattr(transition_tf, 'symbols', []), mk_const(srk, k_sym), elem)
+        return TF.make(formula, getattr(transition_tf, 'symbols', []), exists=exists_fn)
 
     # Build algebras
     tr_symbols = TF.symbols(tf)
@@ -1547,7 +1547,7 @@ class InvariantDirection:
         except Exception:
             pass
 
-        tr_symbols = TF.symbols(tf)
+        tr_symbols = getattr(tf, 'symbols', [])
         exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
 
         if not tr_symbols:
@@ -1786,7 +1786,7 @@ class ProductWedge:
         if hasattr(self.domain_a, "abstract_wedge") and hasattr(self.domain_b, "abstract_wedge"):
             try:
                 wedge = TF.wedge_hull(srk, tf)
-                tr_symbols = TF.symbols(tf)
+                tr_symbols = getattr(tf, 'symbols', [])
                 a = self.domain_a.abstract_wedge(srk, tr_symbols, wedge)
                 b = self.domain_b.abstract_wedge(srk, tr_symbols, wedge)
                 return (a, b)
@@ -1866,7 +1866,7 @@ class NonlinearRecurrenceInequation:
         except ImportError:
             return NRIElement([])
 
-        tr_symbols = TF.symbols(tf)
+        tr_symbols = getattr(tf, 'symbols', [])
         exists_fn = tf.exists if hasattr(tf, "exists") else (lambda s: True)
 
         # Create delta symbols and delta_map
@@ -2022,8 +2022,8 @@ def _abstract_delta_wedge(
                     constraints.append((atom.left, "<=", atom.right))
                 elif hasattr(atom, "left") and hasattr(atom, "right"):
                     # Handle wrapper objects that have left/right attributes
-                    left = getattr(atom, "left")
-                    right = getattr(atom, "right")
+                    left = TF.symbols(atom, "left")
+                    right = TF.symbols(atom, "right")
                     if left is not None and right is not None:
                         op = "="
                         if hasattr(atom, '__class__'):

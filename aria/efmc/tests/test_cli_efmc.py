@@ -15,7 +15,7 @@ def test_parse_arguments_minimal(monkeypatch, tmp_path: Path):
         efmc_cli.sys,
         "argv",
         [
-            "efmc",
+            "aria-efmc",
             "--file",
             str(input_file),
         ],
@@ -46,7 +46,7 @@ def test_main_auto_dispatch_by_extension(monkeypatch, tmp_path: Path, ext: str, 
         efmc_cli.sys,
         "argv",
         [
-            "efmc",
+            "aria-efmc",
             "--file",
             str(input_file),
             "--lang",
@@ -81,7 +81,7 @@ def test_main_explicit_lang_dispatch(monkeypatch, tmp_path: Path):
         efmc_cli.sys,
         "argv",
         [
-            "efmc",
+            "aria-efmc",
             "--file",
             str(input_file),
             "--lang",
@@ -107,7 +107,7 @@ def test_main_unsupported_extension_exits(monkeypatch, tmp_path: Path):
         efmc_cli.sys,
         "argv",
         [
-            "efmc",
+            "aria-efmc",
             "--file",
             str(input_file),
             "--lang",

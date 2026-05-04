@@ -26,6 +26,8 @@ from aria.srk.iteration import (
     IterationEngine,
     WedgeGuard,
     PolyhedronGuard,
+    GuardedTranslation,
+    MakeDomain,
     make_wedge_guard,
     make_polyhedron_guard,
 )
@@ -150,6 +152,48 @@ class TestInductionProofs(unittest.TestCase):
 
         # Simplified test - full implementation needs complete iteration support
         self.assertIsNotNone(self.ctx)
+
+
+class TestGuardedTranslation(unittest.TestCase):
+    def setUp(self):
+        self.ctx = Context()
+        self.x = mk_symbol("x", Type.INT)
+        self.y = mk_symbol("y", Type.INT)
+        self.xp = mk_symbol("x'", Type.INT)
+        self.yp = mk_symbol("y'", Type.INT)
+
+    def _make_tf(self, guard, assigns):
+        pre_syms = set()
+        post_syms = set()
+        atoms = []
+        if guard is not None:
+            atoms.append(guard)
+        for pre_sym, post_sym, expr in assigns:
+            pre_syms.add(pre_sym)
+            post_syms.add(post_sym)
+            atoms.append(mk_eq(mk_const(post_sym), expr))
+        formula = mk_and(atoms) if len(atoms) > 1 else atoms[0]
+        tr_symbols = [(self.x, self.xp), (self.y, self.yp)]
+        return TransitionFormula(formula=formula, symbols=tr_symbols)
+
+    def test_guarded_translation1(self):
+        guard = mk_or([mk_lt(mk_const(self.x), mk_const(self.y)),
+                       mk_lt(mk_const(self.y), mk_const(self.x))])
+        tf = self._make_tf(guard, [
+            (self.x, self.xp, mk_add([mk_const(self.x), mk_real(self.ctx, 1)])),
+            (self.y, self.yp, mk_const(self.y)),
+        ])
+        domain = GuardedTranslation()
+        self.assertIsNotNone(domain)
+
+    def test_guarded_translation2(self):
+        guard = mk_or([mk_lt(mk_real(self.ctx, 0), mk_const(self.x)),
+                       mk_lt(mk_const(self.x), mk_real(self.ctx, 0))])
+        tf = self._make_tf(guard, [
+            (self.x, self.xp, mk_add([mk_const(self.x), mk_real(self.ctx, -2)])),
+        ])
+        domain = GuardedTranslation()
+        self.assertIsNotNone(domain)
 
 
 if __name__ == "__main__":

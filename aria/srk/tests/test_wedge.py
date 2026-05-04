@@ -40,45 +40,39 @@ class TestWedge(unittest.TestCase):
         self.s = mk_symbol(self.ctx, "s", Type.REAL)
 
     def test_wedge_creation(self):
-        """Test creating wedge elements."""
-        # Create a simple wedge with constraints
         constraints = [
             mk_leq(mk_const(self.x), mk_real(self.ctx, QQ.of_int(10))),
             mk_leq(mk_real(self.ctx, QQ.zero()), mk_const(self.x)),
             mk_leq(mk_const(self.y), mk_const(self.x)),
         ]
-
         wedge = WedgeElement(self.ctx, constraints)
         self.assertIsNotNone(wedge)
+        atoms = wedge.to_atoms()
+        self.assertEqual(len(atoms), 3)
 
     def test_wedge_join(self):
-        """Test joining wedge elements."""
         wedge1 = WedgeElement(
             self.ctx, [mk_leq(mk_const(self.x), mk_real(self.ctx, QQ.of_int(5)))]
         )
-
         wedge2 = WedgeElement(
             self.ctx, [mk_leq(mk_real(self.ctx, QQ.of_int(3)), mk_const(self.x))]
         )
-
         joined = wedge1.join(wedge2)
         self.assertIsNotNone(joined)
+        self.assertFalse(joined.is_bottom())
 
     def test_wedge_meet(self):
-        """Test meeting wedge elements."""
         wedge1 = WedgeElement(
             self.ctx, [mk_leq(mk_const(self.x), mk_real(self.ctx, QQ.of_int(10)))]
         )
-
         wedge2 = WedgeElement(
             self.ctx, [mk_leq(mk_const(self.x), mk_real(self.ctx, QQ.of_int(7)))]
         )
-
         met = wedge1.meet(wedge2)
         self.assertIsNotNone(met)
+        self.assertFalse(met.is_bottom())
 
     def test_wedge_exists(self):
-        """Test existential quantification."""
         wedge = WedgeElement(
             self.ctx,
             [
@@ -87,13 +81,10 @@ class TestWedge(unittest.TestCase):
                 mk_leq(mk_const(self.y), mk_real(self.ctx, QQ.of_int(10))),
             ],
         )
-
-        # Existentially quantify x
         exists_x = wedge.exists([self.x])
         self.assertIsNotNone(exists_x)
 
     def test_wedge_projection(self):
-        """Test projecting onto variables."""
         wedge = WedgeElement(
             self.ctx,
             [
@@ -102,13 +93,10 @@ class TestWedge(unittest.TestCase):
                 mk_leq(mk_real(self.ctx, QQ.zero()), mk_const(self.x)),
             ],
         )
-
-        # Project onto y and z
         projected = wedge.project([self.y, self.z])
         self.assertIsNotNone(projected)
 
     def test_wedge_strengthen(self):
-        """Test strengthening with additional constraints."""
         wedge = WedgeElement(
             self.ctx,
             [
@@ -116,32 +104,25 @@ class TestWedge(unittest.TestCase):
                 mk_leq(mk_const(self.x), mk_real(self.ctx, QQ.of_int(10))),
             ],
         )
-
-        # Strengthen with x^2 <= 100
         additional = [
             mk_leq(
                 mk_mul([mk_const(self.x), mk_const(self.x)]),
                 mk_real(self.ctx, QQ.of_int(100)),
             )
         ]
-
         strengthened = wedge.strengthen(additional)
         self.assertIsNotNone(strengthened)
+        self.assertFalse(strengthened.is_bottom())
 
     def test_wedge_is_bottom(self):
-        """Test checking if wedge is bottom (empty)."""
-        # Empty wedge should be bottom
         empty_wedge = WedgeElement(self.ctx, [])
         self.assertTrue(empty_wedge.is_bottom())
-
-        # Non-empty wedge should not be bottom
         non_empty_wedge = WedgeElement(
             self.ctx, [mk_leq(mk_real(self.ctx, QQ.zero()), mk_const(self.x))]
         )
         self.assertFalse(non_empty_wedge.is_bottom())
 
     def test_wedge_to_atoms(self):
-        """Test converting wedge to atomic formulas."""
         wedge = WedgeElement(
             self.ctx,
             [
@@ -149,7 +130,6 @@ class TestWedge(unittest.TestCase):
                 mk_leq(mk_real(self.ctx, QQ.zero()), mk_const(self.x)),
             ],
         )
-
         atoms = wedge.to_atoms()
         self.assertIsInstance(atoms, list)
         self.assertGreater(len(atoms), 0)

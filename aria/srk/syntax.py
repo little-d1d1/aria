@@ -2235,7 +2235,7 @@ def mk_sub(
     if isinstance(context_or_left, Context) and right is not None:
         # Called as mk_sub(context, left, right)
         context, left = context_or_left, left_or_right
-        return context.mk_add([left, context.mk_neg(right)])
+        return mk_add([left, mk_neg(right)])
     else:
         # Called as mk_sub(left, right) - use default context
         left, right = context_or_left, left_or_right
@@ -3611,7 +3611,7 @@ def prenex(srk: Context, phi: Expression) -> Expression:
             qf_pre, disjuncts = combine(disjuncts)
             return (qf_pre, mk_or(disjuncts))
         elif op == "Quantify":
-            qt, name, typ, body = args
+            qt, name, typ, body = args[0]
             qf_pre, matrix = process(body)
             return ([(qt, name, typ)] + qf_pre, matrix)
         elif op == "Not":

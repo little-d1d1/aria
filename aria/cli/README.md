@@ -464,4 +464,4 @@ See `config_example.json` for template.
 
 ## License
 
-See main project LICENSE. 
+See main project LICENSE.

@@ -319,7 +319,7 @@ def main():
         "--parallel", action="store_true", help="Run configurations in parallel"
     )
     parser.add_argument(
-        "--verifier", default="efmc", help="Path to the verifier executable"
+        "--verifier", default="aria-efmc", help="Path to the verifier executable"
     )
     parser.add_argument(
         "--log-level",

@@ -15,6 +15,7 @@ from aria.srk.syntax import (
     Const,
     Exists,
     Forall,
+    Ite,
     mk_symbol,
     mk_const,
     mk_real,
@@ -27,6 +28,9 @@ from aria.srk.syntax import (
     mk_and,
     mk_or,
     mk_not,
+    mk_iff,
+    mk_ite,
+    mk_neg,
 )
 from aria.srk.quantifier import (
     QuantifierEngine,
@@ -34,7 +38,9 @@ from aria.srk.quantifier import (
     check_strategy,
     maximize,
     simsat,
+    qe_mbp,
 )
+from aria.srk.smt import is_sat, SMTResult
 
 
 class TestQuantifierEngine(unittest.TestCase):
@@ -382,7 +388,6 @@ class TestStrategyImprovementSolver(unittest.TestCase):
         )
 
     def test_check_strategy_unknown_for_nonlinear_strategy_formula(self):
-        """Unsupported nonlinear strategy validation stays explicitly unknown."""
         x = mk_symbol(self.context, "nsx", Type.REAL)
         x_const = mk_const(x)
         formula = mk_lt(mk_real(self.context, 0), mk_mul([x_const, x_const]))
@@ -395,6 +400,48 @@ class TestStrategyImprovementSolver(unittest.TestCase):
                 {"assignments": {x: Fraction(2)}},
             )
         )
+
+
+class TestMbp(unittest.TestCase):
+    def setUp(self):
+        self.context = Context()
+
+    def _assert_equiv(self, phi, psi):
+        not_psi = mk_not(psi)
+        not_phi = mk_not(phi)
+        diff = mk_or([mk_and([phi, not_psi]), mk_and([not_phi, psi])])
+        result = is_sat(self.context, diff)
+        self.assertEqual(result, SMTResult.UNSAT,
+                         f"Not equivalent:\n  phi={phi}\n  psi={psi}")
+
+    def test_mbp1_exists_equality_disjunction(self):
+        r = mk_symbol(self.context, "r", Type.REAL)
+        r_const = mk_const(r)
+        s = mk_symbol(self.context, "s", Type.REAL)
+        s_var = Var(str(s), s.typ)
+        zero = mk_real(self.context, Fraction(0))
+        one = mk_real(self.context, Fraction(1))
+        body = mk_and([
+            mk_eq(s_var, r_const),
+            mk_or([mk_leq(s_var, zero), mk_leq(r_const, one)])
+        ])
+        phi = Exists(str(s), s.typ, body)
+        result = qe_mbp(self.context, phi)
+        expected = mk_leq(r_const, one)
+        self._assert_equiv(result, expected)
+
+    def test_mbp2_forall_ite(self):
+        r = mk_symbol(self.context, "r", Type.REAL)
+        r_const = mk_const(r)
+        s = mk_symbol(self.context, "s", Type.REAL)
+        s_var = Var(str(s), s.typ)
+        zero = mk_real(self.context, Fraction(0))
+        ite_expr = mk_ite(mk_lt(zero, s_var), s_var, mk_neg(s_var))
+        body = mk_leq(r_const, ite_expr)
+        phi = Forall(str(s), s.typ, body)
+        result = qe_mbp(self.context, phi)
+        expected = mk_leq(r_const, zero)
+        self._assert_equiv(result, expected)
 
 
 if __name__ == "__main__":

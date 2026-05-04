@@ -26,6 +26,7 @@ from . import polynomial as P
 from .polynomial import RewriteSystem
 from .syntax import ArithExpression, Context, FormulaExpression
 from .linear import QQVector
+from .fourierMotzkin import eliminate as fm_eliminate
 
 logger = logging.getLogger(__name__)
 
@@ -299,27 +300,17 @@ class Abstract0:
 
     @staticmethod
     def forget_array(manager, abstract, dims, project: bool):
-        """Project out (forget) the given dimension indices.
-
-        Removes all constraints that mention any of the forgotten
-        dimensions.  This is a sound (but potentially imprecise)
-        over-approximation of Fourier-Motzkin elimination.
-        """
+        """Project out (forget) the given dimension indices using Fourier-Motzkin."""
         if abstract._is_bottom:
             result = Abstract0(manager, abstract.int_dim, abstract.real_dim, abstract._srk)
             result._is_bottom = True
             return result
 
-        forget_set = set(dims) if not isinstance(dims, set) else dims
-        new_constraints = []
-        for lc in abstract._constraints:
-            mentions_forgotten = False
-            for coeff, d in lc.linexpr0.coeffs:
-                if d is not None and d in forget_set:
-                    mentions_forgotten = True
-                    break
-            if not mentions_forgotten:
-                new_constraints.append(lc)
+        if not dims or not abstract._constraints:
+            return abstract
+
+        new_constraints = fm_eliminate(
+            dims, abstract._constraints, Linexpr0, Lincons0)
 
         result = Abstract0(manager, abstract.int_dim, abstract.real_dim, abstract._srk)
         result._constraints = new_constraints
@@ -2910,6 +2901,111 @@ def abstract_subwedge(
     return result
 
 
+def _fm_eliminate_atoms(srk, atoms, var_ids):
+    from fractions import Fraction as Frac
+    next_dim_counter = [0]
+    sym_to_dim = {}
+
+    def get_dim(sym):
+        if sym is None:
+            return None
+        sid = sym.id if hasattr(sym, 'id') else id(sym)
+        if sid not in sym_to_dim:
+            sym_to_dim[sid] = next_dim_counter[0]
+            next_dim_counter[0] += 1
+        return sym_to_dim[sid]
+
+    lincs = []
+    for atom in atoms:
+        match = syntax.destruct(atom)
+        if not match:
+            continue
+        op = match[0]
+        if op == "Atom":
+            _, rel, left, right = match[1]
+        else:
+            continue
+        from .linear import linterm_of, const_dim, sym_of_dim
+        try:
+            vec_right = linterm_of(srk, right)
+            vec_left = linterm_of(srk, left)
+        except Exception:
+            continue
+        vec = QQVector({})
+        for d, c in vec_right.entries.items():
+            if d == const_dim:
+                d_use = const_dim
+            else:
+                sym = sym_of_dim(d)
+                d_use = get_dim(sym)
+            vec = vec + QQVector.of_term(c, d_use)
+        for d, c in vec_left.entries.items():
+            if d == const_dim:
+                d_use = const_dim
+            else:
+                sym = sym_of_dim(d)
+                d_use = get_dim(sym)
+            vec = vec + QQVector.of_term(-c, d_use)
+        cst_val = Frac(0)
+        real_coeffs = []
+        for d, c in vec.entries.items():
+            if d == const_dim:
+                cst_val = c
+            else:
+                real_coeffs.append((c, d))
+        lintyp = Lincons0.SUPEQ
+        if rel == "Eq":
+            lintyp = Lincons0.EQ
+        elif rel == "Lt":
+            lintyp = Lincons0.SUP
+        lx = Linexpr0(real_coeffs, cst_val if cst_val != 0 else None)
+        lincs.append(Lincons0.make(lx, lintyp))
+
+    elim_dims = [sym_to_dim[vid] for vid in var_ids if vid in sym_to_dim]
+    if not elim_dims:
+        return list(atoms)
+
+    from .fourierMotzkin import eliminate as fm_eliminate
+    result_lincs = fm_eliminate(elim_dims, lincs, Linexpr0, Lincons0)
+
+    dim_to_sym = {d: s for s, d in sym_to_dim.items()}
+    new_atoms = []
+    for lc in result_lincs:
+        terms = []
+        for c, d in lc.linexpr0.coeffs:
+            if d in dim_to_sym:
+                sid = dim_to_sym[d]
+                sym = _find_symbol(srk, sid)
+                if sym is not None:
+                    if c == Frac(1):
+                        terms.append(syntax.mk_const(srk, sym))
+                    elif c == Frac(-1):
+                        terms.append(syntax.mk_mul(srk, [syntax.mk_real(srk, Frac(-1)), syntax.mk_const(srk, sym)]))
+                    else:
+                        terms.append(syntax.mk_mul(srk, [syntax.mk_real(srk, c), syntax.mk_const(srk, sym)]))
+        cst = lc.linexpr0.cst if lc.linexpr0.cst is not None else Frac(0)
+        if cst != 0:
+            terms.append(syntax.mk_real(srk, cst))
+        if not terms:
+            continue
+        lin = terms[0] if len(terms) == 1 else syntax.mk_add(srk, terms)
+        zero_expr = syntax.mk_real(srk, Frac(0))
+        if lc.typ == Lincons0.EQ:
+            new_atoms.append(syntax.mk_eq(srk, lin, zero_expr))
+        elif lc.typ == Lincons0.SUP:
+            new_atoms.append(syntax.mk_lt(srk, zero_expr, lin))
+        else:
+            new_atoms.append(syntax.mk_leq(srk, zero_expr, lin))
+    return new_atoms
+
+
+def _find_symbol(srk, sym_id):
+    for sym in srk._symbols.values():
+        if sym.id == sym_id:
+            return sym
+    return None
+
+
 class WedgeElement:
     """Element of a wedge (convex polyhedron) domain."""
 
@@ -2931,10 +3027,23 @@ class WedgeElement:
         return WedgeElement(self.context, combined_constraints)
 
     def exists(self, variables):
-        """Existential quantification over variables."""
-        # Simplified implementation - just return self
-        # In a full implementation, this would eliminate the quantified variables
-        return self
+        """Existential quantification over variables using Fourier-Motzkin elimination."""
+        if not variables or not self.constraints:
+            return self
+        from .syntax import symbols as get_symbols
+        var_ids = {v.id for v in variables if hasattr(v, 'id')}
+        keep_atoms = []
+        elim_atoms = []
+        for atom in self.constraints:
+            syms = get_symbols(atom)
+            if any(s.id in var_ids for s in syms if hasattr(s, 'id')):
+                elim_atoms.append(atom)
+            else:
+                keep_atoms.append(atom)
+        if not elim_atoms:
+            return self
+        new_atoms = _fm_eliminate_atoms(self.context, elim_atoms, var_ids)
+        return WedgeElement(self.context, keep_atoms + new_atoms)
 
     def is_bottom(self):
         """Check if this wedge is bottom (empty)."""
@@ -2943,10 +3052,16 @@ class WedgeElement:
         return len(self.constraints) == 0
 
     def project(self, variables):
-        """Project onto a subset of variables."""
-        # Simplified implementation - just return self
-        # In a full implementation, this would perform variable elimination
-        return self
+        """Project onto a subset of variables using Fourier-Motzkin elimination."""
+        if not self.constraints:
+            return self
+        all_syms = set()
+        for atom in self.constraints:
+            all_syms.update(syntax.symbols(atom))
+        to_elim = [v for v in all_syms if v not in set(variables)]
+        if not to_elim:
+            return self
+        return self.exists(to_elim)
 
     def strengthen(self, additional_constraints):
         """Strengthen with additional constraints."""

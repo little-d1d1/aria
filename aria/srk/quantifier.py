@@ -16,7 +16,7 @@ import math
 from fractions import Fraction
 
 from .linear import QQVector, of_linterm, const_dim
-from .algebra import QQ
+from .qQ import QQ
 
 
 # Helper function for pivot operation on linear terms
@@ -379,7 +379,7 @@ def normalize(srk: Any, phi: Any) -> Tuple[QuantifierPrefix, Any]:
         match = destruct(formula)
 
         if match and match[0] == "Quantify":
-            qt, name, typ, psi = match[1:]
+            qt, name, typ, psi = match[1]
 
             k = resolve_symbol(name, typ)
 
