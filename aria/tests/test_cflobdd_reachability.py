@@ -1,4 +1,4 @@
-from aria.cflobdd import (
+from aria.automata.cflobdd import (
     GrammarProduction,
     GrammarReachability,
     Relation,

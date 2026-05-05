@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import z3
 
-from aria.llmtools import LLM
+from aria.ml.llmtools import LLM
 from aria.ml.llm.smto.oracles import OracleInfo, WhiteboxOracleInfo
 from aria.ml.llm.smto.smtlib_parser import parse_smtlib_file, parse_smtlib_string
 from aria.ml.llm.smto.spec_synth.synthesizer import (
@@ -98,8 +98,8 @@ class PS_SMTOSolver:
         if llm is not None:
             self.llm = llm
         else:
-            from aria.llmtools import LLM  # type: ignore
-            from aria.llmtools import Logger  # type: ignore
+            from aria.ml.llmtools import LLM  # type: ignore
+            from aria.ml.llmtools import Logger  # type: ignore
 
             logger = Logger("ps_smto.log")
             self.llm = LLM(  # type: ignore

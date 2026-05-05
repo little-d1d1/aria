@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 
-from aria.llmtools import LLM, Logger
+from aria.ml.llmtools import LLM, Logger
 
 from .abductor import NLAbductor
 

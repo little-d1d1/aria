@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import z3
 from aria.itp.utils import unify, pmatch, antipattern
-from aria.unification.core import unify as core_unify, reify
-from aria.unification.variable import var
+from aria.smt.unification.core import unify as core_unify, reify
+from aria.smt.unification.variable import var
 
 
 def z3_unify():

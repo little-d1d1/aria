@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import z3
 
-from aria.llmtools.client import LLM
+from aria.ml.llmtools.client import LLM
 
 
 @dataclass

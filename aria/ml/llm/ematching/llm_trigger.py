@@ -19,8 +19,8 @@ from typing import Iterable, List, Optional, Sequence
 import z3
 
 try:
-    from aria.llmtools.client import LLM  # type: ignore
-    from aria.llmtools import Logger  # type: ignore
+    from aria.ml.llmtools.client import LLM  # type: ignore
+    from aria.ml.llmtools import Logger  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     LLM = None  # type: ignore
     Logger = None  # type: ignore

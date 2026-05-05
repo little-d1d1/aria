@@ -15,7 +15,7 @@ from aria.bool.knowledge_compiler import compile_dnnf
 from aria.bool.knowledge_compiler.dimacs_parser import parse_cnf_string
 from aria.bool.knowledge_compiler.dnnf import DNF_Node, DNNF_Compiler
 from aria.bool.knowledge_compiler.dtree import Dtree_Compiler
-from aria.prob import WMCOptions, compile_wmc, wmc_count
+from examples.prob import WMCOptions, compile_wmc, wmc_count
 
 cnf_foo2 = """
 p cnf 4 4

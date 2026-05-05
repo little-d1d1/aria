@@ -1,7 +1,7 @@
 import z3
 from pysat.formula import CNF
 
-from aria.prob import wmc_count, WMCBackend, WMCOptions
+from examples.prob import wmc_count, WMCBackend, WMCOptions
 
 
 def main():

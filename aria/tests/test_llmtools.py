@@ -2,9 +2,9 @@
 
 import tempfile
 
-from aria.llmtools.core.client import ProviderResolution
-from aria.llmtools import LLM, Logger
-from aria.llmtools.routing import resolve_provider
+from aria.ml.llmtools.core.client import ProviderResolution
+from aria.ml.llmtools import LLM, Logger
+from aria.ml.llmtools.routing import resolve_provider
 from aria.tests import TestCase, main
 
 
@@ -40,7 +40,7 @@ class TestLlmTools(TestCase):
         called = {"value": False}
         captured = {"model_name": None}
 
-        from aria.llmtools.core.base import InferenceResult
+        from aria.ml.llmtools.core.base import InferenceResult
 
         def _fake_resolve_provider(
             _model_name: str,
@@ -49,7 +49,7 @@ class TestLlmTools(TestCase):
             _temperature: float = 0.0,
         ):
             called["value"] = True
-            from aria.llmtools.providers.online.openai import OpenAIProvider
+            from aria.ml.llmtools.providers.online.openai import OpenAIProvider
 
             class FakeProvider(OpenAIProvider):
                 def infer(
@@ -68,7 +68,7 @@ class TestLlmTools(TestCase):
 
             return ProviderResolution(provider=FakeProvider(), timeout=100)
 
-        import aria.llmtools.client as client_module
+        import aria.ml.llmtools.client as client_module
 
         original_resolve_provider = client_module.resolve_provider
         client_module.resolve_provider = _fake_resolve_provider  # type: ignore[assignment]

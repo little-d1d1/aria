@@ -1,9 +1,9 @@
 import logging
 from typing import Dict, Any, Optional, Tuple, Callable, List
 import z3
-from aria.llmtools import LLM
-from aria.llmtools.core.logger import Logger
-from aria.llmtools.local_client import LLMLocal
+from aria.ml.llmtools import LLM
+from aria.ml.llmtools.core.logger import Logger
+from aria.ml.llmtools.local_client import LLMLocal
 from aria.efmc.sts import TransitionSystem
 from aria.efmc.engines.llm4inv.bv.prompt_manager import extract_bit_width_from_sts
 
