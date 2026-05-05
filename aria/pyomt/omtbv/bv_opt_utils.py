@@ -8,8 +8,11 @@ representations used in bit-vector optimization problems.
 import logging
 import os
 import re
+import shutil
 import subprocess
 from typing import Dict, List, Optional, Tuple
+
+from aria.global_params import global_config
 
 logger = logging.getLogger(__name__)
 
@@ -78,16 +81,25 @@ def cnf_from_z3(constraint_file: str) -> Optional[str]:
     Returns:
         Z3 output as string, or None if an error occurred
     """
-    path = os.getcwd()
-    path = os.path.dirname(os.path.dirname(os.path.dirname(path)))
-    z3_path = os.path.join(path, "z3", "build", "z3")
+    z3_path = global_config.get_solver_path("z3")
+    if z3_path is None:
+        z3_path = shutil.which("z3")
+    if z3_path is None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        candidate = os.path.join(repo_root, "z3", "build", "z3")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            z3_path = candidate
+    if z3_path is None:
+        logger.error("Could not locate a usable z3 executable for CNF generation")
+        return None
+
     try:
         command = [z3_path, "opt.priority=box", constraint_file]
         process_result = subprocess.run(
             command, capture_output=True, text=True, check=True
         )
         return process_result.stdout
-    except subprocess.CalledProcessError as e:
+    except (OSError, subprocess.CalledProcessError) as e:
         logger.error("Error running Z3: %s", e)
         return None
 

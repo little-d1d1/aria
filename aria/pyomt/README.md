@@ -59,8 +59,10 @@ Optimization and Maximum Satisfiability (MaxSAT) solvers.
 ## Usage
 
 ```python
-from aria.pyomt import MaxSATSolver
+from aria.pyomt import MaxSMTSolver
+import z3
 
-solver = MaxSATSolver()
-result = solver.solve(weighted_cnf)
+solver = MaxSMTSolver()
+solver.add_hard_constraint(z3.BoolVal(True))
+result = solver.solve()
 ```

@@ -3,13 +3,14 @@ Use linear programming solvers for Optimization Modulo Theory problems.
 
 This module provides two approaches:
 1. Directly calling a disjunctive LP/ILP solver for convex problems
-2. Iterative calling LP/ILP solvers (converting the SMT instance to DNF,
-   and calling LP/ILP solvers multiple times) for non-convex problems
+2. Iteratively calling LP/ILP solvers after splitting non-convex formulas
 
-Note: This module contains incomplete implementations that need to be completed.
+The LP conversion code in this file intentionally targets linear arithmetic
+constraints and objectives only.
 """
 
-from typing import Tuple, List, Optional, Dict
+from fractions import Fraction
+from typing import Dict, List, Optional, Tuple
 
 import pulp  # For LP solving
 import z3
@@ -165,6 +166,8 @@ def _extract_variables(
     vars_set = set()
 
     def collect_vars(expr):
+        if z3.is_int_value(expr) or z3.is_rational_value(expr) or z3.is_bool(expr):
+            return
         if z3.is_const(expr):
             vars_set.add(expr)
         else:
@@ -174,7 +177,62 @@ def _extract_variables(
     collect_vars(fml)
     collect_vars(obj)
 
-    return {var: pulp.LpVariable(str(var)) for var in vars_set}
+    return {
+        var: pulp.LpVariable(
+            str(var),
+            cat=pulp.LpInteger if z3.is_int(var) else pulp.LpContinuous,
+        )
+        for var in vars_set
+        if z3.is_int(var) or z3.is_real(var)
+    }
+
+
+def _z3_num_to_float(expr: z3.ExprRef) -> float:
+    """Convert a Z3 numeric literal to a Python float."""
+    if z3.is_int_value(expr):
+        return float(expr.as_long())
+    if z3.is_rational_value(expr):
+        frac = Fraction(expr.numerator_as_long(), expr.denominator_as_long())
+        return float(frac)
+    raise TypeError(f"Expected numeric literal, got: {expr}")
+
+
+def _linear_expr_to_lp(
+    expr: z3.ExprRef,
+    vars_map: Dict[z3.ExprRef, pulp.LpVariable],
+) -> pulp.LpAffineExpression:
+    """Convert a linear Z3 arithmetic expression into a PuLP affine expression."""
+    if z3.is_int_value(expr) or z3.is_rational_value(expr):
+        return pulp.LpAffineExpression(constant=_z3_num_to_float(expr))
+
+    if z3.is_const(expr) and expr in vars_map:
+        return pulp.LpAffineExpression([(vars_map[expr], 1.0)])
+
+    if z3.is_add(expr):
+        total = pulp.LpAffineExpression()
+        for child in expr.children():
+            total += _linear_expr_to_lp(child, vars_map)
+        return total
+
+    if z3.is_mul(expr):
+        coeff = 1.0
+        symbolic_terms: List[z3.ExprRef] = []
+        for child in expr.children():
+            if z3.is_int_value(child) or z3.is_rational_value(child):
+                coeff *= _z3_num_to_float(child)
+            else:
+                symbolic_terms.append(child)
+
+        if not symbolic_terms:
+            return pulp.LpAffineExpression(constant=coeff)
+        if len(symbolic_terms) != 1:
+            raise ValueError(f"Non-linear multiplication is not supported: {expr}")
+        return coeff * _linear_expr_to_lp(symbolic_terms[0], vars_map)
+
+    if expr.decl().kind() == z3.Z3_OP_UMINUS:
+        return -_linear_expr_to_lp(expr.children()[0], vars_map)
+
+    raise ValueError(f"Unsupported arithmetic expression for LP conversion: {expr}")
 
 
 def _convert_to_lp_constraints(
@@ -190,15 +248,32 @@ def _convert_to_lp_constraints(
     Returns:
         List of LP constraints
 
-    Note:
-        This is a placeholder implementation that needs to be completed.
-        It should handle different comparison operators (<, <=, =, >=, >)
-        and convert Z3 arithmetic expressions to PuLP constraints.
     """
-    constraints = []
-    # TODO: Implementation depends on the structure of constraints
-    # Handle different comparison operators (<, <=, =, >=, >)
-    return constraints
+    if z3.is_and(fml):
+        constraints: List[pulp.LpConstraint] = []
+        for child in fml.children():
+            constraints.extend(_convert_to_lp_constraints(child, vars_map))
+        return constraints
+
+    if z3.is_true(fml):
+        return []
+
+    lhs, rhs = fml.children()
+    lhs_lp = _linear_expr_to_lp(lhs, vars_map)
+    rhs_lp = _linear_expr_to_lp(rhs, vars_map)
+
+    if z3.is_eq(fml):
+        return [lhs_lp == rhs_lp]
+    if z3.is_le(fml):
+        return [lhs_lp <= rhs_lp]
+    if z3.is_ge(fml):
+        return [lhs_lp >= rhs_lp]
+    if z3.is_lt(fml):
+        return [lhs_lp <= rhs_lp]
+    if z3.is_gt(fml):
+        return [lhs_lp >= rhs_lp]
+
+    raise ValueError(f"Unsupported formula shape for LP conversion: {fml}")
 
 
 def _convert_to_lp_objective(
@@ -214,12 +289,8 @@ def _convert_to_lp_objective(
     Returns:
         PuLP affine expression representing the objective
 
-    Note:
-        This is a placeholder implementation that needs to be completed.
-        It should convert Z3 arithmetic expressions to PuLP affine expressions.
     """
-    # TODO: Implementation depends on the structure of objective function
-    return pulp.LpAffineExpression()
+    return _linear_expr_to_lp(obj, vars_map)
 
 
 def _convert_to_dnf(fml: z3.ExprRef) -> List[z3.ExprRef]:
