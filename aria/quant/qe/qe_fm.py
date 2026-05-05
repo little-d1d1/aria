@@ -1,4 +1,22 @@
-"""Fourier-Motzkin quantifier elimination for linear real arithmetic."""
+"""Fourier-Motzkin quantifier elimination for linear real arithmetic.
+
+This module implements a small, fail-fast existential QE procedure for the
+quantifier-free affine fragment over Z3 ``Real`` variables.  The high-level
+algorithm is:
+
+1. Normalize Boolean structure to a bounded DNF list of cubes.
+2. For each projected Real variable, interpret every affine atom as either a
+   lower bound, an upper bound, or a preserved constraint.
+3. Replace all lower/upper pairs with the corresponding compatibility
+   constraints, which is the Fourier-Motzkin projection step.
+4. Reassemble the projected cubes with ``Or`` and continue with the next
+   variable.
+
+The implementation intentionally does not try to be a general Z3 arithmetic
+normalizer.  Unsupported constructs such as nonlinear arithmetic, mixed
+Int/Real terms, nested quantifiers, and excessive DNF expansion raise
+``ValueError`` instead of silently returning an unsound result.
+"""
 
 from __future__ import annotations
 
@@ -15,14 +33,28 @@ MAX_CUBE_COUNT = 64
 
 
 AffineMap = Dict[int, Tuple[z3.ExprRef, Fraction]]
+"""Map from a Z3 variable AST id to ``(variable, rational_coefficient)``."""
+
 Bound = Tuple[AffineMap, Fraction, bool]
+"""Affine bound ``expr + const`` plus a strictness bit.
+
+The same representation is used for lower and upper bounds.  The caller tracks
+whether a bound is lower or upper; the tuple stores only the right-hand affine
+expression and whether the originating comparison was strict.
+"""
 
 
 def _fraction_to_real_val(value: Fraction) -> z3.ArithRef:
+    """Convert an exact Python ``Fraction`` to an exact Z3 real numeral."""
     return z3.RealVal(f"{value.numerator}/{value.denominator}")
 
 
 def _merge_affine(target: AffineMap, source: AffineMap, scale: Fraction) -> None:
+    """Add ``scale * source`` into ``target`` in-place.
+
+    Coefficients are kept as exact rationals.  Zero coefficients are removed so
+    later variable-occurrence checks can use map membership/lookup reliably.
+    """
     for var_id, (var, coeff) in source.items():
         new_coeff = target.get(var_id, (var, Fraction(0)))[1] + scale * coeff
         if new_coeff == 0:
@@ -32,6 +64,7 @@ def _merge_affine(target: AffineMap, source: AffineMap, scale: Fraction) -> None
 
 
 def _scale_affine(terms: AffineMap, const: Fraction, scale: Fraction) -> Tuple[AffineMap, Fraction]:
+    """Return ``scale * (terms + const)`` as a fresh affine representation."""
     scaled_terms: AffineMap = {}
     for var_id, (var, coeff) in terms.items():
         scaled_terms[var_id] = (var, coeff * scale)
@@ -39,6 +72,7 @@ def _scale_affine(terms: AffineMap, const: Fraction, scale: Fraction) -> Tuple[A
 
 
 def _parse_rational_value(expr: z3.ExprRef) -> Optional[Fraction]:
+    """Parse a Z3 numeral expression into ``Fraction`` when possible."""
     simplified = z3.simplify(expr)
     if z3.is_int_value(simplified):
         int_value = cast(z3.IntNumRef, simplified)
@@ -50,6 +84,12 @@ def _parse_rational_value(expr: z3.ExprRef) -> Optional[Fraction]:
 
 
 def _parse_affine_term(expr: z3.ArithRef) -> Tuple[AffineMap, Fraction]:
+    """Parse a supported Z3 arithmetic term as ``sum(coeff_i * x_i) + const``.
+
+    Only Real-sorted affine terms are accepted.  Multiplication is supported
+    exactly when one side is a numeral, and division is supported exactly by a
+    nonzero numeral.  Anything outside that fragment is rejected.
+    """
     if not z3.is_expr(expr):
         raise ValueError("unsupported fragment: expected a Z3 expression")
     if expr.sort().kind() != z3.Z3_REAL_SORT:
@@ -114,6 +154,7 @@ def _parse_affine_term(expr: z3.ArithRef) -> Tuple[AffineMap, Fraction]:
 
 
 def _affine_to_z3(terms: AffineMap, const: Fraction) -> z3.ArithRef:
+    """Convert an affine map and constant back to a Z3 arithmetic term."""
     pieces: List[z3.ArithRef] = []
     for var, coeff in terms.values():
         coeff_val = _fraction_to_real_val(coeff)
@@ -137,6 +178,7 @@ def _comparison_from_affine(
     right_const: Fraction,
     operator: str,
 ) -> z3.BoolRef:
+    """Build a Z3 comparison from two affine representations."""
     left_expr = _affine_to_z3(left_terms, left_const)
     right_expr = _affine_to_z3(right_terms, right_const)
     if operator == "<":
@@ -153,6 +195,7 @@ def _comparison_from_affine(
 
 
 def _negate_atom(atom: z3.BoolRef) -> z3.BoolRef:
+    """Negate a supported arithmetic atom while staying in atom form."""
     kind = atom.decl().kind()
     left = cast(z3.ArithRef, atom.arg(0))
     right = cast(z3.ArithRef, atom.arg(1))
@@ -172,6 +215,7 @@ def _negate_atom(atom: z3.BoolRef) -> z3.BoolRef:
 
 
 def _is_bool_var(expr: z3.ExprRef) -> bool:
+    """Return whether ``expr`` is an uninterpreted Boolean variable."""
     return (
         z3.is_const(expr)
         and expr.decl().kind() == z3.Z3_OP_UNINTERPRETED
@@ -180,6 +224,7 @@ def _is_bool_var(expr: z3.ExprRef) -> bool:
 
 
 def _bool_literal_info(literal: z3.BoolRef) -> Optional[Tuple[z3.BoolRef, bool]]:
+    """Return ``(variable, polarity)`` for a Boolean literal, if recognized."""
     if _is_bool_var(literal):
         return cast(z3.BoolRef, literal), True
     if z3.is_not(literal) and _is_bool_var(literal.arg(0)):
@@ -188,6 +233,12 @@ def _bool_literal_info(literal: z3.BoolRef) -> Optional[Tuple[z3.BoolRef, bool]]
 
 
 def _literal_alternatives(literal: z3.BoolRef) -> List[List[z3.BoolRef]]:
+    """Return DNF alternatives contributed by one literal-like expression.
+
+    Most supported literals contribute a single one-literal cube.  Disequality
+    over reals is the exception: ``a != b`` becomes the two alternatives
+    ``a < b`` and ``a > b``.
+    """
     if z3.is_true(literal):
         return [[]]
     if z3.is_false(literal):
@@ -221,6 +272,7 @@ def _multiply_cube_lists(
     *,
     max_cubes: int,
 ) -> List[List[z3.BoolRef]]:
+    """Conjoin two DNF cube lists, enforcing the configured expansion limit."""
     if not left or not right:
         return []
     if len(left) * len(right) > max_cubes:
@@ -231,6 +283,7 @@ def _multiply_cube_lists(
 
 
 def _expand_to_cubes(expr: z3.BoolRef, *, max_cubes: int) -> List[List[z3.BoolRef]]:
+    """Expand a Boolean expression in NNF into bounded DNF cubes."""
     if z3.is_true(expr):
         return [[]]
     if z3.is_false(expr):
@@ -258,6 +311,7 @@ def _expand_to_cubes(expr: z3.BoolRef, *, max_cubes: int) -> List[List[z3.BoolRe
 
 
 def _normalize_to_cubes(phi: z3.BoolRef, *, max_cubes: int) -> List[List[z3.BoolRef]]:
+    """Simplify to NNF and expand to bounded DNF cubes."""
     if not z3.is_bool(phi):
         raise ValueError("unsupported fragment: phi must be Boolean")
     nnf_phi = z3.Then("simplify", "nnf")(phi).as_expr()
@@ -265,6 +319,12 @@ def _normalize_to_cubes(phi: z3.BoolRef, *, max_cubes: int) -> List[List[z3.Bool
 
 
 def _atom_to_zero_comparison(atom: z3.BoolRef) -> List[Tuple[AffineMap, Fraction, str]]:
+    """Normalize an arithmetic atom into comparisons against zero.
+
+    The returned tuples represent ``affine_terms + affine_const <op> 0``.
+    Equality is split into both directions so the later FM step only has to
+    process ``<`` and ``<=`` style constraints.
+    """
     left_terms, left_const = _parse_affine_term(cast(z3.ArithRef, atom.arg(0)))
     right_terms, right_const = _parse_affine_term(cast(z3.ArithRef, atom.arg(1)))
 
@@ -294,6 +354,12 @@ def _extract_bound(
     var: z3.ExprRef,
     operator: str,
 ) -> Tuple[str, Bound]:
+    """Extract a bound on ``var`` from ``zero_terms + zero_const <op> 0``.
+
+    If the coefficient of ``var`` is positive, the normalized inequality gives
+    an upper bound.  If it is negative, division by the coefficient flips the
+    direction and gives a lower bound.
+    """
     coeff = zero_terms.get(var.get_id(), (var, Fraction(0)))[1]
     if coeff == 0:
         raise ValueError("internal error: attempted to extract a bound without the variable")
@@ -309,6 +375,11 @@ def _extract_bound(
 
 
 def _combine_bounds(lower: Bound, upper: Bound) -> z3.BoolRef:
+    """Build the FM compatibility constraint ``lower <= upper``.
+
+    The combined comparison is strict whenever either contributing bound is
+    strict, matching real arithmetic semantics.
+    """
     lower_terms, lower_const, lower_strict = lower
     upper_terms, upper_const, upper_strict = upper
     operator = "<" if lower_strict or upper_strict else "<="
@@ -322,6 +393,7 @@ def _combine_bounds(lower: Bound, upper: Bound) -> z3.BoolRef:
 
 
 def _eliminate_var_from_cube(cube: Sequence[z3.BoolRef], var: z3.ExprRef) -> z3.BoolRef:
+    """Project one Real variable from one conjunction of literals."""
     preserved: List[z3.BoolRef] = []
     lowers: List[Bound] = []
     uppers: List[Bound] = []
@@ -350,6 +422,9 @@ def _eliminate_var_from_cube(cube: Sequence[z3.BoolRef], var: z3.ExprRef) -> z3.
             else:
                 uppers.append(bound)
 
+    # FM projection: a witness for ``var`` exists exactly when every collected
+    # lower bound is compatible with every collected upper bound.  If either
+    # side is missing, the variable can be chosen unboundedly in that direction.
     if lowers and uppers:
         for lower in lowers:
             for upper in uppers:
@@ -361,6 +436,7 @@ def _eliminate_var_from_cube(cube: Sequence[z3.BoolRef], var: z3.ExprRef) -> z3.
 
 
 def _eliminate_bool_var_from_cube(cube: Sequence[z3.BoolRef], var: z3.ExprRef) -> z3.BoolRef:
+    """Project one Boolean variable from one conjunction of literals."""
     preserved: List[z3.BoolRef] = []
     literal_polarities: Dict[int, bool] = {}
 
@@ -388,6 +464,12 @@ def _eliminate_bool_var_from_cube(cube: Sequence[z3.BoolRef], var: z3.ExprRef) -
 def _validate_projection_vars(
     vars_to_check: Sequence[z3.ExprRef], *, allow_bool: bool
 ) -> None:
+    """Validate variables used by the projection API.
+
+    Explicit quantified variables for this FM entry point must be Real.  Boolean
+    variables are accepted only for partial projection of free variables when
+    ``keep_vars`` is used.
+    """
     allowed_sorts = {z3.Z3_REAL_SORT}
     if allow_bool:
         allowed_sorts.add(z3.Z3_BOOL_SORT)
@@ -404,6 +486,7 @@ def _validate_projection_vars(
 
 
 def _contains_quantifier(expr: z3.ExprRef) -> bool:
+    """Return whether an expression tree contains any Z3 quantifier node."""
     stack = [expr]
     seen = set()
     while stack:
@@ -421,7 +504,26 @@ def _contains_quantifier(expr: z3.ExprRef) -> bool:
 def qelim_exists_lra_fm(
     phi: Any, qvars: Any, *, keep_vars: Optional[Any] = None
 ) -> z3.BoolRef:
-    """Eliminate existentially quantified Real variables with Fourier-Motzkin."""
+    """Eliminate existentially quantified Real variables with Fourier-Motzkin.
+
+    Args:
+        phi: Quantifier-free Boolean Z3 formula in the supported affine LRA
+            fragment.
+        qvars: One Real variable or an iterable of Real variables to eliminate.
+        keep_vars: Optional partial-projection whitelist.  When provided, every
+            free variable in ``phi`` that is not in ``keep_vars`` is projected
+            away together with ``qvars``.  Boolean free variables may be
+            projected this way, but explicit ``qvars`` must be Real variables.
+
+    Returns:
+        A quantifier-free Z3 ``BoolRef`` equivalent to ``Exists(qvars, phi)`` or
+        to the corresponding partial projection when ``keep_vars`` is provided.
+
+    Raises:
+        ValueError: If the input leaves the supported fragment, contains nested
+            quantifiers, has invalid projection variables, or exceeds the DNF
+            cube expansion guard.
+    """
     if not z3.is_bool(phi):
         raise ValueError("unsupported fragment: phi must be a Boolean Z3 formula")
     if _contains_quantifier(cast(z3.ExprRef, phi)):
@@ -438,6 +540,9 @@ def qelim_exists_lra_fm(
 
     result = cast(z3.BoolRef, phi)
 
+    # Variables are eliminated one at a time.  Re-normalizing after each step
+    # keeps the next projection simple and lets Z3 simplify contradictions or
+    # tautologies introduced by the previous FM combination.
     for var in projection_vars:
         cubes = _normalize_to_cubes(cast(z3.BoolRef, result), max_cubes=MAX_CUBE_COUNT)
         if var.sort().kind() == z3.Z3_BOOL_SORT:
