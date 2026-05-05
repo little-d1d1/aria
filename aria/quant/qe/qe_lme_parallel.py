@@ -12,7 +12,7 @@ import shutil
 import z3
 
 from aria.utils.z3.expr import negate  # get_atoms
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 
 # Set up logging
 logger = logging.getLogger(__name__)

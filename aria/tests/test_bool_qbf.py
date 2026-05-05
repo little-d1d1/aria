@@ -9,7 +9,7 @@ from aria.bool.qbf import (
     parse_qcir_string,
     parse_qdimacs_string,
 )
-from aria.translator.parsing import parse_qdimacs_file
+from aria.utils.translator.parsing import parse_qdimacs_file
 
 
 QDIMACS_SAMPLE = """c sample

@@ -8,7 +8,7 @@ from aria.cli.fmldoc_cli import (
     handle_translate,
     handle_validate,
 )
-from aria.translator import cnf2smt
+from aria.utils.translator import cnf2smt
 
 
 DIMACS_SAMPLE = """c Simple CNF

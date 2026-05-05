@@ -9,13 +9,14 @@ import tempfile
 import z3
 
 from aria.tests import TestCase, main
-from aria.translator import cnf2smt, dimacs2smt, qbf2smt, qcir2smt
+from aria.utils.translator import qcir2smt
+from aria.utils.translator import cnf2smt, dimacs2smt, qbf2smt
 
 
 class TestTranslatorRegressions(TestCase):
     def test_cnf2lp_cli_without_arguments_prints_usage(self):
         result = subprocess.run(
-            [sys.executable, "-m", "aria.translator.cnf2lp"],
+            [sys.executable, "-m", "aria.utils.translator.cnf2lp"],
             capture_output=True,
             text=True,
             check=False,
@@ -134,10 +135,10 @@ class TestTranslatorRegressions(TestCase):
 
     def test_fzn2omt_modules_import_from_package(self):
         module_names = [
-            "aria.translator.fzn2omt.fzn2z3",
-            "aria.translator.fzn2omt.fzn2cvc4",
-            "aria.translator.fzn2omt.fzn2optimathsat",
-            "aria.translator.fzn2omt.smt2model2fzn",
+            "aria.utils.translator.fzn2omt.fzn2z3",
+            "aria.utils.translator.fzn2omt.fzn2cvc4",
+            "aria.utils.translator.fzn2omt.fzn2optimathsat",
+            "aria.utils.translator.fzn2omt.smt2model2fzn",
         ]
 
         for module_name in module_names:

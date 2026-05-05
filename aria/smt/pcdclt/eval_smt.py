@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from aria.utils import SolverResult
-from aria.global_params import SMT_SOLVERS_PATH
+from aria.utils.global_params import SMT_SOLVERS_PATH
 from aria.smt.pcdclt import config as pcdclt_config
 
 logger = logging.getLogger("pcdclt_eval")

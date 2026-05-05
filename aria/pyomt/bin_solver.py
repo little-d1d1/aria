@@ -9,7 +9,7 @@ from typing import Callable, Dict, List
 
 import z3
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 
 logger = logging.getLogger(__name__)
 BIN_SOLVER_TIMEOUT = 100

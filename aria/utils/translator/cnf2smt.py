@@ -1,0 +1,153 @@
+"""
+Module for converting CNF (DIMACS format) to Z3 expressions.
+"""
+
+from typing import List, Tuple, cast
+
+import pytest
+import z3
+
+from aria.utils.translator.parsing import parse_dimacs_content, parse_dimacs_file
+
+
+def parse_dimacs_string(dimacs_str: str) -> Tuple[int, int, List[List[int]]]:
+    """
+    Parse a DIMACS CNF string and return the number of variables, clauses, and the clauses.
+
+    :param dimacs_str: String containing DIMACS CNF format
+    :return: Tuple of (num_variables, num_clauses, clauses)
+    """
+    return parse_dimacs_content(dimacs_str)
+
+
+def parse_dimacs(filename: str) -> Tuple[int, int, List[List[int]]]:
+    """
+    Parse a DIMACS CNF file and return the number of variables, clauses, and the clauses.
+
+    :param filename: Path to the DIMACS CNF file
+    :return: Tuple of (num_variables, num_clauses, clauses)
+    """
+    return parse_dimacs_file(filename)
+
+
+def dimacs_to_z3(filename: str) -> z3.BoolRef:
+    """
+    Read a DIMACS CNF file and convert it directly to Z3 expression.
+
+    :param filename: Path to the DIMACS CNF file
+    :return: Z3 expression representing the CNF formula
+    """
+    _, _, clauses = parse_dimacs(filename)
+    return int_clauses_to_z3(clauses)
+
+
+def dimacs_string_to_z3(dimacs_str: str) -> z3.BoolRef:
+    """
+    Convert a DIMACS CNF string directly to Z3 expression.
+
+    :param dimacs_str: String containing DIMACS CNF format
+    :return: Z3 expression representing the CNF formula
+    """
+    _, _, clauses = parse_dimacs_string(dimacs_str)
+    return int_clauses_to_z3(clauses)
+
+
+def int_clauses_to_z3(clauses: List[List[int]]) -> z3.BoolRef:
+    """
+    Convert a list of integer clauses to Z3 expression.
+    The function returns the conjunction (AND) of all clauses in the input.
+    Each integer represents an atomic proposition.
+
+    :param clauses: List[List[int]] representing the clauses of a CNF
+    :return: Z3 expression
+    """
+    z3_clauses = []
+    var_map = {}
+    for clause in clauses:
+        conds = []
+        for lit in clause:
+            a = abs(lit)
+            if a in var_map:
+                b = var_map[a]
+            else:
+                b = z3.Bool(f"k!{a}")
+                var_map[a] = b
+            b = z3.Not(b) if lit < 0 else b
+            conds.append(b)
+        z3_clauses.append(z3.Or(*conds))
+    return cast(z3.BoolRef, z3.And(*z3_clauses))
+
+
+# Test cases
+def test_parse_dimacs_string_simple():
+    """Test parsing a simple DIMACS string."""
+    dimacs_str = """c Simple test case
+p cnf 2 2
+1 2 0
+-1 -2 0"""
+    num_vars, num_clauses, clauses = parse_dimacs_string(dimacs_str)
+    assert num_vars == 2
+    assert num_clauses == 2
+    assert clauses == [[1, 2], [-1, -2]]
+
+
+def test_parse_dimacs_string_with_comments():
+    """Test parsing a DIMACS string with comments."""
+    dimacs_str = """c This is a comment
+c Another comment
+p cnf 3 3
+1 2 3 0
+-1 2 0
+-2 -3 0"""
+    num_vars, num_clauses, clauses = parse_dimacs_string(dimacs_str)
+    assert num_vars == 3
+    assert num_clauses == 3
+    assert clauses == [[1, 2, 3], [-1, 2], [-2, -3]]
+
+
+def test_dimacs_string_to_z3_simple():
+    """Test converting a simple DIMACS string to Z3."""
+    dimacs_str = """p cnf 2 2
+1 2 0
+-1 -2 0"""
+    expr = dimacs_string_to_z3(dimacs_str)
+    s = z3.Solver()
+    s.add(expr)
+    assert s.check() == z3.sat  # Formula should be satisfiable
+
+
+def test_dimacs_string_to_z3_unsat():
+    """Test converting an unsatisfiable DIMACS string to Z3."""
+    dimacs_str = """p cnf 1 2
+1 0
+-1 0"""
+    expr = dimacs_string_to_z3(dimacs_str)
+    s = z3.Solver()
+    s.add(expr)
+    assert s.check() == z3.unsat  # Formula should be unsatisfiable
+
+
+def test_empty_clause():
+    """Test parsing a DIMACS string with an empty clause."""
+    dimacs_str = """p cnf 1 1
+0"""
+    num_vars, num_clauses, clauses = parse_dimacs_string(dimacs_str)
+    assert num_vars == 1
+    assert num_clauses == 1
+    assert clauses == [[]]
+
+
+def test_single_literal_clause():
+    """Test parsing a DIMACS string with a single literal clause."""
+    dimacs_str = """p cnf 1 1
+1 0"""
+    expr = dimacs_string_to_z3(dimacs_str)
+    s = z3.Solver()
+    s.add(expr)
+    assert s.check() == z3.sat
+    m = s.model()
+    assert z3.is_true(m[z3.Bool("k!1")])
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])

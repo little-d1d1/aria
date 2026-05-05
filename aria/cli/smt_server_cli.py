@@ -22,7 +22,7 @@ import z3
 # Import advanced aria features
 try:
     from aria.allsmt import create_allsmt_solver
-    from aria.unsat_core.unsat_core import get_unsat_core, enumerate_all_mus
+    from aria.proof.unsat_core.unsat_core import get_unsat_core, enumerate_all_mus
     from aria.backbone.smt_backbone_literals import get_backbone_literals
     from aria.counting import model_counter
 

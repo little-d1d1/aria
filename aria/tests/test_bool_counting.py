@@ -18,7 +18,7 @@ from aria.counting.bool.pysmt_expr_counting import (
     count_pysmt_models_by_enumeration,
 )
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 
 # Check if SharpSAT is available globally
 SHARP_SAT_AVAILABLE = global_config.is_solver_available("sharp_sat")

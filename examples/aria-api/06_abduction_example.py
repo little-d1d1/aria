@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import z3
-from aria.abduction.qe_abduct import qe_abduce
-from aria.abduction.dillig_abduct import dillig_abduce
+from aria.proof.abduction.qe_abduct import qe_abduce
+from aria.proof.abduction.dillig_abduct import dillig_abduce
 
 
 def basic_abduction():

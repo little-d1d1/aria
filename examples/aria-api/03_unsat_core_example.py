@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import z3
-from aria.unsat_core.marco import SubsetSolver, MapSolver, enumerate_sets
+from aria.proof.unsat_core.marco import SubsetSolver, MapSolver, enumerate_sets
 
 
 def basic_core():

@@ -26,7 +26,7 @@ from pysat.solvers import Solver
 
 from aria.bool.pysat_cnf import gen_cubes
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 
 SHARP_SAT_TIMEOUT = 600  # seconds
 

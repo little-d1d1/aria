@@ -16,7 +16,7 @@ from typing import Optional
 
 import z3
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 
 # Resolve the Z3 binary path from global configuration
 Z3_PATH = global_config.get_solver_path("z3")

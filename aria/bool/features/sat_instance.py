@@ -242,7 +242,7 @@ def demo_features():
     """
     Demo function to compute and display features.
     """
-    from aria.global_params import BENCHMARKS_PATH
+    from aria.utils.global_params import BENCHMARKS_PATH
 
     cnf_path = BENCHMARKS_PATH / "dimacs" / "parity_5.cnf"
     get_base_features(cnf_path)

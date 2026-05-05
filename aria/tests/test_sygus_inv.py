@@ -7,7 +7,7 @@ import tempfile
 import shutil
 
 from aria.synthesis.cvc5.sygus_inv import SygusInv
-from aria.global_params.paths import global_config
+from aria.utils.global_params.paths import global_config
 
 
 class TestSygusInv(TestCase):

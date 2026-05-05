@@ -12,7 +12,7 @@ import shutil
 import subprocess
 from typing import Dict, List, Optional, Tuple
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 
 logger = logging.getLogger(__name__)
 

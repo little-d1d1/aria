@@ -3,7 +3,7 @@
 import time
 import z3
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 from aria.utils.solver.smtlib import SMTLIBSolver
 
 

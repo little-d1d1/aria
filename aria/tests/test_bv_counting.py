@@ -4,7 +4,7 @@ For testing the model counting engine
 """
 import z3
 
-from aria.global_params import global_config
+from aria.utils.global_params import global_config
 from aria.tests import TestCase, main
 from aria.counting.bv import BVModelCounter
 

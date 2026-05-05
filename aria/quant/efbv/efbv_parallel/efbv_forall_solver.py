@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import z3
 from z3.z3util import get_vars
-from aria.global_params.paths import global_config
+from aria.utils.global_params.paths import global_config
 from aria.quant.efbv.efbv_parallel.efbv_utils import FSolverMode
 from aria.quant.efbv.efbv_parallel.exceptions import (
     ForAllSolverSuccess,

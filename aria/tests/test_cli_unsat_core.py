@@ -12,7 +12,7 @@ from aria.cli.unsat_core_cli import (
     main,
     run_unsat_core,
 )
-from aria.unsat_core.unsat_core import UnsatCoreResult
+from aria.proof.unsat_core.unsat_core import UnsatCoreResult
 
 
 SMT2_UNSAT = """(set-logic QF_LIA)

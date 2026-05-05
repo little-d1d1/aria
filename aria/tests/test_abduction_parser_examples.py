@@ -2,7 +2,7 @@
 
 import z3
 
-from aria.abduction.abductor_parser import parse_abduction_problem
+from aria.proof.abduction.abductor_parser import parse_abduction_problem
 
 
 def example_int() -> None:

@@ -6,7 +6,7 @@ from typing import List
 
 from aria.bool import PySATSolver, simplify_numeric_clauses
 from aria.utils import SolverResult, SExprParser
-from aria.global_params import SMT_SOLVERS_PATH
+from aria.utils.global_params import SMT_SOLVERS_PATH
 from aria.smt.pcdclt.preprocessor import FormulaAbstraction
 from aria.smt.pcdclt.theory_solver import TheorySolver
 from aria.smt.pcdclt.config import (

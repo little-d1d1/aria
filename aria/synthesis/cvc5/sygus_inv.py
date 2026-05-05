@@ -179,7 +179,7 @@ class SygusInv:
 
     def _get_cvc5_path(self) -> str:
         """Resolve cvc5 binary path from global config or PATH fallback."""
-        from aria.global_params.paths import global_config
+        from aria.utils.global_params.paths import global_config
 
         cvc5_path = global_config.get_solver_path("cvc5")
         if not cvc5_path:

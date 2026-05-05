@@ -15,7 +15,7 @@ Comprehensive examples showcasing aria's core capabilities using Z3 expressions:
 - **Interpolation**: Compute interpolants between formulas
 - **MaxSMT**: Solve Maximum Satisfiability problems
 - **SyGuS**: Syntax-guided synthesis of functions
-- **Unification**: Term unification and pattern matching
+- **Unification**: Term unification and pattern matching (in `aria.smt.unification`)
 
 ## Domain-Specific Applications
 
@@ -23,31 +23,17 @@ Comprehensive examples showcasing aria's core capabilities using Z3 expressions:
 - **Vendored pyDatalog**: small examples for recursive rules, graph queries, and
   Python-object-backed logic programming
 
-### Formal Verification (`validation/`)
-- **Model Checking**: Bounded model checking for temporal properties
-- **Concurrency Debugging**: Verification of concurrent systems
-- **Citation Checking**: Formal verification of academic citations
+### Formal Verification (`pypmt/`)
+- **PyPMT**: Python-based predicate modular verification framework
+- Various encoders, compilers, and planners for verification tasks
 
-### Security & Access Control (`access-control/`)
-- **ABAC**: Attribute-Based Access Control formal verification
-- **RBAC**: Role-Based Access Control modeling
-- **Cloud Permissions**: Cloud resource access policy verification
-
-### Compiler Construction (`compiler/`)
-- **Graph Coloring**: Constraint solving for register allocation and graph coloring problems
-
-### Cryptanalysis (`crypto/`)
-- **CryptoSMT**: Tool for cryptanalysis of symmetric primitives (block ciphers, hash functions, stream ciphers)
-- Supports primitives like Simon, Speck, AES variants, Keccak, ChaCha, and many others
-- Features differential cryptanalysis, linear cryptanalysis, and key recovery
+### Probability & Learning (`prob/`)
+- Probabilistic reasoning and sampling examples
 
 ### Causal Discovery (`cisan/`)
 - **CISan**: Runtime verification of causal discovery algorithms using automated conditional independence reasoning
 - Implements PC algorithm and variants with SMT-based independence testing
 - Research artifact from ICSE 2024 paper
-
-### Games & Puzzles (`games/`)
-- **Sudoku**: Constraint solving for Sudoku puzzles
 
 ### DSL Development (`pc_dsl/`)
 - **Easy Z3 DSL**: Python DSL that simplifies Z3 constraint solving through class-based syntax

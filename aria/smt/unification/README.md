@@ -12,7 +12,7 @@ This package provides:
 ## Usage
 
 ```python
-from aria.unification import unify, reify, var
+from aria.smt.unification import unify, reify, var
 
 x, y = var("x"), var("y")
 s = unify([1, x], [1, 2])   # {~x: 2}

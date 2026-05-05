@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional
 import z3
 from z3.z3util import get_vars
 
-from aria.global_params.paths import global_config
+from aria.utils.global_params.paths import global_config
 from aria.quant.eflira.eflira_sampling_utils import (
     ESolverSampleStrategy,
     SamplingUnknown,

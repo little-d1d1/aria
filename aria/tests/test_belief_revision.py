@@ -4,7 +4,7 @@ from typing import cast
 
 import z3
 
-from aria.abduction import (
+from aria.proof.abduction import (
     RevisionOperator,
     contract_belief_base,
     enumerate_optimal_contractions,

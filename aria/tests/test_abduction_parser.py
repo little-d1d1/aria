@@ -2,7 +2,7 @@
 
 import z3
 
-from aria.abduction.abductor_parser import (
+from aria.proof.abduction.abductor_parser import (
     extract_abduction_goal,
     parse_abduction_problem,
     parse_smt2_expr,

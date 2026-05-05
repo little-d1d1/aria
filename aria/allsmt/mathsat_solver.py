@@ -36,7 +36,7 @@ class MathSATAllSMTSolver(AllSMTSolver[MathSATModel]):
         # If mathsat_path is not provided, try to get it from global config
         if not mathsat_path:
             try:
-                from aria.global_params import (
+                from aria.utils.global_params import (
                     global_config,
                 )  # pylint: disable=import-outside-toplevel
 

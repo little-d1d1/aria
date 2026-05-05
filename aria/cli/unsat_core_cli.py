@@ -7,7 +7,7 @@ from typing import List, Optional
 
 import z3
 
-from aria.unsat_core.unsat_core import (
+from aria.proof.unsat_core.unsat_core import (
     UnsatCoreResult,
     get_unsat_core,
     enumerate_all_mus,

@@ -3,7 +3,7 @@
 from aria.tests import TestCase, main
 from aria.smt.pcdclt import CDCLTSolver, solve
 from aria.utils import SolverResult
-from aria.global_params import SMT_SOLVERS_PATH
+from aria.utils.global_params import SMT_SOLVERS_PATH
 
 
 class TestCDCLTSolver(TestCase):

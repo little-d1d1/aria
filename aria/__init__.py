@@ -47,13 +47,13 @@ ARIA_DEBUG = os.environ.get("ARIA_DEBUG", "False").lower() in ("true", "1", "yes
 # Public API exports
 __all__ = [
     # Core modules
-    "srk",           # Symbolic reasoning kernel
+    "utils",         # Utilities (including srk, solver, translator, etc.)
     "smt",           # SMT operations and utilities
     "bool",          # Boolean operations and engines
     "quant",         # Quantifier reasoning and solvers
     "pyomt",         # Optimization and MaxSAT solvers
     # Specialized modules
-    "abduction",     # Abductive reasoning
+    "proof",         # Proof utilities (abduction, interpolant, unsat_core)
     "allsmt",        # AllSMT (enumerate all satisfying models)
     "automata",      # Automata operations
     "backbone",      # Backbone literal computation
@@ -62,7 +62,6 @@ __all__ = [
     "counting",      # Model counting
     "datalog",       # Datalog and logic-programming components
     "fol",           # First-order logic
-    "interpolant",   # Interpolant generation
     "itp",           # Interactive theorem proving
     "monabs",        # Monotone abstractions
     "prob",          # Probability and probabilistic reasoning
@@ -71,7 +70,6 @@ __all__ = [
     "synthesis",     # Program synthesis
     "translator",    # Translation utilities
     "unification",   # Unification algorithms
-    "unsat_core",    # UNSAT core computation
     # Utilities
     "utils",         # General utilities
     "cli",           # Command-line interface

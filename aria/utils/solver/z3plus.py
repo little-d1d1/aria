@@ -24,7 +24,7 @@ from typing import List
 import z3
 
 from aria.utils.solver.smtlib import SmtlibProc
-from aria.global_params.paths import global_config
+from aria.utils.global_params.paths import global_config
 
 logger = logging.getLogger(__name__)
 

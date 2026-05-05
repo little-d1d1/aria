@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-from aria.translator.registry import (
+from aria.utils.translator.registry import (
     detect_format,
     get_output_extension,
     get_supported_translation_formats,
