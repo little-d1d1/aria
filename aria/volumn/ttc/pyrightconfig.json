@@ -1,0 +1,17 @@
+{
+  "include": [
+    "src/**/*.py",
+    "ttc.py",
+    "_bootstrap.py"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    "bin/**",
+    "build/**",
+    "benchmarks/**",
+    "benchmarks_polytope/**",
+    "python_polytope/**",
+    "utils/**"
+  ],
+  "pythonVersion": "3.11"
+}

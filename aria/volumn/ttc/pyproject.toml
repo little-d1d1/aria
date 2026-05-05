@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttc"
+version = "1.0.0"
+description = "Volume computation for SMT LRA formulas"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    # Platform-sensitive native wheels are handled by the first-run bootstrap.
+    # Keep only the dependencies that pipx can install directly here.
+    "lark",
+    "numpy",
+    "pandas",
+    "requests",
+]
+
+[project.scripts]
+ttc = "ttc:ttc"
+
+[tool.setuptools]
+py-modules = ["ttc", "_bootstrap"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

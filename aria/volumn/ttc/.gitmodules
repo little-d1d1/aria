@@ -1,0 +1,15 @@
+[submodule "VolEsti"]
+	path = bin/deps/VolEsti
+	url = https://github.com/meelgroup/VolEsti.git
+[submodule "pact"]
+	path = bin/deps/pact
+	url = https://github.com/meelgroup/pact.git
+[submodule "bin/deps/allsat-circuits"]
+	path = bin/deps/allsat-circuits
+	url = https://github.com/yogevshalmon/allsat-circuits.git
+[submodule "bin/deps/upstream-lrslib"]
+	path = bin/deps/upstream-lrslib
+	url = https://github.com/passagemath/upstream-lrslib.git
+[submodule "bin/deps/cddlib"]
+	path = bin/deps/cddlib
+	url = https://github.com/cddlib/cddlib.git
